@@ -1,0 +1,269 @@
+name: Nightly IMDb Engine
+on:
+  schedule:
+    - cron: "0 7 * * *"   # runs daily ~02am US Eastern (07:00 UTC)
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Create project files (no repo upload needed)
+        run: |
+          mkdir -p engine config data .github/workflows
+          cat > requirements.txt <<'REQ'
+          requests==2.32.3
+          beautifulsoup4==4.12.3
+          lxml==5.2.2
+          pandas==2.2.2
+          numpy==1.26.4
+          rapidfuzz==3.9.6
+          bloom-filter2==2.0.0
+          pydantic==2.8.2
+          click==8.1.7
+          rich==13.7.1
+          REQ
+
+          cat > config/config.yaml <<'YAML'
+          mode: unlimited
+          region: US
+          imdb_ratings_url: ""   # we pass it via secret at runtime
+          subs:
+            include: [netflix, prime_video, hulu, max, disney_plus, apple_tv_plus, peacock, paramount_plus]
+          sweeps:
+            consider_targets: { films: 5000, series: 2500 }
+            percent_new_vs_last_run: 0.50
+          commitment_cost:
+            apply_to_unseen_multiseason: true
+            penalty_two_seasons_range: [-5, -3]
+            penalty_three_plus_seasons_range: [-12, -6]
+            exempt_miniseries: true
+          personal_consensus_model:
+            enable: true
+            decay_half_life_days: 365
+            shrinkage_min_support: 8
+          facts_cache_ttls:
+            availability_hours: 24
+            ratings_days: 7
+            language_days: 14
+            structure_days: 60
+          finalist_facts_policy: fetch_missing_or_stale_only
+          dedupe:
+            fuzzy_threshold: 0.92
+            year_tolerance: 1
+          telemetry:
+            enabled: true
+            email_summary: false
+          YAML
+
+          cat > engine/utils.py <<'PY'
+          import re, unicodedata
+          from rapidfuzz import fuzz
+          def normalize_title(s: str) -> str:
+              if not s: return ""
+              s = s.lower().strip()
+              out, depth = [], 0
+              for ch in s:
+                  if ch == '(': depth += 1
+                  elif ch == ')': depth = max(0, depth-1)
+                  elif depth == 0: out.append(ch)
+              s = ''.join(out).replace("&"," and ")
+              s = re.sub(r"[-—–_:/,.'!?;]", " ", s)
+              s = " ".join(t for t in s.split() if t != "the")
+              return unicodedata.normalize("NFKC", s)
+          def fuzzy_match(a: str, b: str, threshold: float = 0.92) -> bool:
+              if not a or not b: return False
+              return (fuzz.token_set_ratio(a, b) / 100.0) >= threshold
+          PY
+
+          cat > engine/seen_index.py <<'PY'
+          import json, os
+          from bloom_filter2 import BloomFilter
+          from .utils import normalize_title, fuzzy_match
+          SEEN_PATH = "data/seen_index_v3.json"
+          BLOOM_PATH = "data/seen_index_v3.bf"
+          def _load_seen():
+              if os.path.exists(SEEN_PATH):
+                  return json.load(open(SEEN_PATH, "r", encoding="utf-8"))
+              return {"by_imdb": {}, "by_key": {}, "meta": {"count": 0}}
+          def _save_seen(seen):
+              os.makedirs("data", exist_ok=True)
+              json.dump(seen, open(SEEN_PATH,"w",encoding="utf-8"), ensure_ascii=False, indent=2)
+          def _build_bloom(seen):
+              n = max(10000, seen["meta"]["count"]*2)
+              bf = BloomFilter(max_elements=n, error_rate=0.001)
+              for iid in seen["by_imdb"]: bf.add(f"imdb:{iid}")
+              for k in seen["by_key"]: bf.add(f"key:{k}")
+              bf.tofile(open(BLOOM_PATH,"wb"))
+          def update_seen_from_ratings(rows):
+              seen = _load_seen()
+              for r in rows:
+                  iid = (r.get("imdb_id") or "").strip()
+                  title = r.get("title",""); year = int(r.get("year") or 0)
+                  key = normalize_title(title)
+                  if iid: seen["by_imdb"][iid] = {"year": year, "title": title}
+                  if key: seen["by_key"][key] = {"year": year, "title": title}
+              seen["meta"]["count"] = max(len(seen["by_imdb"]), len(seen["by_key"]))
+              _save_seen(seen); _build_bloom(seen)
+          def is_seen(title: str, imdb_id: str = "", year: int = 0, thr: float = 0.92, tol: int = 1) -> bool:
+              if os.path.exists(BLOOM_PATH):
+                  bf = BloomFilter.fromfile(open(BLOOM_PATH,"rb"))
+              else:
+                  bf = BloomFilter(max_elements=10000, error_rate=0.001)
+              if imdb_id and f"imdb:{imdb_id}" in bf: return True
+              key = normalize_title(title)
+              if key and f"key:{key}" in bf: return True
+              # fuzzy fallback with year tolerance
+              seen = _load_seen()
+              for k, meta in seen["by_key"].items():
+                  if fuzzy_match(key, k, thr):
+                      y = int(meta.get("year") or 0)
+                      if (year==0) or (abs(y - year) <= tol): return True
+              return False
+          PY
+
+          cat > engine/imdb_ingest.py <<'PY'
+          import re, time, requests
+          from bs4 import BeautifulSoup
+          from dataclasses import dataclass, asdict
+          from typing import List, Dict
+          UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"}
+          @dataclass
+          class RatingItem:
+              imdb_id: str; title: str; year: int; type: str; your_rating: float
+          def scrape_imdb_ratings(public_url: str, max_pages: int = 50) -> List[RatingItem]:
+              m = re.search(r"/user/(ur\\d+)/ratings", public_url)
+              if not m: raise ValueError("Use a URL like https://www.imdb.com/user/ur12345678/ratings")
+              user_id = m.group(1); items: List[RatingItem] = []
+              base = f"https://www.imdb.com/user/{user_id}/ratings?sort=ratings_date:desc&mode=detail"
+              start = 1
+              for _ in range(max_pages):
+                  url = f"{base}&start={start}"
+                  r = requests.get(url, headers=UA, timeout=30)
+                  if r.status_code != 200: break
+                  soup = BeautifulSoup(r.text, "lxml")
+                  blocks = soup.select("div.lister-item.mode-detail")
+                  if not blocks: break
+                  for b in blocks:
+                      a = b.select_one("h3.lister-item-header a[href*='/title/tt']")
+                      if not a: continue
+                      href = a.get("href",""); m2 = re.search(r"/title/(tt\\d+)/", href)
+                      if not m2: continue
+                      iid = m2.group(1); title = a.get_text(strip=True)
+                      ytag = b.select_one("h3 span.lister-item-year"); year = 0
+                      if ytag:
+                          my = re.search(r"(\\d{4})", ytag.get_text()); year = int(my.group(1)) if my else 0
+                      yr = b.select_one("div.ipl-rating-widget span.ipl-rating-star__rating")
+                      your = float(yr.get_text(strip=True)) if yr else 0.0
+                      t = "movie"
+                      sub = b.select_one("p.text-muted")
+                      if sub:
+                          s = sub.get_text()
+                          if "TV Mini-Series" in s: t = "tvMiniSeries"
+                          elif "TV Series" in s: t = "tvSeries"
+                          elif "TV Movie" in s: t = "tvMovie"
+                          elif "TV Special" in s: t = "tvSpecial"
+                          elif "Video Game" in s: t = "game"
+                      items.append(RatingItem(iid, title, year, t, your))
+                  nxt = soup.select_one("a.lister-page-next.next-page")
+                  if not nxt: break
+                  start += 100; time.sleep(0.8)
+              return items
+          def to_rows(items: List[RatingItem]) -> List[Dict]:
+              return [asdict(i) for i in items]
+          PY
+
+          cat > engine/autolearn.py <<'PY'
+          import json, os
+          WEIGHTS = "data/weights_live.json"
+          def _default():
+              return {"critic_weight":0.5,"audience_weight":0.5,"commitment_cost_scale":1.0,"novelty_pressure":0.15}
+          def load_weights():
+              return json.load(open(WEIGHTS,"r")) if os.path.exists(WEIGHTS) else _default()
+          def save_weights(w): os.makedirs("data",exist_ok=True); json.dump(w, open(WEIGHTS,"w"), indent=2)
+          def update_from_ratings(rows):
+              pos = sum(1 for r in rows if float(r.get("your_rating",0))>=8)
+              neg = sum(1 for r in rows if 0<float(r.get("your_rating",0))<=5)
+              total = len(rows) or 1
+              delta = (pos - neg)/total
+              w = load_weights()
+              w["critic_weight"] = float(min(0.7, max(0.3, w.get("critic_weight",0.5)+0.05*delta)))
+              w["audience_weight"] = 1.0 - w["critic_weight"]
+              save_weights(w); return w
+          PY
+
+          cat > engine/recommender.py <<'PY'
+          from typing import List, Dict, Any
+          from .seen_index import is_seen
+          def score(c: Dict[str,Any], w: Dict[str,Any]) -> float:
+              base=70.0; crit=float(c.get("critic",0)); aud=float(c.get("audience",0))
+              s=base+15.0*(w.get("critic_weight",0.5)*crit + w.get("audience_weight",0.5)*aud)
+              if c.get("type")=="tvSeries":
+                  seasons=int(c.get("seasons",1))
+                  s-=9.0*w.get("commitment_cost_scale",1.0) if seasons>=3 else (4.0*w.get("commitment_cost_scale",1.0) if seasons==2 else 0)
+              return max(60.0,min(98.0,s))
+          def recommend(catalog: List[Dict[str,Any]], w: Dict[str,Any]) -> List[Dict[str,Any]]:
+              out=[]
+              for c in catalog:
+                  if is_seen(c.get("title",""), c.get("imdb_id",""), int(c.get("year",0))): continue
+                  x=dict(c); x["match"]=round(score(c,w),1); out.append(x)
+              out.sort(key=lambda x:x["match"], reverse=True); return out[:50]
+          PY
+
+          cat > engine/runner.py <<'PY'
+          import os, json, datetime, sys
+          from rich import print
+          from engine.imdb_ingest import scrape_imdb_ratings, to_rows
+          from engine.seen_index import update_seen_from_ratings
+          from engine.autolearn import update_from_ratings, load_weights
+          from engine.recommender import recommend
+          def main():
+              imdb_url = os.environ.get("IMDB_RATINGS_URL","").strip()
+              if not imdb_url:
+                  print("[red]IMDB_RATINGS_URL secret is missing[/red]"); sys.exit(1)
+              print(f"[bold]IMDb ingest:[/bold] {imdb_url}")
+              rows = to_rows(scrape_imdb_ratings(imdb_url))
+              os.makedirs("data/ingest", exist_ok=True)
+              json.dump(rows, open(f"data/ingest/ratings_{datetime.date.today().isoformat()}.json","w"), indent=2)
+              update_seen_from_ratings(rows)           # SeenIndex v3 + Bloom
+              weights = update_from_ratings(rows)      # autolearn (ratings-driven)
+              # DEMO catalog — replace with a large catalog later
+              catalog = [
+                {"imdb_id":"tt4786824","title":"The Night Of","year":2016,"type":"tvMiniSeries","critic":0.94,"audience":0.88,"seasons":1},
+                {"imdb_id":"tt0412142","title":"House","year":2004,"type":"tvSeries","critic":0.86,"audience":0.91,"seasons":8},
+                {"imdb_id":"tt0848228","title":"The Avengers","year":2012,"type":"movie","critic":0.91,"audience":0.91},
+                {"imdb_id":"tt1631867","title":"Edge of Tomorrow","year":2014,"type":"movie","critic":0.91,"audience":0.90},
+                {"imdb_id":"tt5875444","title":"The Night Manager","year":2016,"type":"tvMiniSeries","critic":0.91,"audience":0.89,"seasons":1}
+              ]
+              recs = recommend(catalog, weights)
+              out_dir = f"data/out/daily/{datetime.date.today().isoformat()}"; os.makedirs(out_dir, exist_ok=True)
+              json.dump({"date":str(datetime.date.today()),"recs":recs,"weights":weights}, open(f"{out_dir}/recs.json","w"), indent=2)
+              json.dump({"eligible_unseen":len(catalog),"considered":len(catalog),"shortlist":min(50,len(recs)),"shown":min(10,len(recs)),
+                         "dedupe":{"pre":0,"post":0,"output":0}}, open(f"{out_dir}/telemetry.json","w"), indent=2)
+              print("[green]Run complete.[/green] See:", out_dir)
+          if __name__ == "__main__": main()
+          PY
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run engine
+        env:
+          IMDB_RATINGS_URL: ${{ secrets.IMDB_RATINGS_URL }}
+        run: |
+          python -m engine.runner
+
+      - name: Upload nightly artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-output
+          path: data/out/daily/**/*
