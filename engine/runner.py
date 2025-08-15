@@ -4,10 +4,10 @@ import json
 import os
 import sys
 import time
-from typing import Dict, List, Tuple
+from typing import Tuple
 
 from . import catalog as cat
-from . import scoring as sc  # <-- fixed to a relative import
+from . import scoring as sc  # relative import (works inside package)
 from .seen_index import (
     load_imdb_ratings_csv_auto,
     update_seen_from_ratings,
@@ -28,22 +28,31 @@ def _dump_json(path: str, obj) -> None:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
 def _weights_from_env() -> Tuple[float, float, float, float]:
-    # accept both old/new envs, then enforce audience dominance
-    cw = float(os.environ.get("CRITIC_WEIGHT", os.environ.get("CRITIC_SCORE_WEIGHT", 0.2)))
-    aw = float(os.environ.get("AUDIENCE_WEIGHT", os.environ.get("AUDIENCE_SCORE_WEIGHT", 0.8)))
+    """
+    Read weights from env (accept legacy names) and normalize to 1.0.
+    Notes:
+      - Audience ratings may be lower or higher than critic ratings.
+      - We simply *weight* audience more by default; no constraints enforced.
+    """
+    # Defaults: audience favored, but env wins if provided.
+    cw = float(os.environ.get("CRITIC_WEIGHT", os.environ.get("CRITIC_SCORE_WEIGHT", 0.35)))
+    aw = float(os.environ.get("AUDIENCE_WEIGHT", os.environ.get("AUDIENCE_SCORE_WEIGHT", 0.65)))
     np = float(os.environ.get("NOVELTY_PRESSURE", 0.15))
     cc = float(os.environ.get("COMMITMENT_COST_SCALE", 1.0))
 
-    total = max(1e-9, cw + aw)
+    total = cw + aw
+    if total <= 0:
+        cw, aw = 0.35, 0.65
+        total = 1.0
+
+    # Normalize without forcing any relation between the two.
     cw, aw = cw / total, aw / total
-    if aw < 0.70:  # your requirement: audience significantly higher than critic
-        aw, cw = 0.70, 0.30
     return cw, aw, np, cc
 
 def main():
     start = time.time()
 
-    # 1) IMDb ingest -> seen index (auto path, supports IMDB_RATINGS_CSV_PATH and fallbacks)
+    # 1) IMDb ingest -> seen index
     rows, ratings_path = load_imdb_ratings_csv_auto()
     if ratings_path:
         print(f"IMDb ingest: {ratings_path} — {len(rows)} rows")
@@ -54,20 +63,24 @@ def main():
         added = 0
     print(f"Seen index: {len(seen.keys)} keys (+{added} new)")
 
-    # 2) Build TMDB pool (English-only, your services only, rotating pages)
+    # 2) Build TMDB pool (English-only, your services, rotating pages)
     _hb("catalog:begin")
     pool = cat.build_pool()
     meta = cat.last_meta()
-    _hb(f"catalog:end pool={len(pool)} movie={meta.get('pool_counts',{}).get('movie',0)} tv={meta.get('pool_counts',{}).get('tv',0)}")
+    _hb(
+        f"catalog:end pool={len(pool)} "
+        f"movie={meta.get('pool_counts',{}).get('movie',0)} "
+        f"tv={meta.get('pool_counts',{}).get('tv',0)}"
+    )
 
-    # 3) Seen filter pass
+    # 3) Seen filter
     _hb("filter1:unseen")
     pool_unseen = filter_unseen(pool, seen)
     _hb(f"filter1:end kept={len(pool_unseen)} dropped={len(pool)-len(pool_unseen)}")
 
-    # 4) Scoring with audience dominance
+    # 4) Scoring with your weights (audience can rate lower; it's just weighted more)
     cw, aw, np, cc = _weights_from_env()
-    _hb(f"score:begin cw={cw:.2f} aw={aw:.2f} np={np} cc={cc}")
+    _hb(f"score:begin cw={cw:.3f} aw={aw:.3f} np={np} cc={cc}")
     ranked = sc.score_and_rank(
         pool_unseen,
         critic_weight=cw,
@@ -85,7 +98,7 @@ def main():
     shortlist2 = filter_unseen(shortlist, seen)
     shown = shortlist2[:shown_size]
 
-    # 6) Telemetry & guardrails
+    # 6) Telemetry
     providers_listed = meta.get("provider_names") or []
     telemetry = {
         "pool": len(pool),
@@ -135,8 +148,8 @@ def main():
         "version": 1,
         "disclaimer": "This product uses the TMDB and OMDb APIs but is not endorsed or certified by them.",
         "weights": {
-            "critic": round(cw, 2),
-            "audience": round(aw, 2),
+            "critic": round(cw, 3),
+            "audience": round(aw, 3),
             "novelty_pressure": np,
             "commitment_cost_scale": cc,
         },
@@ -153,9 +166,16 @@ def main():
 
     # 8) Console summary
     print(f"Run complete in {int(time.time()-start)}s.")
-    print(f"Weights: critic={cw:.2f}, audience={aw:.2f}")
-    print(f"Counts: tmdb_pool={len(pool)}, eligible_unseen={len(pool_unseen)}, shortlist={len(shortlist2)}, shown={len(shown)}")
-    print(f"Page plan: movie_pages={meta.get('movie_pages')} tv_pages={meta.get('tv_pages')} rotate_minutes={meta.get('rotate_minutes')} slot={meta.get('slot')}")
+    print(f"Weights: critic={cw:.3f}, audience={aw:.3f}")
+    print(
+        f"Counts: tmdb_pool={len(pool)}, eligible_unseen={len(pool_unseen)}, "
+        f"shortlist={len(shortlist2)}, shown={len(shown)}"
+    )
+    print(
+        f"Page plan: movie_pages={meta.get('movie_pages')} "
+        f"tv_pages={meta.get('tv_pages')} rotate_minutes={meta.get('rotate_minutes')} "
+        f"slot={meta.get('slot')}"
+    )
     print(f"Providers: {', '.join(providers_listed) if providers_listed else '(none configured)'}")
     print(f"Output: {daily_dir}")
 
