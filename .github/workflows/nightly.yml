@@ -62,7 +62,6 @@ jobs:
           cat > engine/utils.py <<'PY'
           import re, unicodedata
           from rapidfuzz import fuzz
-
           def normalize_title(s: str) -> str:
               if not s: return ""
               s = s.lower().strip()
@@ -75,7 +74,6 @@ jobs:
               s = re.sub(r"[-—–_:/,.'!?;]", " ", s)
               s = " ".join(t for t in s.split() if t != "the")
               return unicodedata.normalize("NFKC", s)
-
           def fuzzy_match(a: str, b: str, threshold: float = 0.92) -> bool:
               if not a or not b: return False
               return (fuzz.token_set_ratio(a, b) / 100.0) >= threshold
@@ -85,26 +83,21 @@ jobs:
           import json, os
           from bloom_filter2 import BloomFilter
           from .utils import normalize_title, fuzzy_match
-
           SEEN_PATH = "data/seen_index_v3.json"
           BLOOM_PATH = "data/seen_index_v3.bf"
-
           def _load_seen():
               if os.path.exists(SEEN_PATH):
                   return json.load(open(SEEN_PATH, "r", encoding="utf-8"))
               return {"by_imdb": {}, "by_key": {}, "meta": {"count": 0}}
-
           def _save_seen(seen):
               os.makedirs("data", exist_ok=True)
               json.dump(seen, open(SEEN_PATH,"w",encoding="utf-8"), ensure_ascii=False, indent=2)
-
           def _build_bloom(seen):
               n = max(10000, seen["meta"]["count"]*2)
               bf = BloomFilter(max_elements=n, error_rate=0.001)
               for iid in seen["by_imdb"]: bf.add(f"imdb:{iid}")
               for k in seen["by_key"]: bf.add(f"key:{k}")
               bf.tofile(open(BLOOM_PATH,"wb"))
-
           def update_seen_from_ratings(rows):
               seen = _load_seen()
               for r in rows:
@@ -115,19 +108,14 @@ jobs:
                   if key: seen["by_key"][key] = {"year": year, "title": title}
               seen["meta"]["count"] = max(len(seen["by_imdb"]), len(seen["by_key"]))
               _save_seen(seen); _build_bloom(seen)
-
           def is_seen(title: str, imdb_id: str = "", year: int = 0, thr: float = 0.92, tol: int = 1) -> bool:
               if os.path.exists(BLOOM_PATH):
                   bf = BloomFilter.fromfile(open(BLOOM_PATH,"rb"))
               else:
                   bf = BloomFilter(max_elements=10000, error_rate=0.001)
-
               if imdb_id and f"imdb:{imdb_id}" in bf: return True
-
               key = normalize_title(title)
               if key and f"key:{key}" in bf: return True
-
-              # fuzzy fallback with year tolerance
               seen = _load_seen()
               for k, meta in seen["by_key"].items():
                   if fuzzy_match(key, k, thr):
@@ -141,13 +129,10 @@ jobs:
           from bs4 import BeautifulSoup
           from dataclasses import dataclass, asdict
           from typing import List, Dict
-
           UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"}
-
           @dataclass
           class RatingItem:
               imdb_id: str; title: str; year: int; type: str; your_rating: float
-
           def scrape_imdb_ratings(public_url: str, max_pages: int = 50) -> List[RatingItem]:
               m = re.search(r"/user/(ur\\d+)/ratings", public_url)
               if not m: raise ValueError("Use a URL like https://www.imdb.com/user/ur12345678/ratings")
@@ -186,26 +171,18 @@ jobs:
                   if not nxt: break
                   start += 100; time.sleep(0.8)
               return items
-
           def to_rows(items: List[RatingItem]) -> List[Dict]:
               return [asdict(i) for i in items]
           PY
 
           cat > engine/autolearn.py <<'PY'
           import json, os
-
           WEIGHTS = "data/weights_live.json"
-
           def _default():
               return {"critic_weight":0.5,"audience_weight":0.5,"commitment_cost_scale":1.0,"novelty_pressure":0.15}
-
           def load_weights():
               return json.load(open(WEIGHTS,"r")) if os.path.exists(WEIGHTS) else _default()
-
-          def save_weights(w):
-              os.makedirs("data",exist_ok=True)
-              json.dump(w, open(WEIGHTS,"w"), indent=2)
-
+          def save_weights(w): os.makedirs("data",exist_ok=True); json.dump(w, open(WEIGHTS,"w"), indent=2)
           def update_from_ratings(rows):
               pos = sum(1 for r in rows if float(r.get("your_rating",0))>=8)
               neg = sum(1 for r in rows if 0<float(r.get("your_rating",0))<=5)
@@ -220,7 +197,6 @@ jobs:
           cat > engine/recommender.py <<'PY'
           from typing import List, Dict, Any
           from .seen_index import is_seen
-
           def score(c: Dict[str,Any], w: Dict[str,Any]) -> float:
               base=70.0; crit=float(c.get("critic",0)); aud=float(c.get("audience",0))
               s=base+15.0*(w.get("critic_weight",0.5)*crit + w.get("audience_weight",0.5)*aud)
@@ -228,7 +204,6 @@ jobs:
                   seasons=int(c.get("seasons",1))
                   s-=9.0*w.get("commitment_cost_scale",1.0) if seasons>=3 else (4.0*w.get("commitment_cost_scale",1.0) if seasons==2 else 0)
               return max(60.0,min(98.0,s))
-
           def recommend(catalog: List[Dict[str,Any]], w: Dict[str,Any]) -> List[Dict[str,Any]]:
               out=[]
               for c in catalog:
@@ -245,36 +220,47 @@ jobs:
           from engine.autolearn import update_from_ratings
           from engine.recommender import recommend
 
+          def _extract_user_id(s: str) -> str:
+              """
+              Accepts:
+                - Full URL: https://www.imdb.com/user/ur18684433/ratings?... (any case)
+                - Bare: 'ur18684433' or 'UR18684433'
+                - Digits only: '18684433'
+                - Values with stray chars/whitespace
+              Returns canonical 'ur########' or ''.
+              """
+              if not s: return ""
+              s = s.strip()
+              # 1) Pull from URL if present
+              m = re.search(r"/user/(ur?\d+)", s, re.I)
+              if m:
+                  s = m.group(1)
+              s = s.strip().lower()
+              # 2) Find the digits with optional 'ur' prefix
+              m2 = re.search(r"(?:ur)?(\d+)", s)
+              if not m2:
+                  return ""
+              return "ur" + m2.group(1)
+
           def resolve_ratings_url() -> str:
               raw = (os.environ.get("IMDB_RATINGS_URL") or "").strip()
               uid = (os.environ.get("IMDB_USER_ID") or "").strip()
-
-              # If a full URL is provided, normalize it
-              m = re.search(r"/user/(ur\\d+)/ratings", raw)
-              if m:
-                  return f"https://www.imdb.com/user/{m.group(1)}/ratings"
-
-              # If an ID is provided (either as URL var or separate), build the URL
-              mid = re.fullmatch(r"(ur\\d+)", raw) or re.fullmatch(r"(ur\\d+)", uid)
-              if mid:
-                  return f"https://www.imdb.com/user/{mid.group(1)}/ratings"
-
-              raise SystemExit(
-                  "Missing/invalid IMDb identity. Set IMDB_USER_ID like 'ur18684433', "
-                  "or IMDB_RATINGS_URL like 'https://www.imdb.com/user/ur18684433/ratings'."
-              )
+              user = _extract_user_id(raw) or _extract_user_id(uid)
+              if not user:
+                  raise SystemExit(
+                      "Missing/invalid IMDb identity. Set IMDB_USER_ID like 'ur18684433', "
+                      "or IMDB_RATINGS_URL like 'https://www.imdb.com/user/ur18684433/ratings'."
+                  )
+              return f"https://www.imdb.com/user/{user}/ratings"
 
           def main():
               imdb_url = resolve_ratings_url()
               print(f"[bold]IMDb ingest:[/bold] {imdb_url}")
-
               rows = to_rows(scrape_imdb_ratings(imdb_url))
               os.makedirs("data/ingest", exist_ok=True)
               json.dump(rows, open(f"data/ingest/ratings_{datetime.date.today().isoformat()}.json","w"), indent=2)
-
               update_seen_from_ratings(rows)           # SeenIndex v3 + Bloom
               weights = update_from_ratings(rows)      # autolearn (ratings-driven)
-
               # DEMO catalog — replace with a large catalog later
               catalog = [
                 {"imdb_id":"tt4786824","title":"The Night Of","year":2016,"type":"tvMiniSeries","critic":0.94,"audience":0.88,"seasons":1},
@@ -284,14 +270,11 @@ jobs:
                 {"imdb_id":"tt5875444","title":"The Night Manager","year":2016,"type":"tvMiniSeries","critic":0.91,"audience":0.89,"seasons":1}
               ]
               recs = recommend(catalog, weights)
-
-              out_dir = f"data/out/daily/{datetime.date.today().isoformat()}"
-              os.makedirs(out_dir, exist_ok=True)
+              out_dir = f"data/out/daily/{datetime.date.today().isoformat()}"; os.makedirs(out_dir, exist_ok=True)
               json.dump({"date":str(datetime.date.today()),"recs":recs,"weights":weights}, open(f"{out_dir}/recs.json","w"), indent=2)
               json.dump({"eligible_unseen":len(catalog),"considered":len(catalog),"shortlist":min(50,len(recs)),"shown":min(10,len(recs)),
                          "dedupe":{"pre":0,"post":0,"output":0}}, open(f"{out_dir}/telemetry.json","w"), indent=2)
               print("[green]Run complete.[/green] See:", out_dir)
-
           if __name__ == "__main__": main()
           PY
 
@@ -305,13 +288,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Probe IMDb from runner
-        run: |
-          curl -I https://www.imdb.com/user/ur18684433/ratings | sed -n '1,20p'
-
       - name: Run engine
         env:
-          # Pass both; runner resolves either a full URL or a bare user ID
           IMDB_RATINGS_URL: ${{ secrets.IMDB_RATINGS_URL }}
           IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
         run: |
