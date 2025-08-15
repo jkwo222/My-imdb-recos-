@@ -1,23 +1,14 @@
 # engine/runner.py
 from __future__ import annotations
-import json
-import os
-import sys
-import time
-from typing import Tuple
+import json, os, sys, time
+from typing import Tuple, List, Dict, Any
 
 from . import catalog as cat
-from . import scoring as sc  # relative import (works inside package)
-from .seen_index import (
-    load_imdb_ratings_csv_auto,
-    update_seen_from_ratings,
-    SeenIndex,
-    load_seen,
-)
+from .seen_index import load_imdb_ratings_csv_auto, update_seen_from_ratings, load_seen, SeenIndex
 from .filtering import filter_unseen
+from .scoring import score_and_rank
 
 OUT_DIR = os.environ.get("OUT_DIR", "data/out")
-DAILY_DIR = os.path.join(OUT_DIR, "daily")
 
 def _hb(msg: str) -> None:
     print(f"[hb] {time.strftime('%H:%M:%S')} | {msg}", flush=True)
@@ -29,12 +20,9 @@ def _dump_json(path: str, obj) -> None:
 
 def _weights_from_env() -> Tuple[float, float, float, float]:
     """
-    Read weights from env (accept legacy names) and normalize to 1.0.
-    Notes:
-      - Audience ratings may be lower or higher than critic ratings.
-      - We simply *weight* audience more by default; no constraints enforced.
+    Audience may be lower or higher than critic. We simply *weight* audience more by default.
+    Env overrides are respected exactly, then normalized.
     """
-    # Defaults: audience favored, but env wins if provided.
     cw = float(os.environ.get("CRITIC_WEIGHT", os.environ.get("CRITIC_SCORE_WEIGHT", 0.35)))
     aw = float(os.environ.get("AUDIENCE_WEIGHT", os.environ.get("AUDIENCE_SCORE_WEIGHT", 0.65)))
     np = float(os.environ.get("NOVELTY_PRESSURE", 0.15))
@@ -44,15 +32,13 @@ def _weights_from_env() -> Tuple[float, float, float, float]:
     if total <= 0:
         cw, aw = 0.35, 0.65
         total = 1.0
-
-    # Normalize without forcing any relation between the two.
     cw, aw = cw / total, aw / total
     return cw, aw, np, cc
 
 def main():
     start = time.time()
 
-    # 1) IMDb ingest -> seen index
+    # 1) IMDb CSV -> seen index
     rows, ratings_path = load_imdb_ratings_csv_auto()
     if ratings_path:
         print(f"IMDb ingest: {ratings_path} — {len(rows)} rows")
@@ -63,71 +49,48 @@ def main():
         added = 0
     print(f"Seen index: {len(seen.keys)} keys (+{added} new)")
 
-    # 2) Build TMDB pool (English-only, your services, rotating pages)
+    # 2) Build TMDB catalog (English + your services; strong page rotation)
     _hb("catalog:begin")
-    pool = cat.build_pool()
-    meta = cat.last_meta()
-    _hb(
-        f"catalog:end pool={len(pool)} "
-        f"movie={meta.get('pool_counts',{}).get('movie',0)} "
-        f"tv={meta.get('pool_counts',{}).get('tv',0)}"
-    )
+    pool, meta = cat.build_pool()
+    _hb(f"catalog:end pool={len(pool)} movie={meta.get('pool_counts',{}).get('movie',0)} tv={meta.get('pool_counts',{}).get('tv',0)}")
 
-    # 3) Seen filter
-    _hb("filter1:unseen")
+    # 3) Seen filter (uses IMDb ttids when available, else title+year)
+    _hb("filter:unseen")
     pool_unseen = filter_unseen(pool, seen)
-    _hb(f"filter1:end kept={len(pool_unseen)} dropped={len(pool)-len(pool_unseen)}")
+    _hb(f"filter:end kept={len(pool_unseen)} dropped={len(pool)-len(pool_unseen)}")
 
-    # 4) Scoring with your weights (audience can rate lower; it's just weighted more)
+    # 4) Scoring
     cw, aw, np, cc = _weights_from_env()
     _hb(f"score:begin cw={cw:.3f} aw={aw:.3f} np={np} cc={cc}")
-    ranked = sc.score_and_rank(
-        pool_unseen,
-        critic_weight=cw,
-        audience_weight=aw,
-        novelty_pressure=np,
-        commitment_cost_scale=cc,
-    )
+    ranked = score_and_rank(pool_unseen, critic_weight=cw, audience_weight=aw,
+                            novelty_pressure=np, commitment_cost_scale=cc)
     _hb(f"score:end ranked={len(ranked)}")
 
     shortlist_size = int(os.environ.get("SHORTLIST_SIZE", "50"))
-    shortlist = ranked[:shortlist_size]
-
-    # 5) Second safety pass (paranoid)
     shown_size = int(os.environ.get("SHOWN_SIZE", "10"))
-    shortlist2 = filter_unseen(shortlist, seen)
-    shown = shortlist2[:shown_size]
+    shortlist = ranked[:shortlist_size]
+    shown = shortlist[:shown_size]
 
-    # 6) Telemetry
-    providers_listed = meta.get("provider_names") or []
+    # 5) Telemetry
     telemetry = {
         "pool": len(pool),
         "eligible": len(pool_unseen),
         "after_skip": len(pool_unseen),
         "shown": len(shown),
-        "weights": {"critic": cw, "audience": aw},
+        "weights": {"critic": round(cw, 3), "audience": round(aw, 3)},
         "counts": {
             "tmdb_pool": len(pool),
             "eligible_unseen": len(pool_unseen),
-            "shortlist": len(shortlist2),
+            "shortlist": len(shortlist),
             "shown": len(shown),
         },
-        "page_plan": {
-            "movie_pages": meta.get("movie_pages"),
-            "tv_pages": meta.get("tv_pages"),
-            "rotate_minutes": meta.get("rotate_minutes"),
-            "slot": meta.get("slot"),
-            "total_pages": meta.get("total_pages"),
-            "provider_names": providers_listed,
-            "language": meta.get("language"),
-            "with_original_language": meta.get("with_original_language"),
-            "watch_region": meta.get("watch_region"),
-        },
+        "page_plan": meta,
     }
 
-    if len(pool) == 0:
-        shown = []
-        _hb("pool=0 (check provider list, language filters, or API key)")
+    # 6) Output
+    date_tag = time.strftime("%Y-%m-%d")
+    daily_dir = os.path.join(OUT_DIR, "daily", date_tag)
+    os.makedirs(daily_dir, exist_ok=True)
 
     top10 = []
     for rank, item in enumerate(shown, 1):
@@ -138,11 +101,6 @@ def main():
             "year": item.get("year"),
             "type": item.get("type", "movie"),
         })
-
-    # 7) Emit artifacts
-    date_tag = time.strftime("%Y-%m-%d")
-    daily_dir = os.path.join(DAILY_DIR, date_tag)
-    os.makedirs(daily_dir, exist_ok=True)
 
     feed = {
         "version": 1,
@@ -157,31 +115,17 @@ def main():
         "top10": top10,
     }
 
-    def _dump(name: str, obj):
-        _dump_json(os.path.join(daily_dir, name), obj)
+    _dump_json(os.path.join(daily_dir, "assistant_feed.json"), feed)
+    _dump_json(os.path.join(daily_dir, "top10.json"), top10)
+    _dump_json(os.path.join(daily_dir, "telemetry.json"), telemetry)
 
-    _dump("assistant_feed.json", feed)
-    _dump("top10.json", top10)
-    _dump("telemetry.json", telemetry)
-
-    # 8) Console summary
+    # Console summary
     print(f"Run complete in {int(time.time()-start)}s.")
-    print(f"Weights: critic={cw:.3f}, audience={aw:.3f}")
-    print(
-        f"Counts: tmdb_pool={len(pool)}, eligible_unseen={len(pool_unseen)}, "
-        f"shortlist={len(shortlist2)}, shown={len(shown)}"
-    )
-    print(
-        f"Page plan: movie_pages={meta.get('movie_pages')} "
-        f"tv_pages={meta.get('tv_pages')} rotate_minutes={meta.get('rotate_minutes')} "
-        f"slot={meta.get('slot')}"
-    )
-    print(f"Providers: {', '.join(providers_listed) if providers_listed else '(none configured)'}")
+    print(f"Weights: critic={cw:.2f}, audience={aw:.2f}")
+    print(f"Counts: tmdb_pool={len(pool)}, eligible_unseen={len(pool_unseen)}, shortlist={len(shortlist)}, shown={len(shown)}")
+    print(f"Page plan: movie_pages={meta.get('movie_pages')} tv_pages={meta.get('tv_pages')} rotate_minutes={meta.get('rotate_minutes')} slot={meta.get('slot')}")
+    print(f"Providers: {', '.join(meta.get('provider_names', [])) or '(none)'}")
     print(f"Output: {daily_dir}")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"[fatal] {type(e).__name__}: {e}", file=sys.stderr)
-        raise
+    main()
