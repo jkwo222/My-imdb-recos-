@@ -1,194 +1,182 @@
 # engine/runner.py
 from __future__ import annotations
-import csv, datetime, json, os, sys, traceback
-from pathlib import Path
-from typing import Any, Dict, List
+import csv, json, os, sys, datetime, math
+from typing import Dict, List, Tuple
 
-from engine.logging_utils import make_heartbeat
-from engine.telemetry import Telemetry, provider_histogram
-
-from engine import catalog as cat
-from engine import providers as prov
+from engine.config import load_config
+from engine.rotation import plan_pages
+from engine.tmdb_client import TMDB, collect_discover, hydrate_items
+from engine.provider_filter import title_has_allowed_provider, summarize_provider_hits
 from engine import seen_index as seen
 
-def _get_env(name: str, default: str | None = None) -> str | None:
-    v = os.environ.get(name)
-    return v if (v is not None and str(v).strip() != "") else default
-
-def _to_bool(s: str | None, default=False) -> bool:
-    if s is None:
-        return default
-    return str(s).strip().lower() in ("1", "true", "yes", "on")
-
-def _safe(obj: dict, key: str, default=None):
-    v = obj.get(key)
-    return v if v is not None else default
-
-def _read_ratings_csv(path: Path) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    with path.open(newline="", encoding="utf-8") as fh:
-        r = csv.DictReader(fh)
-        for row in r:
-            if "imdb_id" not in row and "const" in row:
-                row["imdb_id"] = row["const"]
-            rows.append(row)
+def _read_imdb_csv(path: str) -> List[dict]:
+    rows: List[dict] = []
+    if not os.path.exists(path):
+        print(f"IMDb ingest (CSV): {path} — file missing, continuing with empty seen index")
+        return rows
+    with open(path, "r", encoding="utf-8") as f:
+        sniffer = csv.Sniffer()
+        sample = f.read(4096)
+        f.seek(0)
+        dialect = sniffer.sniff(sample) if sample else csv.excel
+        reader = csv.DictReader(f, dialect=dialect)
+        for r in reader:
+            rows.append(r)
+    print(f"IMDb ingest (CSV): {path} — {len(rows)} rows")
     return rows
 
-def main() -> None:
-    today = datetime.date.today().isoformat()
-    out_dir = Path(f"data/out/daily/{today}")
-    out_dir.mkdir(parents=True, exist_ok=True)
+def _heartbeat(stage: str):
+    def inner(done: int, total: int):
+        print(f"[heartbeat] {stage}: {done}/{total} hydrated")
+    return inner
 
-    hb = make_heartbeat(out_dir)
-    tel = Telemetry()
+def _score_items(cfg, items: List[dict]) -> List[dict]:
+    # Prepare min/max for audience popularity proxy (tmdb_votes) and vote average
+    if not items:
+        return []
+    vcounts = [max(0, it.get("tmdb_votes") or 0) for it in items]
+    vmax = max(vcounts) or 1
+    vmin = min(vcounts)
+    def scale_votes(v):
+        # compress to 0..100 with sqrt to soften huge titles
+        return 100.0 * math.sqrt(max(0.0, (v - vmin) / max(1.0, (vmax - vmin)))) 
 
-    region = _get_env("REGION", "US")
-    langs = (_get_env("ORIGINAL_LANGS", "en") or "en").split(",")
-    subs_include = (_get_env("SUBS_INCLUDE", "") or "").split(",") if _get_env("SUBS_INCLUDE") else []
-    include_tv_seasons = _to_bool(_get_env("INCLUDE_TV_SEASONS", "true"))
-    max_catalog = int(_get_env("MAX_CATALOG", "6000") or "6000")
-
-    # Higher defaults, overridable
-    pages_movie = int(_get_env("TMDB_PAGES_MOVIE", "60") or "60")
-    pages_tv = int(_get_env("TMDB_PAGES_TV", "60") or "60")
-
-    tel.add_note("language_filter", langs)
-    tel.add_note("subs_filter_enforced", bool(subs_include))
-    tel.add_note("region", region)
-
-    # IMDb ratings -> seen index
-    ratings_path = Path(_get_env("IMDB_RATINGS_CSV_PATH", "data/ratings.csv") or "data/ratings.csv")
-    ratings_rows: List[Dict[str, Any]] = []
-    if ratings_path.exists():
-        ratings_rows = _read_ratings_csv(ratings_path)
-        print(f"IMDb ingest (CSV): {ratings_path} — {len(ratings_rows)} rows")
-        hb.ping("ratings_ingested", rows=len(ratings_rows))
+    now_year = datetime.date.today().year
+    scored = []
+    for it in items:
+        critic = float(it.get("tmdb_vote") or 0.0) * 10.0  # 0..100
+        audience = scale_votes(int(it.get("tmdb_votes") or 0))
+        novelty = 0.0
         try:
-            seen.update_seen_from_ratings(ratings_rows)
-            hb.ping("seen_index_updated", entries=len(ratings_rows))
+            y = int((it.get("year") or "0")[:4])
+            if y >= now_year - 1:
+                novelty = 3.0 + 4.0 * (1 if y == now_year else 0)  # mild boost
         except Exception:
-            print("[warn] seen_index update failed:\n" + traceback.format_exc(), file=sys.stderr)
-            hb.ping("seen_index_update_error")
-    else:
-        print(f"[warn] ratings path not found: {ratings_path}")
-        hb.ping("ratings_missing", path=str(ratings_path))
+            novelty = 0.0
+        commit_penalty = 0.0
+        if it.get("type") == "tvSeries":
+            seasons = int(it.get("seasons") or 0)
+            # small penalty for very long shows
+            if seasons > 6:
+                commit_penalty = cfg.commitment_cost_scale * (seasons - 6) * 0.6
+        final = (cfg.critic_weight * critic) + (cfg.audience_weight * audience) + (cfg.novelty_pressure * novelty) - commit_penalty
+        it2 = dict(it)
+        it2["match"] = round(final, 1)
+        scored.append(it2)
+    scored.sort(key=lambda r: r["match"], reverse=True)
+    return scored
 
-    # TMDB pool (uses daily permutation + intra-day rolling window)
-    try:
-        pool = cat.fetch_tmdb_base(
-            pages_movie=pages_movie,
-            pages_tv=pages_tv,
-            region=region,
-            langs=langs,
-            include_tv_seasons=include_tv_seasons,
-            max_items=max_catalog,
-        )
-        # Capture plan meta in telemetry
-        tel.add_note("page_plan", cat.get_last_plan_meta())
-    except Exception:
-        print("[error] TMDB fetch failed:\n" + traceback.format_exc(), file=sys.stderr)
-        hb.ping("tmdb_fetch_error")
-        pool = []
+def _ensure_dirs(path: str):
+    os.makedirs(path, exist_ok=True)
 
-    tel.mark("tmdb_pool", len(pool))
-    hb.ping("tmdb_base", count=len(pool))
-    print(f"TMDB pulled base items: {len(pool)}")
+def main():
+    cfg = load_config()
+    # Seen index
+    rows = _read_imdb_csv(cfg.imdb_ratings_csv_path)
+    seen_stats = seen.update_seen_from_ratings(rows)
 
-    # Enrichments
-    def _call(func_name: str, data: List[dict]) -> List[dict]:
-        try:
-            func = getattr(cat, func_name)
-            out = func(data)
-            hb.ping(func_name, count=(len(out) if hasattr(out, "__len__") else None))
-            return out
-        except Exception:
-            return data
+    # TMDB client
+    if not cfg.tmdb_api_key:
+        print("TMDB_API_KEY missing; aborting TMDB pull.")
+        sys.exit(1)
+    tmdb = TMDB(cfg.tmdb_api_key, cache_dir=cfg.cache_dir)
 
-    pool = _call("enrich_with_ids", pool)
-    pool = _call("enrich_with_votes", pool)
-    pool = _call("enrich_with_ratings", pool)
+    # Rotation plan (pages change every rotation window)
+    movie_pages = plan_pages(cfg.tmdb_pages_movie, cfg.tmdb_rotate_step_movie, cfg.tmdb_rotate_minutes, cfg.tmdb_page_cap)
+    tv_pages = plan_pages(cfg.tmdb_pages_tv, cfg.tmdb_rotate_step_tv, cfg.tmdb_rotate_minutes, cfg.tmdb_page_cap)
 
-    # Availability
-    try:
-        pool = prov.annotate_availability(pool, region=region)
-        hb.ping("availability_annotated", count=len(pool))
-    except Exception:
-        print("[warn] provider availability failed:\n" + traceback.format_exc(), file=sys.stderr)
-        hb.ping("availability_error")
+    # Discover base pools
+    base_movie = collect_discover(tmdb, "movie", movie_pages, cfg.tmdb_movie_sort, cfg.original_langs)
+    base_tv = collect_discover(tmdb, "tv", tv_pages, cfg.tmdb_tv_sort, cfg.original_langs)
+    base_pool = base_movie + base_tv
+    # Cut to max_catalog (pre-hydration cap)
+    if len(base_pool) > cfg.max_catalog:
+        base_pool = base_pool[:cfg.max_catalog]
 
-    # Filters
-    eligible = pool
-    try:
-        eligible = cat.filter_seen(eligible)
-        eligible = cat.filter_by_langs(eligible, langs=langs)
-        if subs_include:
-            eligible = cat.filter_by_providers(eligible, allowed=subs_include)
-    except Exception:
-        print("[warn] filtering pipeline threw — continuing:\n" + traceback.format_exc(), file=sys.stderr)
+    print(f"TMDB pulled base items: {len(base_pool)}  (movies pages={len(movie_pages)} tv pages={len(tv_pages)})")
 
-    tel.mark("eligible_unseen", len(eligible))
-    hb.ping("eligible", count=len(eligible))
-
-    # Scoring
-    recs: List[Dict[str, Any]] = []
-    weights: Dict[str, Any] = {}
-    try:
-        recs, weights = cat.score_and_rank(eligible)
-    except Exception:
-        print("[warn] scoring failed — continuing with eligible set:\n" + traceback.format_exc(), file=sys.stderr)
-        recs = eligible
-        weights = {"critic_weight": 0.5, "audience_weight": 0.5, "commitment_cost_scale": 1.0, "novelty_pressure": 0.15}
-
-    shortlist_n = min(50, len(recs))
-    shown_n = min(10, len(recs))
-    tel.mark("shortlist", shortlist_n)
-    tel.mark("shown", shown_n)
-    hb.ping("ranked", shortlist=shortlist_n, shown=shown_n)
-
-    # Provider breakdown over shortlist
-    basis = recs[:shortlist_n] if shortlist_n else recs
-
-    # Writes
-    json.dump(
-        {"date": today, "recs": recs, "weights": weights},
-        open(out_dir / "recs.json", "w"),
-        indent=2
+    # Hydrate
+    hyd = hydrate_items(
+        tmdb,
+        base_pool,
+        limit=min(cfg.max_id_hydration, len(base_pool)),
+        heartbeat_every=cfg.heartbeat_every,
+        heartbeat_fn=_heartbeat("hydrate")
     )
 
-    telemetry_full = {
-        "pool": tel.counts.get("tmdb_pool", 0),
-        "eligible_unseen": tel.counts.get("eligible_unseen", 0),
-        "after_skip": tel.counts.get("eligible_unseen", 0),
-        "shortlist": tel.counts.get("shortlist", shortlist_n),
-        "shown": tel.counts.get("shown", shown_n),
-        **tel.to_dict(),
-    }
-    json.dump(telemetry_full, open(out_dir / "telemetry.json", "w"), indent=2)
+    # Provider filter (only your services)
+    allowed = set(cfg.subs_include)
+    pass_prov: List[dict] = []
+    provider_hit_buckets: List[List[str]] = []
+    for it in hyd:
+        ok, hits = title_has_allowed_provider(it.get("providers") or {}, list(allowed), cfg.region)
+        if ok:
+            provider_hit_buckets.append(hits)
+            pass_prov.append(it)
 
-    def _row(r: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "imdb_id": _safe(r, "imdb_id", ""),
-            "title": _safe(r, "title", ""),
-            "year": _safe(r, "year", 0),
-            "type": _safe(r, "type", ""),
-            "match": _safe(r, "match", 0.0),
-            "imdb_rating": _safe(r, "imdb_rating"),
-            "rt_tomato": _safe(r, "rt_tomato"),
-            "rt_audience": _safe(r, "rt_audience"),
-            "tmdb_vote_average": _safe(r, "tmdb_vote_average"),
-            "providers": _safe(r, "providers", []),
-            "region": _safe(r, "region"),
-            "original_language": _safe(r, "original_language"),
+    # Unseen filter (based on IMDb IDs when available)
+    unseen: List[dict] = []
+    for it in pass_prov:
+        imdb_id = it.get("imdb_id")
+        if imdb_id and seen.is_seen_imdb(imdb_id):
+            continue
+        unseen.append(it)
+
+    # Score & rank
+    ranked = _score_items(cfg, unseen)
+    topN = ranked[:10]
+
+    # Telemetry & breakdown
+    provider_breakdown = summarize_provider_hits(provider_hit_buckets)
+    telemetry = {
+        "pool": len(base_pool),
+        "eligible_unseen": len(unseen),
+        "after_skip": len(unseen),  # skip window logic would reduce; not applied here
+        "shown": len(topN),
+        "notes": {
+            "language_filter": cfg.original_langs,
+            "subs_filter_enforced": True,
+            "movie_pages": movie_pages,
+            "tv_pages": tv_pages
         }
-
-    feed = {
-        "date": today,
-        "weights": weights,
-        "telemetry": telemetry_full,
-        "top": [_row(r) for r in recs[:25]],
     }
-    json.dump(feed, open(out_dir / "assistant_feed.json", "w"), indent=2)
+    weights = {
+        "critic_weight": cfg.critic_weight,
+        "audience_weight": cfg.audience_weight,
+        "commitment_cost_scale": cfg.commitment_cost_scale,
+        "novelty_pressure": cfg.novelty_pressure,
+    }
 
+    # Console summary
+    print("—"*60)
+    print(f"Provider breakdown (kept): {json.dumps(provider_breakdown, indent=2)}")
+    print(f"Telemetry: pool={telemetry['pool']}, eligible={telemetry['eligible_unseen']}, shown={telemetry['shown']}")
+    print(f"Weights: critic={cfg.critic_weight:.2f}, audience={cfg.audience_weight:.2f}")
+    print("—"*60)
+
+    # Persist outputs
+    today = datetime.date.today().isoformat()
+    out_dir = os.path.join(cfg.out_dir, today)
+    _ensure_dirs(out_dir)
+
+    with open(os.path.join(out_dir, "top10.json"), "w", encoding="utf-8") as f:
+        json.dump(topN, f, ensure_ascii=False, indent=2)
+
+    with open(os.path.join(out_dir, "telemetry.json"), "w", encoding="utf-8") as f:
+        json.dump({"telemetry": telemetry, "weights": weights, "provider_breakdown": provider_breakdown}, f, indent=2)
+
+    # Emit a compact "email/issue" body to stdout for external tooling to pick up
+    def fmt_row(i, r):
+        return f"{i:>2} {r['match']:.1f} — {r.get('title')} ({r.get('year')}) [{r.get('type')}]"
+
+    print()
+    print("Top 10")
+    for i, r in enumerate(topN, 1):
+        print(fmt_row(i, r))
+    print(f"Telemetry: pool={telemetry['pool']}, eligible={telemetry['eligible_unseen']}, after_skip={telemetry['after_skip']}, shown={telemetry['shown']}")
+    print(f"Weights: critic={cfg.critic_weight:.2f}, audience={cfg.audience_weight:.2f}")
+    print("This product uses the TMDB and OMDb APIs but is not endorsed or certified by them.")
+    print()
     print(f"Run complete. See: {out_dir}")
 
 if __name__ == "__main__":
