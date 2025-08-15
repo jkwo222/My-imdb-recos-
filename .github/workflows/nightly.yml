@@ -305,6 +305,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Probe IMDb from runner
+        run: |
+          curl -I https://www.imdb.com/user/ur18684433/ratings | sed -n '1,20p'
+
       - name: Run engine
         env:
           # Pass both; runner resolves either a full URL or a bare user ID
