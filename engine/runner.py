@@ -20,17 +20,18 @@ def _dump_json(path: str, obj) -> None:
 
 def _weights_from_env() -> Tuple[float, float, float, float]:
     """
-    Audience may be lower or higher than critic. We simply *weight* audience more by default.
+    Audience may be lower or higher than critic in absolute score; we simply *weight* audience more.
     Env overrides are respected exactly, then normalized.
     """
-    cw = float(os.environ.get("CRITIC_WEIGHT", os.environ.get("CRITIC_SCORE_WEIGHT", 0.35)))
-    aw = float(os.environ.get("AUDIENCE_WEIGHT", os.environ.get("AUDIENCE_SCORE_WEIGHT", 0.65)))
+    # audience-forward defaults
+    cw = float(os.environ.get("CRITIC_WEIGHT", os.environ.get("CRITIC_SCORE_WEIGHT", 0.25)))
+    aw = float(os.environ.get("AUDIENCE_WEIGHT", os.environ.get("AUDIENCE_SCORE_WEIGHT", 0.75)))
     np = float(os.environ.get("NOVELTY_PRESSURE", 0.15))
     cc = float(os.environ.get("COMMITMENT_COST_SCALE", 1.0))
 
     total = cw + aw
     if total <= 0:
-        cw, aw = 0.35, 0.65
+        cw, aw = 0.25, 0.75
         total = 1.0
     cw, aw = cw / total, aw / total
     return cw, aw, np, cc
@@ -54,7 +55,7 @@ def main():
     pool, meta = cat.build_pool()
     _hb(f"catalog:end pool={len(pool)} movie={meta.get('pool_counts',{}).get('movie',0)} tv={meta.get('pool_counts',{}).get('tv',0)}")
 
-    # 3) Seen filter (uses IMDb ttids when available, else title+year)
+    # 3) Seen filter
     _hb("filter:unseen")
     pool_unseen = filter_unseen(pool, seen)
     _hb(f"filter:end kept={len(pool_unseen)} dropped={len(pool)-len(pool_unseen)}")
@@ -115,11 +116,15 @@ def main():
         "top10": top10,
     }
 
+    def _dump_json(path: str, obj) -> None:
+      os.makedirs(os.path.dirname(path), exist_ok=True)
+      with open(path, "w", encoding="utf-8") as f:
+          json.dump(obj, f, ensure_ascii=False, indent=2)
+
     _dump_json(os.path.join(daily_dir, "assistant_feed.json"), feed)
     _dump_json(os.path.join(daily_dir, "top10.json"), top10)
     _dump_json(os.path.join(daily_dir, "telemetry.json"), telemetry)
 
-    # Console summary
     print(f"Run complete in {int(time.time()-start)}s.")
     print(f"Weights: critic={cw:.2f}, audience={aw:.2f}")
     print(f"Counts: tmdb_pool={len(pool)}, eligible_unseen={len(pool_unseen)}, shortlist={len(shortlist)}, shown={len(shown)}")
