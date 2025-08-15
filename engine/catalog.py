@@ -1,317 +1,295 @@
 # engine/catalog.py
 from __future__ import annotations
-import json, math, os, random, time, zlib
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, Any, List, Tuple
-from urllib import request, parse, error
-import datetime
+import hashlib
+import json
+import math
+import os
+import random
+import time
+from typing import Dict, List, Optional, Tuple
 
-from engine import seen_index as seen
+import requests
 
-_TMDB_KEY = os.environ.get("TMDB_API_KEY", "").strip()
-_BASE = "https://api.themoviedb.org/3"
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "").strip()
+BASE = "https://api.themoviedb.org/3"
+CACHE_DIR = os.environ.get("CACHE_DIR", "data/cache")
+USER_PROVIDERS_JSON = os.path.join(CACHE_DIR, "user_providers.json")
+PROVIDER_MAP_JSON = os.path.join(CACHE_DIR, "provider_map.json")
 
-# ----- module-level debug/meta export -----
-_last_plan_meta: Dict[str, Any] = {}
+# language/region defaults (English only)
+LANG = os.environ.get("LANGUAGE", "en-US")
+WITH_ORIG_LANG = os.environ.get("WITH_ORIGINAL_LANGUAGE", "en")
+WATCH_REGION = os.environ.get("WATCH_REGION", "US")
 
-def get_last_plan_meta() -> Dict[str, Any]:
-    """Expose the most recent page-plan metadata for telemetry."""
-    return dict(_last_plan_meta)
+# page counts & rotation
+MOVIE_PAGES = int(os.environ.get("MOVIE_PAGES", "48"))
+TV_PAGES = int(os.environ.get("TV_PAGES", "48"))
+ROTATE_MIN = int(os.environ.get("ROTATE_MINUTES", "15"))  # per your spec
 
-# -------- HTTP helpers --------
-def _http_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    params = {k: v for k, v in params.items() if v is not None}
-    q = parse.urlencode(params)
-    url = f"{_BASE}{path}?{q}"
-    req = request.Request(url, headers={"Accept": "application/json"})
-    with request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+_LAST_META: Dict = {}
 
-def _sleep_backoff(i: int) -> None:
-    time.sleep(min(0.35 + i * 0.05, 1.0))
+def _ensure_dirs():
+    os.makedirs(CACHE_DIR, exist_ok=True)
 
-# -------- Page plan (daily permutation + intra-day rolling window) --------
-def _daily_seed(salt: str = "") -> int:
-    # Daily seed (UTC) so the permutation changes each day but is stable within a day.
-    today = datetime.datetime.utcnow().date()
-    return zlib.adler32(f"{today.isoformat()}::{salt}".encode("utf-8"))
+def _hb(msg: str):
+    print(f"[cat] {msg}", flush=True)
 
-def _perm_1_to_cap(cap: int, salt: str) -> List[int]:
-    rng = random.Random(_daily_seed(salt))
-    pages = list(range(1, cap + 1))
-    rng.shuffle(pages)
+def _get(url: str, params: Dict) -> Dict:
+    if not TMDB_API_KEY:
+        raise RuntimeError("TMDB_API_KEY is not set")
+    headers = {"Accept": "application/json"}
+    params = dict(params or {})
+    params["api_key"] = TMDB_API_KEY
+    r = requests.get(url, params=params, headers=headers, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+def _slot_and_salt() -> Tuple[int, int]:
+    # 15-min rotation slot (configurable)
+    slot = int(time.time() // (ROTATE_MIN * 60))
+    # persistent salt for this environment
+    _ensure_dirs()
+    salt_path = os.path.join(CACHE_DIR, "tmdb_page_salt.txt")
+    if os.path.exists(salt_path):
+        with open(salt_path, "r") as f:
+            salt = int(f.read().strip() or "0")
+    else:
+        salt = random.randint(10_000, 9_999_999)
+        with open(salt_path, "w") as f:
+            f.write(str(salt))
+    return slot, salt
+
+def _permute(total_pages: int, desired: int, slot: int, salt: int, label: str) -> List[int]:
+    """
+    Choose 'desired' distinct pages in [1..total_pages], rotating each slot.
+    We use a coprime step and a hash-mixed start so pages change frequently.
+    """
+    desired = max(1, min(desired, total_pages))
+    # derive a pseudo-random start and step from salt+label
+    h = int(hashlib.blake2s(f"{salt}:{slot}:{label}".encode(), digest_size=8).hexdigest(), 16)
+    start = (h % total_pages)
+    # pick an odd step coprime-ish to total_pages
+    step = (2 * (h % (total_pages // 2)) + 1) or 1
+    pages = []
+    seen = set()
+    cur = start
+    while len(pages) < desired:
+        p = (cur % total_pages) + 1
+        if p not in seen:
+            pages.append(p)
+            seen.add(p)
+        cur += step
     return pages
 
-def _slot_index(rotate_minutes: int) -> int:
-    # UTC slot index; changes every rotate_minutes.
-    period = max(1, rotate_minutes) * 60
-    return int(time.time() // period)
-
-def _fingerprint(lst: List[int]) -> str:
-    return f"{zlib.adler32((','.join(map(str, lst))).encode()):08x}"
-
-def _rolling_page_plan(
-    count: int,
-    cap: int,
-    *,
-    salt: str,
-    rotate_minutes: int,
-    step: int | None,
-) -> tuple[List[int], Dict[str, Any]]:
+def _load_user_provider_names() -> List[str]:
     """
-    Build a daily-shuffled permutation of 1..cap and select a contiguous window
-    of 'count' pages whose start offset rolls every 'rotate_minutes' by 'step'.
-
-    step default: count (disjoint windows) -> maximum novelty before wrap.
+    Your services only. Sources (in order):
+      1) ENV MY_STREAMING_PROVIDERS (CSV of names)
+      2) /mnt/data/providers.json  (["Netflix","Max",..."])
+      3) cached snapshot data/cache/user_providers.json
     """
-    cap = max(1, cap)
-    n = max(0, min(count, cap))
-    perm = _perm_1_to_cap(cap, salt=salt)
-    slot = _slot_index(rotate_minutes)
-    step_val = max(1, step or n or 1)
-    offset = (slot * step_val) % cap
+    # 1) env
+    envv = os.environ.get("MY_STREAMING_PROVIDERS", "").strip()
+    if envv:
+        names = [x.strip() for x in envv.split(",") if x.strip()]
+        _ensure_dirs()
+        with open(USER_PROVIDERS_JSON, "w", encoding="utf-8") as f:
+            json.dump(names, f, ensure_ascii=False, indent=2)
+        return names
 
-    # Take contiguous block with wrap-around
-    window = perm[offset:offset + n]
-    if len(window) < n:
-        window += perm[: (n - len(window))]
+    # 2) file
+    try:
+        path = "/mnt/data/providers.json"
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                arr = json.load(f)
+            if isinstance(arr, list):
+                names = [str(x).strip() for x in arr if str(x).strip()]
+                _ensure_dirs()
+                with open(USER_PROVIDERS_JSON, "w", encoding="utf-8") as f:
+                    json.dump(names, f, ensure_ascii=False, indent=2)
+                return names
+    except Exception:
+        pass
 
-    meta = {
-        "cap": cap,
-        "requested": count,
-        "rotate_minutes": rotate_minutes,
-        "utc_slot_index": slot,
-        "offset": offset,
-        "step": step_val,
-        "hash": _fingerprint(window),
-        "first5": window[:5],
-    }
-    return window, meta
-
-# -------- Normalize results --------
-def _norm_movie(m: Dict[str, Any]) -> Dict[str, Any]:
-    title = m.get("title") or m.get("original_title") or ""
-    y = (m.get("release_date") or "")[:4]
-    return {
-        "type": "movie",
-        "tmdb_id": int(m.get("id")),
-        "title": title,
-        "year": int(y) if y.isdigit() else None,
-        "original_language": m.get("original_language"),
-        "tmdb_vote_average": m.get("vote_average"),
-        "tmdb_votes": m.get("vote_count"),
-        "region": None,  # runner can fill this in notes if desired
-    }
-
-def _norm_tv(tv: Dict[str, Any]) -> Dict[str, Any]:
-    title = tv.get("name") or tv.get("original_name") or ""
-    y = (tv.get("first_air_date") or "")[:4]
-    return {
-        "type": "tvSeries",
-        "tmdb_id": int(tv.get("id")),
-        "title": title,
-        "year": int(y) if y.isdigit() else None,
-        "original_language": tv.get("original_language"),
-        "tmdb_vote_average": tv.get("vote_average"),
-        "tmdb_votes": tv.get("vote_count"),
-        "region": None,
-    }
-
-# -------- Base fetch --------
-def fetch_tmdb_base(
-    pages_movie: int = 60,
-    pages_tv: int = 60,
-    region: str = "US",
-    langs: List[str] | None = None,
-    include_tv_seasons: bool = True,
-    max_items: int = 6000,
-) -> List[Dict[str, Any]]:
-    """
-    Collect a large mixed pool from TMDB discover using a *daily* permutation
-    with an *intra-day* rolling window that advances every rotate_minutes.
-    """
-    global _last_plan_meta
-    _last_plan_meta = {}
-
-    if not _TMDB_KEY:
-        return []
-
-    langs = langs or ["en"]
-
-    # Sorts (tunable via env)
-    movie_sort = os.environ.get("TMDB_MOVIE_SORT", "vote_count.desc")
-    tv_sort = os.environ.get("TMDB_TV_SORT", "vote_count.desc")
-
-    # Rotation controls
-    cap = int(os.environ.get("TMDB_PAGE_CAP", "500") or "500")
-    rotate_minutes = int(os.environ.get("TMDB_ROTATE_MINUTES", "15") or "15")
-    step_global = os.environ.get("TMDB_ROTATE_STEP")
-    step_movie = int(os.environ.get("TMDB_ROTATE_STEP_MOVIE", step_global or "0") or "0") or None
-    step_tv = int(os.environ.get("TMDB_ROTATE_STEP_TV", step_global or "0") or "0") or None
-
-    # Build page plans
-    movie_pages, movie_meta = _rolling_page_plan(
-        pages_movie, cap,
-        salt=f"movie::{region}::{','.join(langs)}::{movie_sort}",
-        rotate_minutes=rotate_minutes,
-        step=step_movie,
-    )
-    tv_pages, tv_meta = _rolling_page_plan(
-        pages_tv, cap,
-        salt=f"tv::{region}::{','.join(langs)}::{tv_sort}",
-        rotate_minutes=rotate_minutes,
-        step=step_tv,
-    )
-
-    # Accumulate plan meta for telemetry
-    _last_plan_meta = {
-        "rotate_minutes": rotate_minutes,
-        "cap": cap,
-        "movie_pages": len(movie_pages),
-        "tv_pages": len(tv_pages),
-        "movie_hash": movie_meta["hash"],
-        "tv_hash": tv_meta["hash"],
-        "movie_first5": movie_meta["first5"],
-        "tv_first5": tv_meta["first5"],
-        "slot": movie_meta["utc_slot_index"],  # same cadence; keep one
-        "step_movie": movie_meta["step"],
-        "step_tv": tv_meta["step"],
-        "offset_movie": movie_meta["offset"],
-        "offset_tv": tv_meta["offset"],
-    }
-
-    out: List[Dict[str, Any]] = []
-
-    # Movies
-    for i, p in enumerate(movie_pages, 1):
+    # 3) cached
+    if os.path.exists(USER_PROVIDERS_JSON):
         try:
-            data = _http_get("/discover/movie", {
-                "api_key": _TMDB_KEY,
-                "page": p,
-                "include_adult": "false",
-                "include_video": "false",
-                "sort_by": movie_sort,
-                "watch_region": region,
-            })
-            for m in (data.get("results") or []):
-                out.append(_norm_movie(m))
-            if len(out) >= max_items:
-                return out[:max_items]
-        except error.HTTPError as e:
-            if e.code == 429:
-                _sleep_backoff(i)
-                continue
+            with open(USER_PROVIDERS_JSON, "r", encoding="utf-8") as f:
+                arr = json.load(f)
+            if isinstance(arr, list):
+                return [str(x).strip() for x in arr if str(x).strip()]
         except Exception:
-            continue
+            pass
 
-    # TV
-    for i, p in enumerate(tv_pages, 1):
+    # Last resort: no names (we will NOT fail—pool would be too fragile)
+    return []
+
+def _provider_map(kind: str) -> Dict[str, int]:
+    """
+    Map provider names -> IDs for a given kind ("movie" or "tv") in WATCH_REGION.
+    Cached to avoid spamming TMDB.
+    """
+    _ensure_dirs()
+    cache_key = f"{PROVIDER_MAP_JSON}"
+    data = {}
+    if os.path.exists(cache_key):
         try:
-            data = _http_get("/discover/tv", {
-                "api_key": _TMDB_KEY,
-                "page": p,
-                "sort_by": tv_sort,
-                "include_null_first_air_dates": "false",
-                "watch_region": region,
-            })
-            for tv in (data.get("results") or []):
-                out.append(_norm_tv(tv))
-            if len(out) >= max_items:
-                return out[:max_items]
-        except error.HTTPError as e:
-            if e.code == 429:
-                _sleep_backoff(i)
-                continue
+            with open(cache_key, "r", encoding="utf-8") as f:
+                data = json.load(f)
         except Exception:
-            continue
+            data = {}
+    if kind in (data.get("movie") or {}) and kind in (data.get("tv") or {}):
+        pass
 
-    return out[:max_items]
+    if kind not in data:
+        data[kind] = {}
 
-# -------- Enrichment --------
-def enrich_with_ids(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Hydrate imdb_id via external_ids (bounded to avoid rate blowups)."""
-    if not _TMDB_KEY:
-        return items
-    limit = int(os.environ.get("MAX_ID_HYDRATION", "1200") or "1200")
-    count = 0
-    for it in items:
-        if count >= limit:
-            break
-        if it.get("imdb_id"):
-            continue
-        typ = it.get("type")
-        tid = it.get("tmdb_id")
-        if not typ or not tid:
-            continue
-        path = f"/{ 'tv' if typ=='tvSeries' else 'movie' }/{tid}/external_ids"
-        try:
-            data = _http_get(path, {"api_key": _TMDB_KEY})
-            imdb_id = data.get("imdb_id")
-            if imdb_id:
-                it["imdb_id"] = imdb_id
-            count += 1
-        except error.HTTPError as e:
-            if e.code == 429:
-                _sleep_backoff(count)
-                continue
-        except Exception:
-            continue
-    return items
+    url = f"{BASE}/watch/providers/{'movie' if kind=='movie' else 'tv'}"
+    res = _get(url, {"watch_region": WATCH_REGION})
+    mp: Dict[str, int] = {}
+    for entry in res.get("results", []):
+        name = (entry.get("provider_name") or "").strip()
+        pid = entry.get("provider_id")
+        if name and isinstance(pid, int):
+            mp[name.lower()] = pid
+    data[kind] = mp
+    with open(cache_key, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return mp
 
-def enrich_with_votes(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    for it in items:
-        it["tmdb_vote"] = it.get("tmdb_vote_average")
-    return items
-
-def enrich_with_ratings(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # Placeholder for OMDb/RT; keep as pass-through to avoid heavy external calls.
-    return items
-
-# -------- Filters --------
-def filter_seen(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    out = []
-    for it in items:
-        imdb_id = it.get("imdb_id")
-        if imdb_id and seen.is_seen_imdb(imdb_id):
-            continue
-        out.append(it)
+def _names_to_ids(names: List[str], kind: str) -> List[int]:
+    mp = _provider_map(kind)
+    ids = []
+    for n in names:
+        k = n.strip().lower()
+        if k in mp:
+            ids.append(mp[k])
+    # de-dup preserve order
+    out, seen = [], set()
+    for x in ids:
+        if x not in seen:
+            out.append(x); seen.add(x)
     return out
 
-def filter_by_langs(items: List[Dict[str, Any]], langs: List[str]) -> List[Dict[str, Any]]:
-    if not langs:
-        return items
-    allow = set(x.strip().lower() for x in langs)
-    return [it for it in items if (it.get("original_language") or "").lower() in allow]
+def _discover(kind: str, pages: List[int], provider_ids: List[int]) -> List[Dict]:
+    """
+    Fetch discover results for kind in those pages. English only.
+    """
+    items: List[Dict] = []
+    with_prov = "|".join(str(i) for i in provider_ids) if provider_ids else None
+    sorts = ["popularity.desc", "vote_count.desc", "primary_release_date.desc" if kind=="movie" else "first_air_date.desc"]
+    for i, pg in enumerate(pages):
+        sort_by = sorts[i % len(sorts)]
+        params = {
+            "language": LANG,
+            "with_original_language": WITH_ORIG_LANG,
+            "page": pg,
+            "sort_by": sort_by,
+            "watch_region": WATCH_REGION,
+            "with_watch_monetization_types": "flatrate,ads,free"
+        }
+        if with_prov := with_prov:
+            params["with_watch_providers"] = with_prov
+        url = f"{BASE}/discover/{'movie' if kind=='movie' else 'tv'}"
+        data = _get(url, params)
+        for r in data.get("results", []):
+            if kind == "movie":
+                items.append({
+                    "type": "movie",
+                    "id": r.get("id"),
+                    "tmdb_id": r.get("id"),
+                    "title": r.get("title") or r.get("original_title"),
+                    "original_title": r.get("original_title"),
+                    "release_date": r.get("release_date"),
+                    "year": (int(r["release_date"][:4]) if r.get("release_date", "")[:4].isdigit() else None),
+                    "vote_average": r.get("vote_average"),
+                    "vote_count": r.get("vote_count"),
+                })
+            else:
+                items.append({
+                    "type": "tvSeries",
+                    "id": r.get("id"),
+                    "tmdb_id": r.get("id"),
+                    "name": r.get("name") or r.get("original_name"),
+                    "original_name": r.get("original_name"),
+                    "first_air_date": r.get("first_air_date"),
+                    "year": (int(r["first_air_date"][:4]) if r.get("first_air_date", "")[:4].isdigit() else None),
+                    "vote_average": r.get("vote_average"),
+                    "vote_count": r.get("vote_count"),
+                })
+    return items
 
-def filter_by_providers(items: List[Dict[str, Any]], allowed: List[str]) -> List[Dict[str, Any]]:
-    if not allowed:
-        return items
-    allow = set(a.strip().lower() for a in allowed)
-    def ok(it: Dict[str, Any]) -> bool:
-        provs = [p.lower() for p in (it.get("providers") or [])]
-        return bool(allow.intersection(provs))
-    return [it for it in items if ok(it)]
+def _total_pages(kind: str, provider_ids: List[int]) -> int:
+    params = {
+        "language": LANG,
+        "with_original_language": WITH_ORIG_LANG,
+        "page": 1,
+        "watch_region": WATCH_REGION,
+        "with_watch_monetization_types": "flatrate,ads,free"
+    }
+    if provider_ids:
+        params["with_watch_providers"] = "|".join(str(i) for i in provider_ids)
+    url = f"{BASE}/discover/{'movie' if kind=='movie' else 'tv'}"
+    data = _get(url, params)
+    return int(data.get("total_pages") or 1)
 
-# -------- Scoring --------
-def _norm01(x: float, lo: float, hi: float) -> float:
+def _plan_pages() -> Dict[str, List[int]]:
+    slot, salt = _slot_and_salt()
+    # Provider names -> IDs
+    names = _load_user_provider_names()
+    movie_ids = _names_to_ids(names, "movie")
+    tv_ids = _names_to_ids(names, "tv")
+
+    # Get total pages once to bound the permutation
     try:
-        return max(0.0, min(1.0, (x - lo) / (hi - lo)))
+        total_m = _total_pages("movie", movie_ids)
     except Exception:
-        return 0.0
+        total_m = 1
+    try:
+        total_t = _total_pages("tv", tv_ids)
+    except Exception:
+        total_t = 1
 
-def score_and_rank(items: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
-    cw = float(os.environ.get("CRITIC_WEIGHT", "0.56"))
-    aw = float(os.environ.get("AUDIENCE_WEIGHT", "0.44"))
-    novelty = float(os.environ.get("NOVELTY_PRESSURE", "0.15"))
-    for it in items:
-        vavg = float(it.get("tmdb_vote_average") or 0.0)
-        vcnt = float(it.get("tmdb_votes") or 0.0)
-        critic = _norm01(vavg, 5.0, 9.0)
-        audience = _norm01(math.log10(vcnt + 1.0), 0.0, 5.0)
-        base = cw * critic + aw * audience
-        novelty_bump = novelty * (1.0 - audience) * 0.5
-        match = 100.0 * (base + novelty_bump)
-        it["match"] = round(match, 1)
-    ranked = sorted(items, key=lambda r: (r.get("match") or 0.0, r.get("tmdb_vote_average") or 0.0), reverse=True)
-    return ranked, {"critic_weight": cw, "audience_weight": aw, "commitment_cost_scale": 1.0, "novelty_pressure": novelty}
+    # Plan rotating pages
+    pages_m = _permute(total_m, MOVIE_PAGES, slot, salt, "movie")
+    pages_t = _permute(total_t, TV_PAGES, slot, salt, "tv")
+
+    meta = {
+        "movie_pages": len(pages_m),
+        "tv_pages": len(pages_t),
+        "rotate_minutes": ROTATE_MIN,
+        "slot": slot,
+        "total_pages": {"movie": total_m, "tv": total_t},
+        "provider_names": names,
+        "provider_ids": {"movie": movie_ids, "tv": tv_ids},
+        "language": LANG,
+        "with_original_language": WITH_ORIG_LANG,
+        "watch_region": WATCH_REGION
+    }
+    return {"movie": pages_m, "tv": pages_t, "meta": meta}
+
+def build_pool() -> List[Dict]:
+    """
+    Returns a combined list of movie+tv dicts honoring your provider & language constraints.
+    Rotation ensures pages change every ROTATE_MIN minutes.
+    """
+    global _LAST_META
+    _ensure_dirs()
+    plan = _plan_pages()
+    _LAST_META = plan["meta"]
+    prov_ids_m = plan["meta"]["provider_ids"]["movie"]
+    prov_ids_t = plan["meta"]["provider_ids"]["tv"]
+
+    _hb(f"plan: movies={len(plan['movie'])} tv={len(plan['tv'])} slot={_LAST_META['slot']} "
+        f"prov_m={len(prov_ids_m)} prov_t={len(prov_ids_t)}")
+
+    movies = _discover("movie", plan["movie"], prov_ids_m)
+    tv = _discover("tv", plan["tv"], prov_ids_t)
+
+    pool = movies + tv
+    _LAST_META["pool_counts"] = {"movie": len(movies), "tv": len(tv), "total": len(pool)}
+    return pool
+
+def last_meta() -> Dict:
+    return dict(_LAST_META)
