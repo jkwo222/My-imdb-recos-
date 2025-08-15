@@ -1,25 +1,11 @@
 # engine/runner.py
-import os, json, datetime, sys, pathlib
+import os, json, datetime, pathlib
 from rich import print
 from engine.seen_index import update_seen_from_ratings
 from engine.autolearn import update_from_ratings, load_weights
 from engine.catalog_builder import build_catalog
 
-# Try to import the optional IMDb HTML scraper.
-# If it's missing (or later removed), we still run using CSV.
-try:
-    from engine.imdb_ingest import scrape_imdb_ratings, to_rows
-    HAVE_IMDB_SCRAPER = True
-except Exception:
-    scrape_imdb_ratings = None
-    to_rows = None
-    HAVE_IMDB_SCRAPER = False
-
 def _load_ratings_from_csv(csv_path: str):
-    """
-    Load IMDb ratings from CSV (preferred for reliability).
-    Supports official IMDb export or your curated data/ratings.csv.
-    """
     rows = []
     if not csv_path or not os.path.exists(csv_path):
         return rows
@@ -40,40 +26,22 @@ def _load_ratings_from_csv(csv_path: str):
     return rows
 
 def main():
-    # ---- Load ratings (CSV first, then optional web) -------------
-    imdb_user = os.environ.get("IMDB_USER_ID","").strip()
+    # 1) Ratings ingest (CSV preferred)
     csv_path  = os.environ.get("IMDB_RATINGS_CSV_PATH","").strip()
-
-    rows = []
-    if csv_path and os.path.exists(csv_path):
-        print(f"[bold]IMDb ingest (CSV):[/bold] {csv_path}")
-        rows = _load_ratings_from_csv(csv_path)
-    elif imdb_user and HAVE_IMDB_SCRAPER:
-        url = f"https://www.imdb.com/user/{imdb_user}/ratings"
-        print(f"[bold]IMDb ingest (web):[/bold] {url}")
-        try:
-            rows = to_rows(scrape_imdb_ratings(url))
-        except Exception as e:
-            print(f"[yellow]IMDb web ingest failed ({e}). Continuing without update.[/yellow]")
-    else:
-        if imdb_user and not HAVE_IMDB_SCRAPER:
-            print("[yellow]IMDB_USER_ID set but imdb_ingest module not available. Prefer CSV path.[/yellow]")
-        else:
-            print("[yellow]No ratings source configured; continuing without update.[/yellow]")
-
-    # ---- Save ingest + update seen index + autolearn -------------
-    today = datetime.date.today().isoformat()
-    os.makedirs("data/ingest", exist_ok=True)
+    rows = _load_ratings_from_csv(csv_path) if csv_path else []
     if rows:
-        json.dump(rows, open(f"data/ingest/ratings_{today}.json","w"), indent=2)
+        print(f"[bold]IMDb ingest (CSV):[/bold] {csv_path} — {len(rows)} rows")
         update_seen_from_ratings(rows)
-    weights = update_from_ratings(rows) if rows else load_weights()
+        weights = update_from_ratings(rows)
+    else:
+        print("[yellow]No ratings CSV found; using last learned weights.[/yellow]")
+        weights = load_weights()
 
-    # ---- Build catalog (TMDB + OMDb) -----------------------------
-    print("[bold]Building catalog …[/bold]")
+    # 2) Build catalog (TMDB + OMDb) with English + providers + ratings
+    print("[bold]Building catalog…[/bold]")
     catalog = build_catalog()
 
-    # ---- Filter to your subscriptions by default -----------------
+    # 3) Subscription filter (default to your services)
     subs_env = os.environ.get(
         "SUBS_INCLUDE",
         "netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus"
@@ -85,26 +53,47 @@ def main():
 
     eligible = [c for c in catalog if on_subs(c)]
 
-    # ---- Recommend ------------------------------------------------
+    # 4) Recommend
     from engine.recommender import recommend
     recs = recommend(eligible, weights)
 
-    # ---- Output files --------------------------------------------
+    # 5) Output
+    today = datetime.date.today().isoformat()
     out_dir = pathlib.Path(f"data/out/daily/{today}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    json.dump({"date": str(today), "recs": recs, "weights": weights}, open(out_dir/"recs.json","w"), indent=2)
     json.dump({
-        "eligible_unseen": len(eligible),
+        "date": str(today),
+        "recs": recs,
+        "weights": weights
+    }, open(out_dir/"recs.json","w"), indent=2)
+
+    json.dump({
+        "pool": len(catalog),
+        "eligible_after_subs": len(eligible),
         "considered": len(eligible),
         "shortlist": min(50, len(recs)),
-        "shown": min(10, len(recs)),
-        "dedupe": {"pre": 0, "post": 0, "output": 0}
+        "shown": min(10, len(recs))
     }, open(out_dir/"telemetry.json","w"), indent=2)
 
-    feed = {
-        "version": "v2.13-feed-1",
-        "generated_at": datetime.datetime.utcnow().isoformat()+"Z",
+    # Keep an assistant feed the workflow can summarize into the Issue
+    top = []
+    for r in recs[:200]:
+        top.append({
+            "title": r.get("title",""),
+            "year": r.get("year",0),
+            "type": r.get("type",""),
+            "seasons": r.get("seasons",1),
+            "imdb_id": r.get("imdb_id",""),
+            "critic_rt": round(100 * float(r.get("critic",0.0))),
+            "audience_imdb": round(10 * float(r.get("audience",0.0)), 1),
+            "providers": r.get("providers",[]),
+            "match": r.get("match",0.0),
+        })
+
+    json.dump({
+        "version": "v2.13-sync-omdb-tmdb",
+        "generated_at": datetime.datetime.utcnow().isoformat() + "Z",
         "weights": weights,
         "telemetry": {
             "pool": len(catalog),
@@ -112,24 +101,10 @@ def main():
             "shortlist": min(50, len(recs)),
             "shown": min(10, len(recs))
         },
-        "top": [
-            {
-                "imdb_id": r.get("imdb_id",""),
-                "title": r.get("title",""),
-                "year": r.get("year",0),
-                "type": r.get("type",""),
-                "seasons": r.get("seasons",1),
-                "critic": r.get("critic",0.0),
-                "audience": r.get("audience",0.0),
-                "match": r.get("match",0.0),
-                "providers": r.get("providers",[])
-            } for r in recs[:200]
-        ],
-        "considered_sample": [c.get("imdb_id","") for c in eligible[:200]]
-    }
-    open(out_dir/"assistant_feed.json","w",encoding="utf-8").write(json.dumps(feed, indent=2))
+        "top": top
+    }, open(out_dir/"assistant_feed.json","w"), indent=2)
 
-    print("[green]Run complete.[/green] See:", out_dir)
+    print(f"[green]Run complete.[/green] See: {out_dir}")
 
 if __name__ == "__main__":
     main()
