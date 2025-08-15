@@ -1,42 +1,34 @@
-name: nightly
+name: Nightly / Run Engine
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   schedule:
-    - cron: "17 3 * * *"  # daily 03:17 UTC
+    - cron: "15 3 * * *"  # 03:15 UTC daily (adjust as you like)
 
-env:
-  PAGES_MOVIES: ${{ vars.PAGES_MOVIES || '120' }}
-  PAGES_TV: ${{ vars.PAGES_TV || '120' }}
-  OMDB_WORKERS: ${{ vars.OMDB_WORKERS || '8' }}
-  CATALOG_TTL_DAYS: ${{ vars.CATALOG_TTL_DAYS || '7' }}
-  PROVIDERS_TTL_DAYS: ${{ vars.PROVIDERS_TTL_DAYS || '1' }}
-  OMDB_TTL_DAYS: ${{ vars.OMDB_TTL_DAYS || '14' }}
+permissions:
+  contents: read
+  issues: write
 
 jobs:
   run:
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-      issues: write
+    runs-on: ubuntu-latest
+    env:
+      IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}       # e.g., ur18684433  (or set IMDB_RATINGS_URL instead)
+      TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+      OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
+      IMDB_RATINGS_CSV_PATH: data/ratings.csv         # your uploaded CSV baseline
+      # Tuning knobs (optional):
+      TMDB_PAGES_MOVIE: "5"        # discovery pages for movies
+      TMDB_PAGES_TV: "5"           # discovery pages for series
+      INCLUDE_TV_SEASONS: "true"   # fetch tv details to count seasons (more API calls)
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Cache data
-        uses: actions/cache@v4
-        with:
-            path: |
-              data/cache
-              data/catalog
-            key: cache-${{ runner.os }}-${{ hashFiles('engine/**', 'requirements.txt') }}
-            restore-keys: |
-              cache-${{ runner.os }}-
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install deps
         run: |
@@ -44,51 +36,50 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run engine
-        env:
-          IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}          # e.g., ur18684433
-          IMDB_RATINGS_URL: ${{ secrets.IMDB_RATINGS_URL }}  # optional
-          IMDB_RATINGS_CSV_URL: ${{ secrets.IMDB_RATINGS_CSV_URL }}  # optional
-          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
-          OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
-          PAGES_MOVIES: ${{ env.PAGES_MOVIES }}
-          PAGES_TV: ${{ env.PAGES_TV }}
-          OMDB_WORKERS: ${{ env.OMDB_WORKERS }}
-          CATALOG_TTL_DAYS: ${{ env.CATALOG_TTL_DAYS }}
-          PROVIDERS_TTL_DAYS: ${{ env.PROVIDERS_TTL_DAYS }}
-          OMDB_TTL_DAYS: ${{ env.OMDB_TTL_DAYS }}
-        run: |
-          python -m engine.runner
+        run: python -m engine.runner
 
-      - name: Upload results artifact
+      - name: Upload results (artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: results-${{ github.run_id }}
-          path: data/out/daily
+          name: recs-${{ github.run_id }}
+          path: |
+            data/out/daily/**
 
-      - name: Post Top 10 as an issue (push notification)
+      - name: Post GitHub Issue (mobile push)
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const path = 'data/out/daily/' + new Date().toISOString().slice(0,10) + '/recs.json';
-            const telemetryPath = 'data/out/daily/' + new Date().toISOString().slice(0,10) + '/telemetry.json';
-            const recs = JSON.parse(fs.readFileSync(path, 'utf8')).recs || [];
-            const telem = JSON.parse(fs.readFileSync(telemetryPath, 'utf8'));
-            const lines = [];
-            lines.push(`Run: https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`);
-            lines.push(``);
-            lines.push(`Top 10`);
-            for (let i=0; i<Math.min(10,recs.length); i++) {
-              const r = recs[i];
-              lines.push(`${String(i+1).padStart(2,' ')}. ${r.match} — ${r.title} (${r.year||'—'}) [${r.type}]`);
+            const path = 'data/out/daily';
+            const days = fs.readdirSync(path).sort();
+            if (days.length === 0) {
+              core.setFailed('No output folder found');
+              return;
             }
-            lines.push(``);
-            lines.push(`Telemetry: pool=${telem.eligible_unseen}, considered=${telem.considered}, shortlist=${telem.shortlist}, shown=${telem.shown}`);
-            lines.push(``);
-            lines.push(`This product uses the TMDB API but is not endorsed or certified by TMDB.`);
+            const dayDir = `${path}/${days[days.length-1]}`;
+            const recs = JSON.parse(fs.readFileSync(`${dayDir}/recs.json`, 'utf8'));
+            const tel  = JSON.parse(fs.readFileSync(`${dayDir}/telemetry.json`, 'utf8'));
+
+            function fmtItem(i, r) {
+              const y = r.year || '';
+              const t = r.type || '';
+              const m = r.match?.toFixed ? r.match.toFixed(1) : r.match;
+              return `${i}. ${m} — ${r.title} (${y}) [${t}]`;
+            }
+            const top = (recs.recs || []).slice(0, 10).map((r, i) => fmtItem(i+1, r)).join('\n');
+
+            const body = [
+              `Run: https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              'Top 10',
+              top || '(no results)',
+              `Telemetry: pool=${tel.eligible_unseen}, considered=${tel.considered}, shortlist=${tel.shortlist}, shown=${tel.shown}`,
+              '',
+              'This product uses the TMDB API but is not endorsed or certified by TMDB.'
+            ].join('\n');
+
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `Run: ${context.runId}`,
-              body: lines.join('\n')
+              title: 'Latest recommendations',
+              body
             });
