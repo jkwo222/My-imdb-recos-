@@ -1,2 +1,2 @@
-# engine/__init__.py
-# Make 'engine' an importable package. Intentionally minimal.
+# Keep package init minimal to avoid import side-effects
+__all__ = []  # don't expose submodules implicitly
