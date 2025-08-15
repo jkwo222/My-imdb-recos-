@@ -1,78 +1,89 @@
 # engine/seen_index.py
 from __future__ import annotations
-import csv, os, re
-from dataclasses import dataclass, field
-from typing import Dict, Set, Tuple, List
+import csv, os, unicodedata
+from typing import Dict, Iterable, List, Optional, Tuple
 
-IMDB_RATINGS_CSV_PATH = os.environ.get("IMDB_RATINGS_CSV_PATH", "data/ratings.csv")
-
-_norm_re = re.compile(r"[^a-z0-9]+")
+RATINGS_PATH_ENV = os.environ.get("IMDB_RATINGS_CSV_PATH", "data/ratings.csv")
 
 def _norm_title(t: str) -> str:
-    t = (t or "").lower()
-    t = _norm_re.sub("", t)
+    t = unicodedata.normalize("NFKD", t or "").encode("ascii", "ignore").decode("ascii")
+    t = t.lower()
+    repl = [("’","'"), ("&"," and "), (":"," "), ("-"," "), ("/"," "), ("."," "), (","," "), ("!"," "), ("?"," ")]
+    for a,b in repl: t = t.replace(a,b)
+    # strip articles
+    for art in (" the ", " a ", " an "):
+        if t.startswith(art.strip()+" "): t = t[len(art):]
+    t = " ".join(t.split())
     return t
 
-@dataclass
+def _kind_from_title_type(tt: str) -> Optional[str]:
+    tt = (tt or "").lower()
+    if tt in ("movie", "video", "tvmovie"): return "movie"
+    if tt in ("tvseries", "tvminiseries"): return "tvSeries"
+    # ignore episodes, shorts, etc., for seen filter purposes
+    return None
+
 class SeenIndex:
-    ttids: Set[str] = field(default_factory=set)
-    by_title_year: Set[Tuple[str,int]] = field(default_factory=set)
+    def __init__(self) -> None:
+        self.keys = set()  # strings like "movie:normalized:1997" or "tvSeries:normalized:*"
 
-    @property
-    def keys(self) -> Set[str]:
-        # mainly for size logging
-        return set(self.ttids) | {f"{t}:{y}" for t,y in self.by_title_year}
+    def add(self, kind: str, title: str, year: Optional[int]) -> None:
+        if not title or not kind: return
+        nt = _norm_title(title)
+        if not nt: return
+        y = str(year) if year else "*"
+        self.keys.add(f"{kind}:{nt}:{y}")
 
-def load_imdb_ratings_csv_auto() -> Tuple[List[Dict[str,str]], str | None]:
-    """
-    Load IMDb ratings CSV from env path (repo), or fallback to /mnt/data for local runs.
-    Returns (rows, path_used)
-    """
-    candidates = []
-    if IMDB_RATINGS_CSV_PATH:
-        candidates.append(IMDB_RATINGS_CSV_PATH)
-    # local dev fallback
-    candidates.append("/mnt/data/ratings.csv")
+    def has(self, kind: str, title: str, year: Optional[int]) -> bool:
+        if not title or not kind: return False
+        nt = _norm_title(title)
+        if not nt: return False
+        y = str(year) if year else "*"
+        if f"{kind}:{nt}:{y}" in self.keys: return True
+        # tolerant checks
+        if f"{kind}:{nt}:*" in self.keys: return True
+        if year is not None:
+            # allow +/- 1 year wiggle
+            if f"{kind}:{nt}:{year-1}" in self.keys: return True
+            if f"{kind}:{nt}:{year+1}" in self.keys: return True
+        return False
 
-    for path in candidates:
-        try:
-            if path and os.path.exists(path):
-                rows: List[Dict[str,str]] = []
-                with open(path, "r", encoding="utf-8", newline="") as f:
-                    r = csv.DictReader(f)
-                    for row in r:
-                        rows.append(row)
-                return rows, path
-        except Exception:
-            continue
-    return [], None
+def _parse_int(x: str) -> Optional[int]:
+    try:
+        return int(x)
+    except:
+        return None
 
-def update_seen_from_ratings(rows: List[Dict[str,str]]) -> Tuple[SeenIndex,int]:
-    seen = SeenIndex()
+def _read_csv(path: str) -> List[dict]:
+    rows: List[dict] = []
+    if not os.path.exists(path):
+        return rows
+    with open(path, "r", encoding="utf-8") as f:
+        rdr = csv.DictReader(f)
+        for r in rdr:
+            rows.append({k.strip(): (v or "").strip() for k,v in r.items()})
+    return rows
+
+def load_imdb_ratings_csv_auto() -> Tuple[List[dict], Optional[str]]:
+    rows = _read_csv(RATINGS_PATH_ENV)
+    return rows, RATINGS_PATH_ENV if rows else ([], None)[0]
+
+def update_seen_from_ratings(rows: Iterable[dict]) -> Tuple[SeenIndex, int]:
+    idx = SeenIndex()
     added = 0
-    for row in rows:
-        # IMDb's export commonly uses "const" for tt id, "Title", "Year"
-        tid = (row.get("const") or row.get("tconst") or "").strip()
-        title = (row.get("Title") or row.get("title") or "").strip()
-        year_str = (row.get("Year") or row.get("year") or "").strip()
-        year = None
-        try:
-            year = int(year_str) if year_str else None
-        except:
-            year = None
-
-        if tid.startswith("tt"):
-            if tid not in seen.ttids:
-                seen.ttids.add(tid)
-                added += 1
-
-        if title and year:
-            key = (_norm_title(title), year)
-            if key not in seen.by_title_year:
-                seen.by_title_year.add(key)
-                # don't count twice toward 'added'
-    return seen, added
+    for r in rows:
+        # Try multiple schema variants
+        title = r.get("Title") or r.get("title") or r.get("originalTitle") or r.get("Original Title")
+        year = _parse_int(r.get("Year") or r.get("year") or r.get("startYear") or r.get("Release Year") or "")
+        ttype = r.get("Title type") or r.get("titleType") or r.get("Type") or r.get("constType") or ""
+        kind = _kind_from_title_type(ttype)
+        if not kind:
+            # best-effort: infer TV if "Episode" present, else movie
+            kind = "tvSeries" if (ttype.lower() == "tvepisode") else "movie"
+        if title:
+            idx.add(kind, title, year)
+            added += 1
+    return idx, added
 
 def load_seen() -> SeenIndex:
-    # empty fallback when CSV absent
     return SeenIndex()
