@@ -1,6 +1,6 @@
 # engine/catalog.py
 from __future__ import annotations
-import json, math, os, random, time
+import json, math, os, random, time, zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
@@ -11,6 +11,13 @@ from engine import seen_index as seen
 
 _TMDB_KEY = os.environ.get("TMDB_API_KEY", "").strip()
 _BASE = "https://api.themoviedb.org/3"
+
+# ----- module-level debug/meta export -----
+_last_plan_meta: Dict[str, Any] = {}
+
+def get_last_plan_meta() -> Dict[str, Any]:
+    """Expose the most recent page-plan metadata for telemetry."""
+    return dict(_last_plan_meta)
 
 # -------- HTTP helpers --------
 def _http_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -24,22 +31,63 @@ def _http_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
 def _sleep_backoff(i: int) -> None:
     time.sleep(min(0.35 + i * 0.05, 1.0))
 
-# -------- Page plan (rotates daily) --------
+# -------- Page plan (daily permutation + intra-day rolling window) --------
 def _daily_seed(salt: str = "") -> int:
-    today = datetime.date.today()
-    doy = int(today.strftime("%j"))
-    rnd = random.Random(f"{today.isoformat()}::{salt}")
-    return rnd.randint(1, 10_000_000) ^ (doy << 11)
+    # Daily seed (UTC) so the permutation changes each day but is stable within a day.
+    today = datetime.datetime.utcnow().date()
+    return zlib.adler32(f"{today.isoformat()}::{salt}".encode("utf-8"))
 
-def _daily_page_plan(count: int, cap: int = 500, salt: str = "") -> List[int]:
-    """
-    Deterministic (by date + salt) shuffle of 1..cap, then take first 'count'.
-    Ensures pages are different day-to-day and stable within a day.
-    """
+def _perm_1_to_cap(cap: int, salt: str) -> List[int]:
     rng = random.Random(_daily_seed(salt))
     pages = list(range(1, cap + 1))
     rng.shuffle(pages)
-    return pages[:max(0, min(count, cap))]
+    return pages
+
+def _slot_index(rotate_minutes: int) -> int:
+    # UTC slot index; changes every rotate_minutes.
+    period = max(1, rotate_minutes) * 60
+    return int(time.time() // period)
+
+def _fingerprint(lst: List[int]) -> str:
+    return f"{zlib.adler32((','.join(map(str, lst))).encode()):08x}"
+
+def _rolling_page_plan(
+    count: int,
+    cap: int,
+    *,
+    salt: str,
+    rotate_minutes: int,
+    step: int | None,
+) -> tuple[List[int], Dict[str, Any]]:
+    """
+    Build a daily-shuffled permutation of 1..cap and select a contiguous window
+    of 'count' pages whose start offset rolls every 'rotate_minutes' by 'step'.
+
+    step default: count (disjoint windows) -> maximum novelty before wrap.
+    """
+    cap = max(1, cap)
+    n = max(0, min(count, cap))
+    perm = _perm_1_to_cap(cap, salt=salt)
+    slot = _slot_index(rotate_minutes)
+    step_val = max(1, step or n or 1)
+    offset = (slot * step_val) % cap
+
+    # Take contiguous block with wrap-around
+    window = perm[offset:offset + n]
+    if len(window) < n:
+        window += perm[: (n - len(window))]
+
+    meta = {
+        "cap": cap,
+        "requested": count,
+        "rotate_minutes": rotate_minutes,
+        "utc_slot_index": slot,
+        "offset": offset,
+        "step": step_val,
+        "hash": _fingerprint(window),
+        "first5": window[:5],
+    }
+    return window, meta
 
 # -------- Normalize results --------
 def _norm_movie(m: Dict[str, Any]) -> Dict[str, Any]:
@@ -53,7 +101,7 @@ def _norm_movie(m: Dict[str, Any]) -> Dict[str, Any]:
         "original_language": m.get("original_language"),
         "tmdb_vote_average": m.get("vote_average"),
         "tmdb_votes": m.get("vote_count"),
-        "region": None,  # set by runner notes
+        "region": None,  # runner can fill this in notes if desired
     }
 
 def _norm_tv(tv: Dict[str, Any]) -> Dict[str, Any]:
@@ -79,18 +127,59 @@ def fetch_tmdb_base(
     include_tv_seasons: bool = True,
     max_items: int = 6000,
 ) -> List[Dict[str, Any]]:
-    """Collect a large mixed pool from TMDB discover with a *rotating* page plan."""
+    """
+    Collect a large mixed pool from TMDB discover using a *daily* permutation
+    with an *intra-day* rolling window that advances every rotate_minutes.
+    """
+    global _last_plan_meta
+    _last_plan_meta = {}
+
     if not _TMDB_KEY:
         return []
 
     langs = langs or ["en"]
-    # Use vote_count sorting to avoid ultra-obscure noise; mix with popularity
+
+    # Sorts (tunable via env)
     movie_sort = os.environ.get("TMDB_MOVIE_SORT", "vote_count.desc")
     tv_sort = os.environ.get("TMDB_TV_SORT", "vote_count.desc")
 
-    # Cap pages at API max (usually 500)
-    movie_pages = _daily_page_plan(pages_movie, cap=500, salt=f"movie::{region}::{','.join(langs)}::{movie_sort}")
-    tv_pages    = _daily_page_plan(pages_tv,    cap=500, salt=f"tv::{region}::{','.join(langs)}::{tv_sort}")
+    # Rotation controls
+    cap = int(os.environ.get("TMDB_PAGE_CAP", "500") or "500")
+    rotate_minutes = int(os.environ.get("TMDB_ROTATE_MINUTES", "15") or "15")
+    step_global = os.environ.get("TMDB_ROTATE_STEP")
+    step_movie = int(os.environ.get("TMDB_ROTATE_STEP_MOVIE", step_global or "0") or "0") or None
+    step_tv = int(os.environ.get("TMDB_ROTATE_STEP_TV", step_global or "0") or "0") or None
+
+    # Build page plans
+    movie_pages, movie_meta = _rolling_page_plan(
+        pages_movie, cap,
+        salt=f"movie::{region}::{','.join(langs)}::{movie_sort}",
+        rotate_minutes=rotate_minutes,
+        step=step_movie,
+    )
+    tv_pages, tv_meta = _rolling_page_plan(
+        pages_tv, cap,
+        salt=f"tv::{region}::{','.join(langs)}::{tv_sort}",
+        rotate_minutes=rotate_minutes,
+        step=step_tv,
+    )
+
+    # Accumulate plan meta for telemetry
+    _last_plan_meta = {
+        "rotate_minutes": rotate_minutes,
+        "cap": cap,
+        "movie_pages": len(movie_pages),
+        "tv_pages": len(tv_pages),
+        "movie_hash": movie_meta["hash"],
+        "tv_hash": tv_meta["hash"],
+        "movie_first5": movie_meta["first5"],
+        "tv_first5": tv_meta["first5"],
+        "slot": movie_meta["utc_slot_index"],  # same cadence; keep one
+        "step_movie": movie_meta["step"],
+        "step_tv": tv_meta["step"],
+        "offset_movie": movie_meta["offset"],
+        "offset_tv": tv_meta["offset"],
+    }
 
     out: List[Dict[str, Any]] = []
 
@@ -104,7 +193,6 @@ def fetch_tmdb_base(
                 "include_video": "false",
                 "sort_by": movie_sort,
                 "watch_region": region,
-                # intentionally not pinning original language here; we filter later
             })
             for m in (data.get("results") or []):
                 out.append(_norm_movie(m))
@@ -216,14 +304,12 @@ def score_and_rank(items: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], D
     cw = float(os.environ.get("CRITIC_WEIGHT", "0.56"))
     aw = float(os.environ.get("AUDIENCE_WEIGHT", "0.44"))
     novelty = float(os.environ.get("NOVELTY_PRESSURE", "0.15"))
-    # Simple heuristic: vote avg (5..9+) and log votes
     for it in items:
         vavg = float(it.get("tmdb_vote_average") or 0.0)
         vcnt = float(it.get("tmdb_votes") or 0.0)
         critic = _norm01(vavg, 5.0, 9.0)
-        audience = _norm01(math.log10(vcnt + 1.0), 0.0, 5.0)  # ~0..1 over a wide range
+        audience = _norm01(math.log10(vcnt + 1.0), 0.0, 5.0)
         base = cw * critic + aw * audience
-        # Light novelty bump for recent/lower-vote titles
         novelty_bump = novelty * (1.0 - audience) * 0.5
         match = 100.0 * (base + novelty_bump)
         it["match"] = round(match, 1)
