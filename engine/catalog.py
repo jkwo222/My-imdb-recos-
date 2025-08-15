@@ -1,6 +1,6 @@
 # engine/catalog.py
 from __future__ import annotations
-import hashlib, os, random, time
+import hashlib, math, os, random, time
 from typing import Dict, List, Tuple, Any
 import requests
 
@@ -19,13 +19,12 @@ TV_PAGES    = int(os.environ.get("TMDB_PAGES_TV", "24"))
 ROTATE_MIN  = int(os.environ.get("ROTATE_MINUTES", os.environ.get("ROTATE_EVERY_MINUTES", "15")))
 MAX_CATALOG = int(os.environ.get("MAX_CATALOG", "6000"))
 
-# Map your provider slugs -> TMDB provider IDs (US)
-# (IDs are stable on TMDB; if any drift, your pool size will expose it quickly)
+# Your services only (US provider IDs)
 PROVIDER_MAP = {
     "netflix": 8,
     "prime_video": 9,      # Amazon Prime Video
     "hulu": 15,
-    "max": 384,            # Max (formerly HBO Max)
+    "max": 384,            # Max (HBO Max)
     "disney_plus": 337,
     "apple_tv_plus": 350,
     "peacock": 386,
@@ -34,7 +33,7 @@ PROVIDER_MAP = {
 SUBS_INCLUDE = os.environ.get("SUBS_INCLUDE", "")
 PROVIDER_SLUGS = [s.strip() for s in SUBS_INCLUDE.split(",") if s.strip()]
 PROVIDER_IDS = [PROVIDER_MAP[s] for s in PROVIDER_SLUGS if s in PROVIDER_MAP]
-PROVIDER_NAMES = PROVIDER_SLUGS[:]  # echo back what you asked for
+PROVIDER_NAMES = PROVIDER_SLUGS[:]  # echo back
 
 def _q(params: Dict[str, Any]) -> Dict[str, Any]:
     params = dict(params)
@@ -52,7 +51,6 @@ def _discover(kind: str, page: int) -> Dict[str, Any]:
         "sort_by": "popularity.desc",
         "page": page,
     }
-    # "flatrate" = subscription streaming; respects provider filter.
     if PROVIDER_IDS:
         q["with_watch_providers"] = ",".join(str(x) for x in PROVIDER_IDS)
         q["with_watch_monetization_types"] = "flatrate"
@@ -69,31 +67,45 @@ def _safe_year(date_str: str | None) -> int | None:
         return None
 
 def _rot_seed() -> str:
-    # 15-min time slot
+    # 15-min “slot” + per-run jitter so pages differ frequently
     slot = int(time.time() // (ROTATE_MIN * 60) if ROTATE_MIN > 0 else time.time())
-    # add per-run jitter so results change even within a slot
     jitter = os.environ.get("GITHUB_RUN_NUMBER") or os.environ.get("GITHUB_RUN_ID")
     if not jitter:
-        # fall back to fresh randomness each run
         jitter = hashlib.md5(os.urandom(16)).hexdigest()[:8]
-    salt = f"{slot}:{jitter}:{','.join(PROVIDER_SLUGS)}:{ORIG_LANGS}:{REGION}"
-    return salt
+    return f"{slot}:{jitter}:{','.join(PROVIDER_SLUGS)}:{ORIG_LANGS}:{REGION}"
 
 def _choose_pages(kind: str, want_pages: int) -> Tuple[List[int], int]:
-    """Probe total_pages, then pick a rotating, per-run set of pages."""
+    """
+    Probe TMDB for total pages; then select a rotating, per-run subset.
+    Safe for tiny totals (1, 2, …).
+    """
     probe = _discover(kind, 1)
     total_pages = max(1, int(probe.get("total_pages") or 1))
-    total_pages = min(total_pages, 500)  # safety cap
+    total_pages = min(total_pages, 500)  # TMDB hard cap
     want = max(1, min(want_pages, total_pages))
+
+    # If there’s only one page, return it.
+    if total_pages == 1:
+        return [1], 1
+
     seed = int(hashlib.sha256((kind + _rot_seed()).encode()).hexdigest(), 16)
     rng = random.Random(seed)
-    # choose a random start + step that is coprime with total_pages
+
     start = rng.randrange(1, total_pages + 1)
-    step = rng.randrange(1, total_pages) * 2 + 1  # odd step
-    # co-prime fallback
-    if total_pages % 2 == 0 and step % 2 == 0:
-        step += 1
-    pages = []
+
+    # Choose a step that is coprime with total_pages to walk the space.
+    # When total_pages == 2, the only valid step is 1.
+    step = 1 if total_pages == 2 else rng.randrange(1, total_pages)
+    # ensure gcd(step, total_pages) == 1
+    tries = 0
+    while math.gcd(step, total_pages) != 1:
+        step = rng.randrange(1, total_pages)
+        tries += 1
+        if tries > 32:  # extremely defensive fallback
+            step = 1
+            break
+
+    pages: List[int] = []
     seen = set()
     curr = start
     while len(pages) < want:
@@ -118,23 +130,23 @@ def _shape_item(kind: str, x: Dict[str, Any]) -> Dict[str, Any]:
         "title": title,
         "name": title,
         "year": year,
-        "tmdb_vote": float(x.get("vote_average") or 0.0),   # 0–10 scale
+        "tmdb_vote": float(x.get("vote_average") or 0.0),   # 0–10
         "tmdb_votes": int(x.get("vote_count") or 0),
         "pop": float(x.get("popularity") or 0.0),
-        # IMDb id is expensive to fetch per-item; we filter by title+year first.
-        # (You can enrich later if needed.)
     }
 
 def _collect_kind(kind: str, want_pages: int, budget_left: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     pages, total_pages = _choose_pages(kind, want_pages)
     out: List[Dict[str, Any]] = []
     for p in pages:
-        if budget_left <= 0: break
+        if budget_left <= 0:
+            break
         data = _discover(kind, p)
         for x in data.get("results", []):
             out.append(_shape_item(kind, x))
             budget_left -= 1
-            if budget_left <= 0: break
+            if budget_left <= 0:
+                break
     meta = {
         "kind": kind, "pages": pages, "total_pages": total_pages,
         "used": len(out)
@@ -175,5 +187,4 @@ def build_pool() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     return pool, meta
 
 def last_meta() -> Dict[str, Any]:
-    # kept for backward compatibility with earlier runner logic
     return {}
