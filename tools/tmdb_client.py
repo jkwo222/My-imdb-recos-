@@ -21,7 +21,6 @@ def _get(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
     params["api_key"] = _key()
     r = requests.get(url, params=params, headers=UA, timeout=30)
     if r.status_code == 429:
-        # backoff a bit
         time.sleep(1.0)
         r = requests.get(url, params=params, headers=UA, timeout=30)
     if r.status_code != 200:
@@ -48,19 +47,13 @@ def _discover(kind: str, page: int, region: str, original_lang: str|None) -> Dic
         "page": page,
         "sort_by": "popularity.desc",
         "include_adult": "false",
-        "with_original_language": original_lang or "",
         "watch_region": region or "US"
     }
-    # remove empty param; TMDB treats empty string weirdly
-    if not original_lang:
-        params.pop("with_original_language", None)
+    if original_lang:
+        params["with_original_language"] = original_lang  # ISO-639-1, e.g., 'en'
     return _get(url, params)
 
 def fetch_catalog(region: str, pages_movie: int, pages_tv: int, original_langs: List[str]) -> Tuple[List[Dict], Dict]:
-    """
-    Returns (items, diag) where items are raw TMDB items (with kind field).
-    Never returns an empty list silently; diag explains counts and errors.
-    """
     diag = {
         "movie_pages": pages_movie,
         "tv_pages": pages_tv,
@@ -70,7 +63,7 @@ def fetch_catalog(region: str, pages_movie: int, pages_tv: int, original_langs: 
     }
     items: List[Dict[str,Any]] = []
 
-    langs = original_langs or [None]  # None means 'no filter'
+    langs = original_langs or [None]
     for kind, pages in (("movie", pages_movie), ("tv", pages_tv)):
         for lang in langs:
             for page in range(1, max(1, pages)+1):
@@ -84,10 +77,8 @@ def fetch_catalog(region: str, pages_movie: int, pages_tv: int, original_langs: 
                     r["_kind"] = kind
                     items.append(r)
                 diag["counts"][kind] += len(results)
-                # Be polite
                 time.sleep(0.12)
 
-    # Dedupe by (kind, tmdb_id)
     seen = set()
     deduped = []
     for r in items:
@@ -99,10 +90,6 @@ def fetch_catalog(region: str, pages_movie: int, pages_tv: int, original_langs: 
     return deduped, diag
 
 def fetch_providers(kind: str, tmdb_id: int, region: str) -> List[str]:
-    """
-    Returns list of lowercase provider slugs for the given title in region.
-    If provider call fails, returns [] – caller must NOT exclude on this basis.
-    """
     name = f"providers_{kind}_{tmdb_id}_{region}.json"
     data = _cached_json(name, lambda: _get(f"{TMDB_API}/{kind}/{tmdb_id}/watch/providers", {}))
     if "__error__" in data: 
