@@ -3,29 +3,32 @@ name: nightly
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 3 * * *"  # run daily at 03:17 UTC (change as you like)
+    - cron: "17 3 * * *"  # daily 03:17 UTC
 
 concurrency:
   group: nightly-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write   # allow committing assistant_feed.json -> latest
   issues: write
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
     env:
-      # —— engine configuration ——
-      IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}          # e.g. ur18684433
-      TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}          # v4 bearer token OR v3 key
+      # Region & subscriptions
+      REGION: US
+      SUBS_INCLUDE: "netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus"
+      # IMDb -> seen-index (use CSV if present)
+      IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}         # e.g., ur18684433 (optional if CSV used)
+      IMDB_RATINGS_CSV_PATH: data/ratings.csv
+      # APIs
+      TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
       OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
-      IMDB_RATINGS_CSV_PATH: data/ratings.csv           # your uploaded CSV
+      # Sweep size
       TMDB_PAGES_MOVIE: 5
       TMDB_PAGES_TV: 5
-      INCLUDE_TV_SEASONS: "true"
 
     steps:
       - name: Checkout
@@ -57,12 +60,6 @@ jobs:
             engine-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-
             engine-${{ runner.os }}-
 
-      # (Optional) sanity check your ratings CSV exists & is readable
-      # - name: Debug CSV presence
-      #   run: |
-      #     ls -la data || true
-      #     head -n 5 data/ratings.csv || true
-
       - name: Run engine
         run: python -m engine.runner
 
@@ -79,19 +76,14 @@ jobs:
           weights = recs.get("weights", {})
           run_url = f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}"
           lines = []
-          lines.append(f"Run: {run_url}")
-          lines.append("")
+          lines.append(f"Run: {run_url}\n")
           if top:
               lines.append("**Top 10**")
               for i, r in enumerate(top, 1):
-                  title = r.get("title","")
-                  year = r.get("year","")
-                  typ  = r.get("type","")
-                  match= r.get("match","")
+                  title = r.get("title",""); year = r.get("year",""); typ  = r.get("type",""); match= r.get("match","")
                   lines.append(f"{i:2d}. {match} — {title} ({year}) [{typ}]")
           else:
               lines.append("**Top 10**\n(no results)")
-
           lines.append("")
           lines.append(f"**Telemetry**: pool={tel.get('eligible_unseen',0)}, considered={tel.get('considered',0)}, shortlist={tel.get('shortlist',0)}, shown={tel.get('shown',0)}")
           if weights:
@@ -100,7 +92,6 @@ jobs:
           lines.append("This product uses the TMDB API but is not endorsed or certified by TMDB.")
           md = "\n".join(lines)
           open("summary.md","w",encoding="utf-8").write(md)
-          # surface outputs
           print(f"::set-output name=outdir::{out_dir}")
           print(f"::set-output name=summary_file::summary.md")
           PY
@@ -111,6 +102,22 @@ jobs:
         with:
           name: engine-output-${{ github.run_id }}
           path: ${{ steps.summarize.outputs.outdir }}
+
+      - name: Publish assistant_feed.json to latest/
+        if: always()
+        run: |
+          set -e
+          D=$(date -u +%F)
+          OUT="data/out/daily/$D"
+          if [ -f "$OUT/assistant_feed.json" ]; then
+            mkdir -p data/out/latest
+            cp "$OUT/assistant_feed.json" data/out/latest/assistant_feed.json
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add data/out/latest/assistant_feed.json
+            git commit -m "Update latest assistant_feed.json [skip ci]" || echo "no changes"
+            git push
+          fi
 
       - name: Create issue with results (push notification)
         uses: actions/github-script@v7
