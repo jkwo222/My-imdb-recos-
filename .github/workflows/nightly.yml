@@ -1,7 +1,8 @@
 name: Nightly IMDb Engine
+
 on:
   schedule:
-    - cron: "0 7 * * *"   # runs daily ~02am US Eastern (07:00 UTC)
+    - cron: "0 7 * * *"   # runs daily at 07:00 UTC (~2am ET)
   workflow_dispatch:
 
 jobs:
@@ -21,7 +22,6 @@ jobs:
           numpy==1.26.4
           rapidfuzz==3.9.6
           bloom-filter2==2.0.0
-          pydantic==2.8.2
           click==8.1.7
           rich==13.7.1
           REQ
@@ -29,7 +29,7 @@ jobs:
           cat > config/config.yaml <<'YAML'
           mode: unlimited
           region: US
-          imdb_ratings_url: ""   # we pass it via secret at runtime
+          imdb_ratings_url: ""   # we pass it via env
           subs:
             include: [netflix, prime_video, hulu, max, disney_plus, apple_tv_plus, peacock, paramount_plus]
           sweeps:
@@ -115,7 +115,6 @@ jobs:
               if imdb_id and f"imdb:{imdb_id}" in bf: return True
               key = normalize_title(title)
               if key and f"key:{key}" in bf: return True
-              # fuzzy fallback with year tolerance
               seen = _load_seen()
               for k, meta in seen["by_key"].items():
                   if fuzzy_match(key, k, thr):
@@ -217,7 +216,7 @@ jobs:
           from rich import print
           from engine.imdb_ingest import scrape_imdb_ratings, to_rows
           from engine.seen_index import update_seen_from_ratings
-          from engine.autolearn import update_from_ratings, load_weights
+          from engine.autolearn import update_from_ratings
           from engine.recommender import recommend
           def main():
               imdb_url = os.environ.get("IMDB_RATINGS_URL","").strip()
@@ -258,7 +257,8 @@ jobs:
 
       - name: Run engine
         env:
-          IMDB_RATINGS_URL: ${{ secrets.IMDB_RATINGS_URL }}
+          # Prefer the full URL if present, otherwise build it from your IMDb user ID
+          IMDB_RATINGS_URL: ${{ secrets.IMDB_RATINGS_URL && secrets.IMDB_RATINGS_URL || format('https://www.imdb.com/user/{0}/ratings', secrets.IMDB_USER_ID) }}
         run: |
           python -m engine.runner
 
