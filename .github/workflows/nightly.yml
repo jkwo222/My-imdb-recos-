@@ -3,7 +3,7 @@ name: nightly
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 5 * * *"  # 05:00 UTC daily
+    - cron: "15 2 * * *"  # daily 02:15 UTC
 
 permissions:
   contents: read
@@ -11,15 +11,15 @@ permissions:
 
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
       OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
-      IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
+      IMDB_USER_ID:  ${{ secrets.IMDB_USER_ID }}    # e.g., ur18684433
       IMDB_RATINGS_CSV_PATH: data/ratings.csv
       REGION: US
-      ORIGINAL_LANGS: "en"   # <— TWEAK: English originals
-      SUBS_INCLUDE: "netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus"
+      ORIGINAL_LANGS: en
+      SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
       TMDB_PAGES_MOVIE: "12"
       TMDB_PAGES_TV: "12"
       MAX_CATALOG: "6000"
@@ -27,47 +27,43 @@ jobs:
       SKIP_WINDOW_DAYS: "4"
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-
-      - name: Cache data/cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            data/cache/tmdb
-            data/cache/omdb
-          key: dcache-${{ runner.os }}-${{ env.ORIGINAL_LANGS }}-${{ env.REGION }}-${{ env.TMDB_PAGES_MOVIE }}-${{ env.TMDB_PAGES_TV }}
-          restore-keys: |
-            dcache-${{ runner.os }}-
-
-      - name: Install deps
+      - name: Install deps (cached)
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run engine
-        run: python -m engine.runner
+      - name: Run
+        run: |
+          mkdir -p data/debug
+          python -m engine.runner 2>&1 | tee data/debug/runner.log
 
-      - name: Render issue body
+      - name: Render issue
         run: |
           python tools/render_issue.py > issue.md
           echo "today=$(date -u +%F)" >> $GITHUB_OUTPUT
-        id: render
 
-      - name: Post results to GitHub issue
+      - name: Create GitHub Issue with results
         uses: peter-evans/create-issue-from-file@v5
         with:
-          title: "Daily picks — ${{ steps.render.outputs.today }}"
+          title: "Daily picks — ${{ steps.Render_issue.outputs.today }}"
           content-filepath: issue.md
           labels: recommendations
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-${{ github.run_id }}
+          path: |
+            data/out/**
+            data/cache/**
+            data/debug/**
+            issue.md
+          if-no-files-found: warn
