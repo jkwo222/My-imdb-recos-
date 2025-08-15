@@ -1,122 +1,152 @@
 # engine/runner.py
-import os, json, datetime, pathlib
+import os, sys, json, datetime, math
 from rich import print
-from engine.seen_index import update_seen_from_ratings
-from engine.autolearn import update_from_ratings, load_weights
-from engine.catalog_builder import build_catalog
-from engine.taste import build_taste
-from engine.recency import should_skip, mark_shown
+from typing import List, Dict, Any
 
-def _load_ratings_from_csv(csv_path: str):
-    rows = []
-    if not csv_path or not os.path.exists(csv_path): return rows
-    import csv
-    with open(csv_path, "r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            title = (r.get("Title") or r.get("title") or "").strip()
-            year = int((r.get("Year") or r.get("year") or "0").strip() or 0)
-            imdb_id = (r.get("Const") or r.get("imdb_id") or "").strip()
-            your_rating = float((r.get("Your Rating") or r.get("your_rating") or "0").strip() or 0)
-            typ_raw = (r.get("Title Type") or r.get("type") or "").strip()
-            if typ_raw in ("tvMiniSeries","tvSeries","tvMovie","tvSpecial","movie"):
-                typ = typ_raw
-            else:
-                typ = "movie" if typ_raw == "movie" else ("tvSeries" if "series" in typ_raw else "movie")
-            rows.append({"imdb_id": imdb_id, "title": title, "year": year, "type": typ, "your_rating": your_rating})
-    return rows
+from tools.ratings import load_imdb_ratings_csv, enrich_with_omdb
+from engine.seen_index import update_seen_from_ratings, is_seen
+from tools.tmdb_client import fetch_catalog, fetch_providers
 
+# ---- helpers ----
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except Exception:
+        return default
+
+def env_list(name: str) -> List[str]:
+    raw = os.environ.get(name, "") or ""
+    return [t.strip() for t in raw.split(",") if t.strip()]
+
+def _score(item: Dict[str,Any], weights: Dict[str,float]) -> float:
+    base = 70.0
+    crit = float(item.get("rt_pct", 0) or 0)/100.0
+    imdb = float(item.get("imdb_rating", 0) or 0)/10.0
+    s = base + 15.0*(weights.get("critic_weight",0.5)*crit + weights.get("audience_weight",0.5)*imdb)
+
+    # Commitment cost for multi-season TV
+    if item.get("type") == "tvSeries":
+        seasons = int(item.get("seasons") or 1)
+        if seasons >= 3: s -= 9.0
+        elif seasons == 2: s -= 4.0
+
+    # Small penalty if we lack ratings to avoid over-ranking unknowns
+    if not item.get("rt_pct") and not item.get("imdb_rating"):
+        s -= 3.0
+
+    # Tiny nudge if on your subs
+    if item.get("providers_on_subs"):
+        s += 1.0
+
+    return max(60.0, min(98.0, s))
+
+def _type_from_tmdb(raw: Dict[str,Any]) -> str:
+    return "tvSeries" if raw.get("_kind") == "tv" else "movie"
+
+def _year_from_tmdb(raw: Dict[str,Any]) -> int:
+    date = raw.get("first_air_date") if raw.get("_kind")=="tv" else raw.get("release_date")
+    if not date: return 0
+    try:
+        return int(date[:4])
+    except Exception:
+        return 0
+
+def _title_from_tmdb(raw: Dict[str,Any]) -> str:
+    return (raw.get("name") if raw.get("_kind")=="tv" else raw.get("title")) or ""
+
+def _providers_on_subs(all_providers: List[str], subs: set) -> bool:
+    return any(p in subs for p in all_providers)
+
+# ---- main ----
 def main():
-    # 1) Ratings ingest (CSV preferred)
-    csv_path = os.environ.get("IMDB_RATINGS_CSV_PATH","").strip()
-    rows = _load_ratings_from_csv(csv_path) if csv_path else []
-    if rows:
-        print(f"[bold]IMDb ingest (CSV):[/bold] {csv_path} — {len(rows)} rows")
-        update_seen_from_ratings(rows)
-        weights = update_from_ratings(rows)
-    else:
-        print("[yellow]No ratings CSV found; using last learned weights.[/yellow]")
-        weights = load_weights()
+    # 1) Load your ratings (CSV) and update seen index
+    csv_path = os.environ.get("IMDB_RATINGS_CSV_PATH", "data/ratings.csv")
+    ratings = load_imdb_ratings_csv(csv_path)
+    print(f"[bold]IMDb ingest (CSV):[/bold] {csv_path} — {len(ratings)} rows")
+    update_seen_from_ratings(ratings)
 
-    # 2) Build taste profile from your ratings
-    taste_profile = build_taste(rows)
+    # weights – autolearn already updated previously; default to balanced
+    weights = {"critic_weight": 0.54, "audience_weight": 0.46}
 
-    # 3) Build catalog (TMDB + OMDb) with English + providers + ratings + genres
-    print("[bold]Building catalog…[/bold]")
-    catalog = build_catalog()
+    # 2) Build catalog from TMDB (diagnostic-friendly)
+    region = os.environ.get("REGION","US").strip() or "US"
+    pages_movie = env_int("TMDB_PAGES_MOVIE", 12)
+    pages_tv    = env_int("TMDB_PAGES_TV", 12)
+    langs = env_list("ORIGINAL_LANGS")  # if empty, no language filter is applied
 
-    # 4) Subscription filter (default to your services)
-    subs_env = os.environ.get(
-        "SUBS_INCLUDE",
-        "netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus"
-    )
-    subs = set([s.strip() for s in subs_env.split(",") if s.strip() and s.strip() != "*"])
-    def on_subs(item):
-        if not subs: return True
-        return any(p in subs for p in (item.get("providers") or []))
-    eligible = [c for c in catalog if on_subs(c)]
+    raw_items, diag = fetch_catalog(region, pages_movie, pages_tv, langs)
 
-    # 5) Recommend
-    from engine.recommender import recommend
-    recs_all = recommend(eligible, weights, taste_profile)
+    # 3) Light transform + OMDb enrichment (but don't exclude on missing data)
+    subs = set([s.strip() for s in (os.environ.get("SUBS_INCLUDE","") or "").split(",") if s.strip()])
+    out: List[Dict[str,Any]] = []
+    for r in raw_items:
+        title = _title_from_tmdb(r)
+        year = _year_from_tmdb(r)
+        kind = _type_from_tmdb(r)
+        tmdb_id = int(r.get("id") or 0)
 
-    # 6) Apply skip-window (don’t re-show very recent recs)
-    skip_days = int(os.environ.get("SKIP_WINDOW_DAYS","4") or "4")
-    recs = [r for r in recs_all if not should_skip(r.get("imdb_id",""), days=skip_days)]
+        # Providers – do NOT exclude on missing; only annotate
+        providers = fetch_providers("tv" if kind=="tvSeries" else "movie", tmdb_id, region)
+        on_subs = _providers_on_subs(providers, subs) if subs else True
 
-    # 7) Trim and output
+        # Build base item
+        item = {
+            "title": title, "year": year, "type": kind,
+            "tmdb_id": tmdb_id, "providers": providers,
+            "providers_on_subs": on_subs
+        }
+        out.append(item)
+
+    # Enrich ratings (OMDb)
+    out = enrich_with_omdb(out)  # fills imdb_id, imdb_rating, rt_pct when available
+
+    counts = {
+        "raw": len(raw_items),
+        "after_transform": len(out)
+    }
+
+    # 4) Apply soft filters + seen check (no hard excludes except seen)
+    eligible: List[Dict[str,Any]] = []
+    for it in out:
+        # Only exclusion: already seen
+        if is_seen(it["title"], it.get("imdb_id",""), int(it.get("year") or 0)):
+            continue
+        # Soft filters:
+        # - Subs: if not on your subs, keep but it'll miss the +1 boost and can rank lower.
+        eligible.append(it)
+
+    counts["eligible"] = len(eligible)
+
+    # 5) Score + shortlist
+    for it in eligible:
+        it["match"] = round(_score(it, weights), 1)
+    eligible.sort(key=lambda x: x["match"], reverse=True)
+
+    shortlist = eligible[:50]
+    shown = shortlist[:10]
+
+    # 6) Telemetry + write files
     today = datetime.date.today().isoformat()
-    out_dir = pathlib.Path(f"data/out/daily/{today}")
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Keep top 50 for the feed
-    top = []
-    for r in recs[:50]:
-        top.append({
-            "title": r.get("title",""),
-            "year": r.get("year",0),
-            "type": r.get("type",""),
-            "seasons": r.get("seasons",1),
-            "imdb_id": r.get("imdb_id",""),
-            "critic_rt": round(100 * float(r.get("critic",0.0))),
-            "audience_imdb": round(10 * float(r.get("audience",0.0)), 1),
-            "providers": r.get("providers",[]),
-            "genres": r.get("genres",[]),
-            "match": r.get("match",0.0),
-        })
+    out_dir = f"data/out/daily/{today}"
+    os.makedirs(out_dir, exist_ok=True)
 
     json.dump({
-        "date": str(today),
-        "recs": top,
-        "weights": weights
-    }, open(out_dir/"recs.json","w"), indent=2)
-
-    json.dump({
-        "pool": len(catalog),
-        "eligible_after_subs": len(eligible),
-        "considered": len(eligible),
-        "shortlist": min(50, len(recs)),
-        "shown": min(10, len(top))
-    }, open(out_dir/"telemetry.json","w"), indent=2)
-
-    json.dump({
-        "version": "v2.13a-near-match",
-        "generated_at": datetime.datetime.utcnow().isoformat()+"Z",
+        "date": today,
         "weights": weights,
-        "taste_profile": taste_profile,
-        "telemetry": {
-            "pool": len(catalog),
-            "eligible_after_subs": len(eligible),
-            "after_skip_window": len(recs),
-            "shown": len(top)
-        },
-        "top": top
-    }, open(out_dir/"assistant_feed.json","w"), indent=2)
+        "diag": diag,
+        "counts": counts,
+        "shortlist": shortlist,
+        "shown": shown
+    }, open(f"{out_dir}/recs.json","w"), indent=2)
 
-    # Mark the top N we showed, to enforce the skip-window next run
-    mark_shown([r.get("imdb_id","") for r in top])
+    json.dump({
+        "pool": counts["after_transform"],
+        "eligible": counts["eligible"],
+        "after_skip": len(shortlist),
+        "shown": len(shown)
+    }, open(f"{out_dir}/telemetry.json","w"), indent=2)
 
-    print(f"[green]Run complete.[/green] See: {out_dir}")
+    print("[green]Run complete.[/green] See:", out_dir)
 
 if __name__ == "__main__":
     main()
