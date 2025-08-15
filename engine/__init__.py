@@ -1,3 +1,3 @@
 # engine/__init__.py
-# Minimal package file to avoid circular imports.
+# keep package clean; avoid side-effect imports
 __all__ = []
