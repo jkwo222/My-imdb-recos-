@@ -3,133 +3,66 @@ name: nightly
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 3 * * *"  # daily 03:17 UTC
-
-concurrency:
-  group: nightly-${{ github.ref }}
-  cancel-in-progress: true
+    - cron: "30 12 * * *" # daily 12:30 UTC; adjust as you like
 
 permissions:
-  contents: write   # allow committing assistant_feed.json -> latest
+  contents: read
   issues: write
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
     env:
-      # Region & subscriptions
-      REGION: US
-      SUBS_INCLUDE: "netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus"
-      # IMDb -> seen-index (use CSV if present)
-      IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}         # e.g., ur18684433 (optional if CSV used)
-      IMDB_RATINGS_CSV_PATH: data/ratings.csv
-      # APIs
+      # === REQUIRED KEYS ===
       TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
       OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
-      # Sweep size
-      TMDB_PAGES_MOVIE: 5
-      TMDB_PAGES_TV: 5
+
+      # === YOUR IMDb (optional when CSV provided) ===
+      IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
+
+      # === RATINGS CSV ===
+      IMDB_RATINGS_CSV_PATH: data/ratings.csv
+
+      # === CATALOG SWEEP SIZES ===
+      TMDB_PAGES_MOVIE: 12
+      TMDB_PAGES_TV: 12
+      MAX_CATALOG: 6000
+      INCLUDE_TV_SEASONS: "true"
+
+      # === REGION + SUBSCRIPTIONS ===
+      REGION: "US"
+      SUBS_INCLUDE: "netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus"
+
+      # === BEHAVIOR ===
+      SKIP_WINDOW_DAYS: "4"
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Setup Python
-        id: py
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
-          cache-dependency-path: requirements.txt
+          python-version: "3.11"
 
-      - name: Install deps
+      - name: Install deps (cached)
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Restore engine caches
-        uses: actions/cache@v4
-        with:
-          path: |
-            data/cache
-            data/catalog
-            data/seen_index_v3.json
-            data/weights_live.json
-          key: engine-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-${{ hashFiles('requirements.txt', 'engine/**/*.py') }}-${{ hashFiles('data/ratings.csv') }}
-          restore-keys: |
-            engine-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-
-            engine-${{ runner.os }}-
-
       - name: Run engine
         run: python -m engine.runner
 
-      - name: Summarize results → summary.md
-        id: summarize
+      - name: Format issue body
+        id: render
         run: |
-          python - << 'PY'
-          import os, json, datetime, pathlib
-          d = datetime.date.today().isoformat()
-          out_dir = pathlib.Path(f"data/out/daily/{d}")
-          recs = json.load(open(out_dir/"recs.json","r"))
-          tel  = json.load(open(out_dir/"telemetry.json","r"))
-          top = recs.get("recs", [])[:10]
-          weights = recs.get("weights", {})
-          run_url = f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}"
-          lines = []
-          lines.append(f"Run: {run_url}\n")
-          if top:
-              lines.append("**Top 10**")
-              for i, r in enumerate(top, 1):
-                  title = r.get("title",""); year = r.get("year",""); typ  = r.get("type",""); match= r.get("match","")
-                  lines.append(f"{i:2d}. {match} — {title} ({year}) [{typ}]")
-          else:
-              lines.append("**Top 10**\n(no results)")
-          lines.append("")
-          lines.append(f"**Telemetry**: pool={tel.get('eligible_unseen',0)}, considered={tel.get('considered',0)}, shortlist={tel.get('shortlist',0)}, shown={tel.get('shown',0)}")
-          if weights:
-              lines.append(f"**Weights**: critic={weights.get('critic_weight',0):.2f}, audience={weights.get('audience_weight',0):.2f}")
-          lines.append("")
-          lines.append("This product uses the TMDB API but is not endorsed or certified by TMDB.")
-          md = "\n".join(lines)
-          open("summary.md","w",encoding="utf-8").write(md)
-          print(f"::set-output name=outdir::{out_dir}")
-          print(f"::set-output name=summary_file::summary.md")
-          PY
-        shell: bash
+          python tools/render_issue.py > issue.md
+          echo "today=$(date -u +%F)" >> $GITHUB_OUTPUT
 
-      - name: Upload results artifact
-        uses: actions/upload-artifact@v4
+      - name: Create Issue with results
+        uses: peter-evans/create-issue-from-file@v5
         with:
-          name: engine-output-${{ github.run_id }}
-          path: ${{ steps.summarize.outputs.outdir }}
-
-      - name: Publish assistant_feed.json to latest/
-        if: always()
-        run: |
-          set -e
-          D=$(date -u +%F)
-          OUT="data/out/daily/$D"
-          if [ -f "$OUT/assistant_feed.json" ]; then
-            mkdir -p data/out/latest
-            cp "$OUT/assistant_feed.json" data/out/latest/assistant_feed.json
-            git config user.name  "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add data/out/latest/assistant_feed.json
-            git commit -m "Update latest assistant_feed.json [skip ci]" || echo "no changes"
-            git push
-          fi
-
-      - name: Create issue with results (push notification)
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const body = fs.readFileSync('${{ steps.summarize.outputs.summary_file }}', 'utf8');
-            const title = `Run ${new Date().toISOString().slice(0,10)} — Top picks`;
-            const res = await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title,
-              body
-            });
-            core.info(`Issue created: ${res.data.html_url}`);
+          title: "Daily picks — ${{ steps.render.outputs.today }}"
+          content-filepath: "issue.md"
+          labels: recommendations
