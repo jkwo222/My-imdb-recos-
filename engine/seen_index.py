@@ -22,8 +22,7 @@ def _build_bloom(seen):
         bf.add(f"imdb:{iid}")
     for k in seen["by_key"]:
         bf.add(f"key:{k}")
-    # NOTE: bloom_filter2 has no .tofile on GH Actions runner – keep it purely in-memory.
-    # We skip persisting the bloom and rely on the json index across runs.
+    # No tofile persistence on GH runner; rely on JSON index across runs.
 
 def update_seen_from_ratings(rows):
     seen = _load_seen()
@@ -42,10 +41,10 @@ def update_seen_from_ratings(rows):
 
 def is_seen(title: str, imdb_id: str = "", year: int = 0, thr: float = 0.92, tol: int = 1) -> bool:
     """
-    Conservative 'seen' check to avoid false positives:
-    1) If IMDB ID matches, it's seen.
-    2) If normalized title matches EXACT KEY and year within tolerance, it's seen.
-    3) Fuzzy fallback ONLY if BOTH sides have a non-zero year.
+    Conservative 'seen' check:
+    - True if IMDb ID seen.
+    - Or exact normalized title AND year within tolerance.
+    - Fuzzy only if BOTH sides have years.
     """
     seen = _load_seen()
 
@@ -57,11 +56,9 @@ def is_seen(title: str, imdb_id: str = "", year: int = 0, thr: float = 0.92, tol
     if meta:
         y = int(meta.get("year") or 0)
         if year == 0 or y == 0:
-            # Without years, don't risk a false positive – require ID match.
             return False
         return abs(y - year) <= tol
 
-    # Fuzzy fallback – require both years present to reduce false positives.
     if year == 0:
         return False
     for k, m in seen["by_key"].items():
