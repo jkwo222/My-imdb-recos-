@@ -48,7 +48,7 @@ def main() -> None:
     include_tv_seasons = _to_bool(_get_env("INCLUDE_TV_SEASONS", "true"))
     max_catalog = int(_get_env("MAX_CATALOG", "6000") or "6000")
 
-    # SUBSTANTIALLY HIGHER DEFAULTS (still overridable)
+    # Higher defaults, overridable
     pages_movie = int(_get_env("TMDB_PAGES_MOVIE", "60") or "60")
     pages_tv = int(_get_env("TMDB_PAGES_TV", "60") or "60")
 
@@ -73,7 +73,7 @@ def main() -> None:
         print(f"[warn] ratings path not found: {ratings_path}")
         hb.ping("ratings_missing", path=str(ratings_path))
 
-    # TMDB pool (uses daily-rotating page plan)
+    # TMDB pool (uses daily permutation + intra-day rolling window)
     try:
         pool = cat.fetch_tmdb_base(
             pages_movie=pages_movie,
@@ -83,6 +83,8 @@ def main() -> None:
             include_tv_seasons=include_tv_seasons,
             max_items=max_catalog,
         )
+        # Capture plan meta in telemetry
+        tel.add_note("page_plan", cat.get_last_plan_meta())
     except Exception:
         print("[error] TMDB fetch failed:\n" + traceback.format_exc(), file=sys.stderr)
         hb.ping("tmdb_fetch_error")
@@ -97,7 +99,6 @@ def main() -> None:
         try:
             func = getattr(cat, func_name)
             out = func(data)
-            tel.mark(func_name, len(out) if hasattr(out, "__len__") else None)
             hb.ping(func_name, count=(len(out) if hasattr(out, "__len__") else None))
             return out
         except Exception:
@@ -110,7 +111,6 @@ def main() -> None:
     # Availability
     try:
         pool = prov.annotate_availability(pool, region=region)
-        tel.mark("after_availability", len(pool))
         hb.ping("availability_annotated", count=len(pool))
     except Exception:
         print("[warn] provider availability failed:\n" + traceback.format_exc(), file=sys.stderr)
@@ -147,8 +147,6 @@ def main() -> None:
 
     # Provider breakdown over shortlist
     basis = recs[:shortlist_n] if shortlist_n else recs
-    prov_hist = provider_histogram(basis, field="providers")
-    tel.set_provider_breakdown(prov_hist)
 
     # Writes
     json.dump(
