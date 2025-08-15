@@ -1,525 +1,42 @@
-name: Nightly IMDb Engine
+name: nightly
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "25 3 * * *"   # daily ~03:25 UTC
+    - cron: "17 3 * * *"  # daily 03:17 UTC
 
-permissions:
-  contents: write   # to commit outputs back (optional step below)
-  issues: write     # to create an issue (push notification via GitHub Mobile)
+env:
+  PAGES_MOVIES: ${{ vars.PAGES_MOVIES || '120' }}
+  PAGES_TV: ${{ vars.PAGES_TV || '120' }}
+  OMDB_WORKERS: ${{ vars.OMDB_WORKERS || '8' }}
+  CATALOG_TTL_DAYS: ${{ vars.CATALOG_TTL_DAYS || '7' }}
+  PROVIDERS_TTL_DAYS: ${{ vars.PROVIDERS_TTL_DAYS || '1' }}
+  OMDB_TTL_DAYS: ${{ vars.OMDB_TTL_DAYS || '14' }}
 
 jobs:
   run:
     runs-on: ubuntu-24.04
-
+    permissions:
+      contents: write
+      issues: write
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Make project layout & config
-        run: |
-          mkdir -p engine config data .github/workflows
+      - name: Cache data
+        uses: actions/cache@v4
+        with:
+            path: |
+              data/cache
+              data/catalog
+            key: cache-${{ runner.os }}-${{ hashFiles('engine/**', 'requirements.txt') }}
+            restore-keys: |
+              cache-${{ runner.os }}-
 
-          # requirements
-          cat > requirements.txt <<'REQ'
-          requests==2.32.3
-          beautifulsoup4==4.12.3
-          lxml==5.2.2
-          pandas==2.2.2
-          numpy==1.26.4
-          rapidfuzz==3.9.6
-          rich==13.7.1
-          REQ
-
-          # (simple runtime config placeholder; not strictly used in runner yet)
-          cat > config/config.yaml <<'YAML'
-          mode: unlimited
-          region: US
-          sweeps:
-            consider_targets: { films: 5000, series: 2500 }
-            percent_new_vs_last_run: 0.50
-          commitment_cost:
-            apply_to_unseen_multiseason: true
-            penalty_two_seasons_range: [-5, -3]
-            penalty_three_plus_seasons_range: [-12, -6]
-            exempt_miniseries: true
-          telemetry:
-            enabled: true
-          YAML
-
-      - name: Write engine/utils.py
-        run: |
-          cat > engine/utils.py <<'PY'
-          import re, unicodedata
-          from rapidfuzz import fuzz
-
-          def normalize_title(s: str) -> str:
-            if not s: return ""
-            s = s.lower().strip()
-            out, depth = [], 0
-            for ch in s:
-                if ch == '(': depth += 1
-                elif ch == ')': depth = max(0, depth-1)
-                elif depth == 0: out.append(ch)
-            s = ''.join(out).replace("&"," and ")
-            s = re.sub(r"[-—–_:/,.'!?;]", " ", s)
-            s = " ".join(t for t in s.split() if t != "the")
-            return unicodedata.normalize("NFKC", s)
-
-          def fuzzy_match(a: str, b: str, threshold: float = 0.92) -> bool:
-            if not a or not b: return False
-            return (fuzz.token_set_ratio(a, b) / 100.0) >= threshold
-          PY
-
-      - name: Write engine/seen_index.py (JSON-only; no bloom)
-        run: |
-          cat > engine/seen_index.py <<'PY'
-          import json, os
-          from .utils import normalize_title, fuzzy_match
-
-          SEEN_PATH = "data/seen_index_v3.json"
-
-          def _load_seen():
-              if os.path.exists(SEEN_PATH):
-                  return json.load(open(SEEN_PATH, "r", encoding="utf-8"))
-              return {"by_imdb": {}, "by_key": {}, "meta": {"count": 0}}
-
-          def _save_seen(seen):
-              os.makedirs("data", exist_ok=True)
-              json.dump(seen, open(SEEN_PATH,"w",encoding="utf-8"), ensure_ascii=False, indent=2)
-
-          def update_seen_from_ratings(rows):
-              seen = _load_seen()
-              for r in rows:
-                  iid = (r.get("imdb_id") or "").strip()
-                  title = r.get("title","")
-                  year = int(r.get("year") or 0)
-                  key = normalize_title(title)
-                  if iid:
-                      seen["by_imdb"][iid] = {"year": year, "title": title}
-                  if key:
-                      seen["by_key"][key] = {"year": year, "title": title}
-              seen["meta"]["count"] = max(len(seen["by_imdb"]), len(seen["by_key"]))
-              _save_seen(seen)
-
-          def is_seen(title: str, imdb_id: str = "", year: int = 0, thr: float = 0.92, tol: int = 1) -> bool:
-              seen = _load_seen()
-              if imdb_id and imdb_id in seen["by_imdb"]:
-                  return True
-              key = normalize_title(title)
-              if key and key in seen["by_key"]:
-                  return True
-              for k, meta in seen["by_key"].items():
-                  if fuzzy_match(key, k, thr):
-                      y = int(meta.get("year") or 0)
-                      if (year==0) or (abs(y - year) <= tol):
-                          return True
-              return False
-          PY
-
-      - name: Write engine/imdb_ingest.py (HTML + CSV fallback)
-        run: |
-          cat > engine/imdb_ingest.py <<'PY'
-          import re, time, requests, csv, io
-          from bs4 import BeautifulSoup
-          from dataclasses import dataclass, asdict
-          from typing import List, Dict
-
-          UA = {
-              "User-Agent": "Personal-IMDb-Recommender/2025 (+contact: you@example.com)",
-              "Accept-Language": "en-US,en;q=0.9",
-              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          }
-
-          @dataclass
-          class RatingItem:
-              imdb_id: str; title: str; year: int; type: str; your_rating: float
-
-          def scrape_imdb_ratings(public_url: str, max_pages: int = 50) -> List[RatingItem]:
-              m = re.search(r"/user/(ur\d+)/ratings", public_url)
-              if not m:
-                  raise ValueError("Use a URL like https://www.imdb.com/user/ur12345678/ratings")
-              user_id = m.group(1)
-              base = f"https://www.imdb.com/user/{user_id}/ratings?sort=ratings_date:desc&mode=detail"
-              items: List[RatingItem] = []
-              start = 1
-              for _ in range(max_pages):
-                  url = f"{base}&start={start}"
-                  r = requests.get(url, headers=UA, timeout=30)
-                  if r.status_code != 200:
-                      break
-                  soup = BeautifulSoup(r.text, "lxml")
-                  blocks = soup.select("div.lister-item.mode-detail")
-                  if not blocks:
-                      break
-                  for b in blocks:
-                      a = b.select_one("h3.lister-item-header a[href*='/title/tt']")
-                      if not a: 
-                          continue
-                      href = a.get("href",""); m2 = re.search(r"/title/(tt\d+)/", href)
-                      if not m2: 
-                          continue
-                      iid = m2.group(1); title = a.get_text(strip=True)
-                      ytag = b.select_one("h3 span.lister-item-year"); year = 0
-                      if ytag:
-                          my = re.search(r"(\d{4})", ytag.get_text()); year = int(my.group(1)) if my else 0
-                      yr = b.select_one("div.ipl-rating-widget span.ipl-rating-star__rating")
-                      try:
-                          your = float(yr.get_text(strip=True)) if yr else 0.0
-                      except: 
-                          your = 0.0
-                      t = "movie"
-                      sub = b.select_one("p.text-muted")
-                      if sub:
-                          s = sub.get_text()
-                          if "TV Mini-Series" in s: t = "tvMiniSeries"
-                          elif "TV Series" in s: t = "tvSeries"
-                          elif "TV Movie" in s: t = "tvMovie"
-                          elif "TV Special" in s: t = "tvSpecial"
-                          elif "Video Game" in s: t = "game"
-                      items.append(RatingItem(iid, title, year, t, your))
-                  nxt = soup.select_one("a.lister-page-next.next-page")
-                  if not nxt:
-                      break
-                  start += 100; time.sleep(0.8)
-              return items
-
-          # Optional CSV fallback (export from IMDb -> Ratings.csv; host somewhere reachable)
-          def scrape_imdb_ratings_csv(csv_url: str) -> List[RatingItem]:
-              if not csv_url:
-                  return []
-              r = requests.get(csv_url, headers=UA, timeout=30)
-              r.raise_for_status()
-              text = r.text
-              f = io.StringIO(text)
-              rdr = csv.DictReader(f)
-              out: List[RatingItem] = []
-              for row in rdr:
-                  iid = (row.get("Const") or "").strip()
-                  title = (row.get("Title") or "").strip()
-                  year = int(row.get("Year") or 0)
-                  t = (row.get("Title Type") or "movie").strip()
-                  your = 0.0
-                  try:
-                      your = float(row.get("Your Rating") or 0)
-                  except:
-                      pass
-                  out.append(RatingItem(iid, title, year, t, your))
-              return out
-
-          def to_rows(items: List[RatingItem]) -> List[Dict]:
-              return [asdict(i) for i in items]
-          PY
-
-      - name: Write engine/autolearn.py
-        run: |
-          cat > engine/autolearn.py <<'PY'
-          import json, os
-
-          WEIGHTS = "data/weights_live.json"
-
-          def _default():
-              return {"critic_weight":0.5,"audience_weight":0.5,"commitment_cost_scale":1.0,"novelty_pressure":0.15}
-
-          def load_weights():
-              return json.load(open(WEIGHTS,"r")) if os.path.exists(WEIGHTS) else _default()
-
-          def save_weights(w):
-              os.makedirs("data",exist_ok=True)
-              json.dump(w, open(WEIGHTS,"w"), indent=2)
-
-          def update_from_ratings(rows):
-              pos = sum(1 for r in rows if float(r.get("your_rating",0))>=8)
-              neg = sum(1 for r in rows if 0<float(r.get("your_rating",0))<=5)
-              total = len(rows) or 1
-              delta = (pos - neg)/total
-              w = load_weights()
-              w["critic_weight"] = float(min(0.7, max(0.3, w.get("critic_weight",0.5)+0.05*delta)))
-              w["audience_weight"] = round(1.0 - w["critic_weight"], 3)
-              save_weights(w)
-              return w
-          PY
-
-      - name: Write engine/recommender.py
-        run: |
-          cat > engine/recommender.py <<'PY'
-          from typing import List, Dict, Any
-          from .seen_index import is_seen
-
-          def score(c: Dict[str,Any], w: Dict[str,Any]) -> float:
-              base=70.0
-              crit=float(c.get("critic",0))
-              aud=float(c.get("audience",0))
-              s=base+15.0*(w.get("critic_weight",0.5)*crit + w.get("audience_weight",0.5)*aud)
-              if c.get("type")=="tvSeries":
-                  seasons=int(c.get("seasons",1))
-                  if seasons>=3: s-=9.0*w.get("commitment_cost_scale",1.0)
-                  elif seasons==2: s-=4.0*w.get("commitment_cost_scale",1.0)
-              return max(60.0,min(98.0,s))
-
-          def recommend(catalog: List[Dict[str,Any]], w: Dict[str,Any]) -> List[Dict[str,Any]]:
-              out=[]
-              for c in catalog:
-                  if is_seen(c.get("title",""), c.get("imdb_id",""), int(c.get("year",0))):
-                      continue
-                  x=dict(c); x["match"]=round(score(c,w),1); out.append(x)
-              out.sort(key=lambda x:x["match"], reverse=True)
-              return out[:50]
-          PY
-
-      - name: Write engine/catalog_builder.py (TMDB + OMDb)
-        env:
-          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
-          OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
-        run: |
-          cat > engine/catalog_builder.py <<'PY'
-          import os, time, requests, json, datetime
-          from typing import Dict, Any, Iterable, List
-
-          TMDB = os.environ.get("TMDB_API_KEY","").strip()
-          OMDB = os.environ.get("OMDB_API_KEY","").strip()
-          REGION = "US"
-
-          H = {"User-Agent":"Personal-IMDb-Recommender/2025 (+contact: you@example.com)"}
-
-          def _get(url: str, params: Dict[str,Any]=None, tries=3, sleep=0.6):
-              for i in range(tries):
-                  r = requests.get(url, params=params or {}, headers=H, timeout=30)
-                  if r.status_code == 200:
-                      return r.json()
-                  time.sleep(sleep*(i+1))
-              r.raise_for_status()
-
-          def tmdb(path: str, params: Dict[str,Any]=None):
-              params = dict(params or {})
-              params["api_key"] = TMDB
-              return _get(f"https://api.themoviedb.org/3{path}", params)
-
-          def omdb_by_imdb(iid: str) -> Dict[str,Any]:
-              if not OMDB or not iid: return {}
-              q = {"apikey": OMDB, "i": iid, "tomatoes":"true"}
-              try:
-                  return _get("https://www.omdbapi.com/", q)
-              except Exception:
-                  return {}
-
-          def _iter_discover_movie(pages=12) -> Iterable[Dict[str,Any]]:
-              today = datetime.date.today().isoformat()
-              for p in range(1, pages+1):
-                  j = tmdb("/discover/movie", {
-                      "sort_by":"popularity.desc",
-                      "region":REGION,
-                      "include_adult":"false",
-                      "include_video":"false",
-                      "page":p,
-                      "language":"en-US",
-                      "release_date.lte":today
-                  })
-                  for it in j.get("results", []):
-                      it["_tmdb_type"]="movie"
-                      yield it
-
-          def _iter_discover_tv(pages=12) -> Iterable[Dict[str,Any]]:
-              today = datetime.date.today().isoformat()
-              for p in range(1, pages+1):
-                  j = tmdb("/discover/tv", {
-                      "sort_by":"popularity.desc",
-                      "include_adult":"false",
-                      "page":p,
-                      "language":"en-US",
-                      "first_air_date.lte":today,
-                      "watch_region":REGION
-                  })
-                  for it in j.get("results", []):
-                      it["_tmdb_type"]="tv"
-                      yield it
-
-          def _external_ids(item: Dict[str,Any]) -> Dict[str,Any]:
-              t = item["_tmdb_type"]; tid = item["id"]
-              if t=="movie":
-                  j = tmdb(f"/movie/{tid}/external_ids")
-              else:
-                  j = tmdb(f"/tv/{tid}/external_ids")
-              return j or {}
-
-          def _watch_providers(item: Dict[str,Any]) -> Dict[str,bool]:
-              t = item["_tmdb_type"]; tid = item["id"]
-              if t=="movie":
-                  j = tmdb(f"/movie/{tid}/watch/providers")
-              else:
-                  j = tmdb(f"/tv/{tid}/watch/providers")
-              res = (j or {}).get("results", {}).get(REGION, {})
-              flatrate = res.get("flatrate", []) or []
-              names = { (x.get("provider_name") or "").lower() for x in flatrate }
-              def has(s): return any(s in n for n in names)
-              return {
-                  "netflix": has("netflix"),
-                  "hulu": has("hulu"),
-                  "max": has("max"),
-                  "prime_video": has("prime"),
-                  "disney_plus": has("disney"),
-                  "apple_tv_plus": has("apple tv+"),
-                  "peacock": has("peacock"),
-                  "paramount_plus": has("paramount"),
-              }
-
-          def _tv_seasons(item: Dict[str,Any]) -> int:
-              tid = item["id"]
-              j = tmdb(f"/tv/{tid}")
-              try:
-                  return int(j.get("number_of_seasons") or 0)
-              except:
-                  return 0
-
-          def _norm_scores(om: Dict[str,Any], tmdb_vote: float) -> (float, float):
-              aud = 0.0
-              try:
-                  ir = float(om.get("imdbRating", 0)) if om else 0.0
-                  aud = (ir/10.0) if ir else 0.0
-              except: pass
-              if not aud and tmdb_vote:
-                  aud = float(tmdb_vote)/10.0
-
-              crit = 0.0
-              try:
-                  for r in (om.get("Ratings") or []):
-                      if (r.get("Source") or "").lower().startswith("rotten"):
-                          v = r.get("Value","").replace("%","")
-                          crit = (float(v)/100.0) if v else 0.0
-                          break
-              except: pass
-              if not crit:
-                  crit = aud
-              return (round(crit,3), round(aud,3))
-
-          def build_catalog(pages_movies=15, pages_tv=15, out_path="data/catalog.jsonl") -> List[Dict[str,Any]]:
-              if not TMDB:
-                  raise SystemExit("TMDB_API_KEY missing")
-              os.makedirs(os.path.dirname(out_path), exist_ok=True)
-              out, seen = [], set()
-
-              # Movies
-              for it in _iter_discover_movie(pages_movies):
-                  ext = _external_ids(it)
-                  iid = (ext.get("imdb_id") or "").strip()
-                  if not iid or iid in seen: 
-                      continue
-                  seen.add(iid)
-                  om = omdb_by_imdb(iid)
-                  crit, aud = _norm_scores(om, it.get("vote_average") or 0)
-                  prov = _watch_providers(it)
-                  title = (it.get("title") or it.get("original_title") or "").strip()
-                  year = 0
-                  rd = (it.get("release_date") or "")[:4]
-                  year = int(rd) if rd.isdigit() else 0
-                  out.append({
-                      "imdb_id": iid, "title": title, "year": year,
-                      "type": "movie", "critic": crit, "audience": aud,
-                      "seasons": 0, "providers": prov
-                  })
-                  if len(out) % 200 == 0: time.sleep(0.2)
-
-              # TV
-              for it in _iter_discover_tv(pages_tv):
-                  ext = _external_ids(it)
-                  iid = (ext.get("imdb_id") or "").strip()
-                  if not iid or iid in seen: 
-                      continue
-                  seen.add(iid)
-                  om = omdb_by_imdb(iid)
-                  crit, aud = _norm_scores(om, it.get("vote_average") or 0)
-                  prov = _watch_providers(it)
-                  seasons = _tv_seasons(it)
-                  title = (it.get("name") or it.get("original_name") or "").strip()
-                  year = 0
-                  rd = (it.get("first_air_date") or "")[:4]
-                  year = int(rd) if rd.isdigit() else 0
-                  out.append({
-                      "imdb_id": iid, "title": title, "year": year,
-                      "type": "tvSeries", "critic": crit, "audience": aud,
-                      "seasons": seasons, "providers": prov
-                  })
-                  if len(out) % 200 == 0: time.sleep(0.2)
-
-              # persist
-              with open(out_path, "w", encoding="utf-8") as f:
-                  for r in out:
-                      f.write(json.dumps(r, ensure_ascii=False) + "\n")
-              return out
-          PY
-
-      - name: Write engine/runner.py (uses auto-catalog + attribution)
-        run: |
-          cat > engine/runner.py <<'PY'
-          import os, json, datetime, sys, glob
-          from rich import print
-          from engine.imdb_ingest import scrape_imdb_ratings, scrape_imdb_ratings_csv, to_rows
-          from engine.seen_index import update_seen_from_ratings
-          from engine.autolearn import update_from_ratings
-          from engine.recommender import recommend
-          from engine.catalog_builder import build_catalog
-
-          ATTRIBUTION = "This product uses the TMDB API but is not endorsed or certified by TMDB."
-
-          def _resolve_imdb_url():
-              uid = (os.environ.get("IMDB_USER_ID") or "").strip()
-              url = (os.environ.get("IMDB_RATINGS_URL") or "").strip()
-              if url:
-                  return url
-              if uid:
-                  return f"https://www.imdb.com/user/{uid}/ratings"
-              return ""
-
-          def main():
-              imdb_url = _resolve_imdb_url()
-              if not imdb_url:
-                  print("[red]Missing/invalid IMDb identity. Set IMDB_USER_ID like 'ur12345678', or IMDB_RATINGS_URL like 'https://www.imdb.com/user/ur12345678/ratings'.[/red]")
-                  sys.exit(1)
-
-              print(f"[bold]IMDb ingest:[/bold] {imdb_url.replace(os.environ.get('IMDB_USER_ID',''), '***')}")
-              rows = to_rows(scrape_imdb_ratings(imdb_url))
-
-              # CSV fallback if needed
-              if not rows:
-                  csv_url = os.environ.get("IMDB_RATINGS_CSV_URL","").strip()
-                  if csv_url:
-                      print("[yellow]HTML ingest empty; trying CSV fallback...[/yellow]")
-                      rows = to_rows(scrape_imdb_ratings_csv(csv_url))
-
-              os.makedirs("data/ingest", exist_ok=True)
-              json.dump(rows, open(f"data/ingest/ratings_{datetime.date.today().isoformat()}.json","w"), indent=2)
-
-              update_seen_from_ratings(rows)           # update SeenIndex
-              weights = update_from_ratings(rows)      # update autolearn weights
-
-              # Build/refresh a large catalog automatically (TMDB+OMDb)
-              catalog = build_catalog(pages_movies=15, pages_tv=15, out_path="data/catalog.jsonl")
-
-              # Score & filter
-              recs = recommend(catalog, weights)
-
-              # Telemetry
-              eligible_unseen = len([c for c in catalog])         # (pre-filter count shown as pool size)
-              considered = len(catalog)
-              shortlist = min(50, len(recs))
-              shown = min(10, len(recs))
-
-              out_dir = f"data/out/daily/{datetime.date.today().isoformat()}"; os.makedirs(out_dir, exist_ok=True)
-              json.dump({"date":str(datetime.date.today()),"recs":recs,"weights":weights,"attribution":ATTRIBUTION}, open(f"{out_dir}/recs.json","w"), indent=2)
-              json.dump({"eligible_unseen":eligible_unseen,"considered":considered,"shortlist":shortlist,"shown":shown}, open(f"{out_dir}/telemetry.json","w"), indent=2)
-
-              print("[green]Run complete.[/green] See:", out_dir)
-              print(f"[blue]{ATTRIBUTION}[/blue]")
-
-          if __name__ == "__main__": 
-              main()
-          PY
-
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install deps
         run: |
@@ -528,95 +45,50 @@ jobs:
 
       - name: Run engine
         env:
-          IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
-          IMDB_RATINGS_URL: ${{ secrets.IMDB_RATINGS_URL }}
-          IMDB_RATINGS_CSV_URL: ${{ secrets.IMDB_RATINGS_CSV_URL }}
+          IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}          # e.g., ur18684433
+          IMDB_RATINGS_URL: ${{ secrets.IMDB_RATINGS_URL }}  # optional
+          IMDB_RATINGS_CSV_URL: ${{ secrets.IMDB_RATINGS_CSV_URL }}  # optional
           TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
           OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
+          PAGES_MOVIES: ${{ env.PAGES_MOVIES }}
+          PAGES_TV: ${{ env.PAGES_TV }}
+          OMDB_WORKERS: ${{ env.OMDB_WORKERS }}
+          CATALOG_TTL_DAYS: ${{ env.CATALOG_TTL_DAYS }}
+          PROVIDERS_TTL_DAYS: ${{ env.PROVIDERS_TTL_DAYS }}
+          OMDB_TTL_DAYS: ${{ env.OMDB_TTL_DAYS }}
         run: |
           python -m engine.runner
 
-      - name: Print Top 10 to log
-        run: |
-          python - <<'PY'
-          import json, glob
-          p = sorted(glob.glob('data/out/daily/*/recs.json'))[-1]
-          o = json.load(open(p))
-          print("\nTop 10 recommendations:\n")
-          for r in o.get("recs", [])[:10]:
-              print(f"{r.get('match','?'):>5}  {r.get('title','?')} ({r.get('year','')}) [{r.get('type','')}]")
-          PY
-
-      - name: Upload output + state
+      - name: Upload results artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nightly-output
-          path: |
-            data/out/daily/**/*
-            data/ingest/**/*
-            data/weights_live.json
-            data/seen_index_v3.json
-            data/catalog.jsonl
+          name: results-${{ github.run_id }}
+          path: data/out/daily
 
-      - name: Commit state & output to repo (optional)
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "chore: update engine output/state [skip ci]"
-          file_pattern: |
-            data/out/daily/**/*
-            data/ingest/**/*
-            data/weights_live.json
-            data/seen_index_v3.json
-            data/catalog.jsonl
-
-      - name: Capture latest recs/telemetry paths
-        id: latest
-        shell: bash
-        run: |
-          RECS_PATH="$(ls -dt data/out/daily/* | head -1)/recs.json"
-          TEL_PATH="$(ls -dt data/out/daily/* | head -1)/telemetry.json"
-          echo "recs=$RECS_PATH" >> $GITHUB_OUTPUT
-          echo "telemetry=$TEL_PATH" >> $GITHUB_OUTPUT
-
-      - name: Add attribution to job summary
-        run: |
-          {
-            echo '## Data Sources'
-            echo ''
-            echo 'This product uses the TMDB API but is not endorsed or certified by TMDB.'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Post run summary as GitHub Issue (push to GitHub Mobile)
+      - name: Post Top 10 as an issue (push notification)
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const recsPath = core.getInput('recs') || '${{ steps.latest.outputs.recs }}';
-            const telPath  = core.getInput('telemetry') || '${{ steps.latest.outputs.telemetry }}';
-            const recs = JSON.parse(fs.readFileSync(recsPath,'utf8'));
-            const tel  = JSON.parse(fs.readFileSync(telPath,'utf8'));
-            const top = recs.recs.slice(0,10).map(
-              (r,i)=> `${String(i+1).padStart(2,' ')}. ${r.match} — ${r.title} (${r.year}) [${r.type}]`
-            ).join('\n');
-
-            const body = [
-              `Run: ${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`,
-              '',
-              '### Top 10',
-              '```',
-              top || '(no results)',
-              '```',
-              '',
-              `Telemetry: pool=${tel.eligible_unseen}, considered=${tel.considered}, shortlist=${tel.shortlist}, shown=${tel.shown}`,
-              '',
-              '_This product uses the TMDB API but is not endorsed or certified by TMDB._'
-            ].join('\n');
-
-            const title = `IMDb Engine Results – ${new Date().toISOString().slice(0,10)}`;
+            const path = 'data/out/daily/' + new Date().toISOString().slice(0,10) + '/recs.json';
+            const telemetryPath = 'data/out/daily/' + new Date().toISOString().slice(0,10) + '/telemetry.json';
+            const recs = JSON.parse(fs.readFileSync(path, 'utf8')).recs || [];
+            const telem = JSON.parse(fs.readFileSync(telemetryPath, 'utf8'));
+            const lines = [];
+            lines.push(`Run: https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`);
+            lines.push(``);
+            lines.push(`Top 10`);
+            for (let i=0; i<Math.min(10,recs.length); i++) {
+              const r = recs[i];
+              lines.push(`${String(i+1).padStart(2,' ')}. ${r.match} — ${r.title} (${r.year||'—'}) [${r.type}]`);
+            }
+            lines.push(``);
+            lines.push(`Telemetry: pool=${telem.eligible_unseen}, considered=${telem.considered}, shortlist=${telem.shortlist}, shown=${telem.shown}`);
+            lines.push(``);
+            lines.push(`This product uses the TMDB API but is not endorsed or certified by TMDB.`);
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title,
-              body,
-              assignees: [context.actor]
+              title: `Run: ${context.runId}`,
+              body: lines.join('\n')
             });
