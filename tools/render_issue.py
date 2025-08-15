@@ -44,6 +44,22 @@ if providers:
     pb = ", ".join(f"{k}={v}" for k, v in providers.items())
     lines.append(f"Providers: {pb}")
 
+# Page-plan meta (from catalog.get_last_plan_meta via telemetry.notes.page_plan)
+notes = telemetry.get("notes") or {}
+plan = notes.get("page_plan") if isinstance(notes, dict) else {}
+if plan:
+    lines.append(
+        "Page plan: "
+        f"movie_pages={plan.get('movie_pages')} "
+        f"tv_pages={plan.get('tv_pages')} "
+        f"rotate_minutes={plan.get('rotate_minutes')} "
+        f"slot={plan.get('slot')} "
+        f"step_movie={plan.get('step_movie')} "
+        f"step_tv={plan.get('step_tv')} "
+        f"hashes(m,t)={plan.get('movie_hash')},{plan.get('tv_hash')} "
+        f"first5(m,t)={plan.get('movie_first5')},{plan.get('tv_first5')}"
+    )
+
 lines.append("This product uses the TMDB and OMDb APIs but is not endorsed or certified by them.\n")
 
 lines.append("<details><summary>assistant_feed.json (copy & paste into chat)</summary>\n")
