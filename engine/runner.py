@@ -6,10 +6,14 @@ import sys
 import time
 from typing import Dict, List, Tuple
 
-from engine import catalog as cat
-from engine import scoring as sc
-
-from .seen_index import load_imdb_ratings_csv_auto, update_seen_from_ratings, SeenIndex, load_seen
+from . import catalog as cat
+from . import scoring as sc  # <-- fixed to a relative import
+from .seen_index import (
+    load_imdb_ratings_csv_auto,
+    update_seen_from_ratings,
+    SeenIndex,
+    load_seen,
+)
 from .filtering import filter_unseen
 
 OUT_DIR = os.environ.get("OUT_DIR", "data/out")
@@ -24,63 +28,64 @@ def _dump_json(path: str, obj) -> None:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
 def _weights_from_env() -> Tuple[float, float, float, float]:
+    # accept both old/new envs, then enforce audience dominance
     cw = float(os.environ.get("CRITIC_WEIGHT", os.environ.get("CRITIC_SCORE_WEIGHT", 0.2)))
     aw = float(os.environ.get("AUDIENCE_WEIGHT", os.environ.get("AUDIENCE_SCORE_WEIGHT", 0.8)))
     np = float(os.environ.get("NOVELTY_PRESSURE", 0.15))
     cc = float(os.environ.get("COMMITMENT_COST_SCALE", 1.0))
-    # enforce audience dominance per your instruction
+
     total = max(1e-9, cw + aw)
     cw, aw = cw / total, aw / total
-    if aw < 0.70:
-        aw = 0.70
-        cw = 0.30
+    if aw < 0.70:  # your requirement: audience significantly higher than critic
+        aw, cw = 0.70, 0.30
     return cw, aw, np, cc
 
 def main():
     start = time.time()
 
-    # 1) IMDb ingest -> seen index (auto path)
+    # 1) IMDb ingest -> seen index (auto path, supports IMDB_RATINGS_CSV_PATH and fallbacks)
     rows, ratings_path = load_imdb_ratings_csv_auto()
     if ratings_path:
         print(f"IMDb ingest: {ratings_path} — {len(rows)} rows")
         seen, added = update_seen_from_ratings(rows)
     else:
         print("IMDb ingest: (no ratings CSV found) — 0 rows")
-        # still load prior seen cache if any
         seen = load_seen()
         added = 0
     print(f"Seen index: {len(seen.keys)} keys (+{added} new)")
 
-    # 2) Build TMDB pool
+    # 2) Build TMDB pool (English-only, your services only, rotating pages)
     _hb("catalog:begin")
     pool = cat.build_pool()
     meta = cat.last_meta()
     _hb(f"catalog:end pool={len(pool)} movie={meta.get('pool_counts',{}).get('movie',0)} tv={meta.get('pool_counts',{}).get('tv',0)}")
 
-    # 3) Seen filter (pass 1)
+    # 3) Seen filter pass
     _hb("filter1:unseen")
     pool_unseen = filter_unseen(pool, seen)
     _hb(f"filter1:end kept={len(pool_unseen)} dropped={len(pool)-len(pool_unseen)}")
 
-    # 4) Scoring
+    # 4) Scoring with audience dominance
     cw, aw, np, cc = _weights_from_env()
     _hb(f"score:begin cw={cw:.2f} aw={aw:.2f} np={np} cc={cc}")
-    ranked = sc.score_and_rank(pool_unseen,
-                               critic_weight=cw,
-                               audience_weight=aw,
-                               novelty_pressure=np,
-                               commitment_cost_scale=cc)
+    ranked = sc.score_and_rank(
+        pool_unseen,
+        critic_weight=cw,
+        audience_weight=aw,
+        novelty_pressure=np,
+        commitment_cost_scale=cc,
+    )
     _hb(f"score:end ranked={len(ranked)}")
 
     shortlist_size = int(os.environ.get("SHORTLIST_SIZE", "50"))
     shortlist = ranked[:shortlist_size]
 
-    # 5) Seen filter (pass 2)
+    # 5) Second safety pass (paranoid)
     shown_size = int(os.environ.get("SHOWN_SIZE", "10"))
     shortlist2 = filter_unseen(shortlist, seen)
     shown = shortlist2[:shown_size]
 
-    # 6) Telemetry & safety: do not fabricate results if pool==0
+    # 6) Telemetry & guardrails
     providers_listed = meta.get("provider_names") or []
     telemetry = {
         "pool": len(pool),
@@ -104,10 +109,9 @@ def main():
             "language": meta.get("language"),
             "with_original_language": meta.get("with_original_language"),
             "watch_region": meta.get("watch_region"),
-        }
+        },
     }
 
-    # If pool is zero, force shown to empty and surface a clear reason
     if len(pool) == 0:
         shown = []
         _hb("pool=0 (check provider list, language filters, or API key)")
@@ -122,7 +126,7 @@ def main():
             "type": item.get("type", "movie"),
         })
 
-    # 7) Emit files
+    # 7) Emit artifacts
     date_tag = time.strftime("%Y-%m-%d")
     daily_dir = os.path.join(DAILY_DIR, date_tag)
     os.makedirs(daily_dir, exist_ok=True)
@@ -134,10 +138,10 @@ def main():
             "critic": round(cw, 2),
             "audience": round(aw, 2),
             "novelty_pressure": np,
-            "commitment_cost_scale": cc
+            "commitment_cost_scale": cc,
         },
         "telemetry": telemetry,
-        "top10": top10
+        "top10": top10,
     }
 
     def _dump(name: str, obj):
