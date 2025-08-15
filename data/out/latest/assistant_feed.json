@@ -1,0 +1,954 @@
+{
+  "version": "v2.13-feed-1",
+  "generated_at": "2025-08-15T04:39:24.884854Z",
+  "weights": {
+    "critic_weight": 0.5426470588235295,
+    "audience_weight": 0.457,
+    "commitment_cost_scale": 1.0
+  },
+  "telemetry": {
+    "pool": 200,
+    "eligible_after_subs": 193,
+    "shortlist": 50,
+    "shown": 10
+  },
+  "top": [
+    {
+      "imdb_id": "tt30445556",
+      "title": "The Pickup",
+      "year": 2025,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "prime_video"
+      ]
+    },
+    {
+      "imdb_id": "tt4978342",
+      "title": "My Oxford Year",
+      "year": 2025,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "netflix"
+      ]
+    },
+    {
+      "imdb_id": "tt14205554",
+      "title": "KPop Demon Hunters",
+      "year": 2025,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "netflix"
+      ]
+    },
+    {
+      "imdb_id": "tt9619824",
+      "title": "Final Destination Bloodlines",
+      "year": 2025,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "max",
+        "prime_video"
+      ]
+    },
+    {
+      "imdb_id": "tt0295701",
+      "title": "xXx",
+      "year": 2002,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "fubotv",
+        "peacock",
+        "youtube_tv",
+        "nbc",
+        "usa_network",
+        "kanopy",
+        "hoopla"
+      ]
+    },
+    {
+      "imdb_id": "tt13357520",
+      "title": "Heads of State",
+      "year": 2025,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "prime_video"
+      ]
+    },
+    {
+      "imdb_id": "tt14961624",
+      "title": "The Old Guard 2",
+      "year": 2025,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "netflix"
+      ]
+    },
+    {
+      "imdb_id": "tt9150192",
+      "title": "A Working Man",
+      "year": 2025,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "fubotv",
+        "prime_video",
+        "mgm_plus_roku_premium_channel",
+        "mgm_plus",
+        "philo"
+      ]
+    },
+    {
+      "imdb_id": "tt0899043",
+      "title": "The Amateur",
+      "year": 2025,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "hulu"
+      ]
+    },
+    {
+      "imdb_id": "tt18259086",
+      "title": "Sonic the Hedgehog 3",
+      "year": 2024,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "prime_video",
+        "fubotv",
+        "paramount_plus",
+        "mgm_plus",
+        "philo"
+      ]
+    },
+    {
+      "imdb_id": "tt23060698",
+      "title": "Clown in a Cornfield",
+      "year": 2025,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "apple_tv_plus",
+        "prime_video",
+        "philo",
+        "shudder"
+      ]
+    },
+    {
+      "imdb_id": "tt36463894",
+      "title": "Predator: Killer of Killers",
+      "year": 2025,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "hulu"
+      ]
+    },
+    {
+      "imdb_id": "tt0322330",
+      "title": "Freaky Friday",
+      "year": 2003,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "disney_plus"
+      ]
+    },
+    {
+      "imdb_id": "tt0120667",
+      "title": "Fantastic Four",
+      "year": 2005,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "disney_plus"
+      ]
+    },
+    {
+      "imdb_id": "tt26584495",
+      "title": "Companion",
+      "year": 2025,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "max",
+        "prime_video"
+      ]
+    },
+    {
+      "imdb_id": "tt1457767",
+      "title": "The Conjuring",
+      "year": 2013,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "max"
+      ]
+    },
+    {
+      "imdb_id": "tt32434379",
+      "title": "My Fault: London",
+      "year": 2025,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "prime_video"
+      ]
+    },
+    {
+      "imdb_id": "tt17526714",
+      "title": "The Substance",
+      "year": 2024,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "mubi",
+        "prime_video"
+      ]
+    },
+    {
+      "imdb_id": "tt30955489",
+      "title": "Until Dawn",
+      "year": 2025,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "netflix"
+      ]
+    },
+    {
+      "imdb_id": "tt28443655",
+      "title": "Death of a Unicorn",
+      "year": 2025,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "max",
+        "prime_video"
+      ]
+    },
+    {
+      "imdb_id": "tt28249919",
+      "title": "Presence",
+      "year": 2025,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "hulu"
+      ]
+    },
+    {
+      "imdb_id": "tt4419684",
+      "title": "In the Lost Lands",
+      "year": 2025,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "hulu"
+      ]
+    },
+    {
+      "imdb_id": "tt0486576",
+      "title": "Fantastic Four: Rise of the Silver Surfer",
+      "year": 2007,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "disney_plus"
+      ]
+    },
+    {
+      "imdb_id": "tt31121295",
+      "title": "Deep Cover",
+      "year": 2025,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "prime_video"
+      ]
+    },
+    {
+      "imdb_id": "tt10078772",
+      "title": "Flight Risk",
+      "year": 2025,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "apple_tv_plus",
+        "starz_roku_premium_channel",
+        "starz",
+        "philo",
+        "prime_video"
+      ]
+    },
+    {
+      "imdb_id": "tt14948432",
+      "title": "Red One",
+      "year": 2024,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "prime_video"
+      ]
+    },
+    {
+      "imdb_id": "tt0078748",
+      "title": "Alien",
+      "year": 1979,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "hulu",
+        "fubotv"
+      ]
+    },
+    {
+      "imdb_id": "tt1099212",
+      "title": "Twilight",
+      "year": 2008,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "prime_video"
+      ]
+    },
+    {
+      "imdb_id": "tt4126476",
+      "title": "After",
+      "year": 2019,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "netflix",
+        "filmbox+"
+      ]
+    },
+    {
+      "imdb_id": "tt7888964",
+      "title": "Nobody",
+      "year": 2021,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "youtube_tv",
+        "prime_video"
+      ]
+    },
+    {
+      "imdb_id": "tt1502712",
+      "title": "Fantastic Four",
+      "year": 2015,
+      "type": "movie",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "disney_plus"
+      ]
+    },
+    {
+      "imdb_id": "tt7587890",
+      "title": "The Rookie",
+      "year": 2018,
+      "type": "tvSeries",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "hulu",
+        "fubotv",
+        "youtube_tv",
+        "philo",
+        "spectrum_on_demand"
+      ]
+    },
+    {
+      "imdb_id": "tt14016500",
+      "title": "The Summer I Turned Pretty",
+      "year": 2022,
+      "type": "tvSeries",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "prime_video"
+      ]
+    },
+    {
+      "imdb_id": "tt0460681",
+      "title": "Supernatural",
+      "year": 2005,
+      "type": "tvSeries",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "netflix",
+        "youtube_tv",
+        "tnt"
+      ]
+    },
+    {
+      "imdb_id": "tt0182576",
+      "title": "Family Guy",
+      "year": 1999,
+      "type": "tvSeries",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "hulu",
+        "fubotv",
+        "youtube_tv",
+        "adult_swim",
+        "fox",
+        "fxnow"
+      ]
+    },
+    {
+      "imdb_id": "tt0364845",
+      "title": "NCIS",
+      "year": 2003,
+      "type": "tvSeries",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "netflix",
+        "hulu",
+        "fubotv",
+        "paramount_plus",
+        "apple_tv_plus",
+        "prime_video",
+        "youtube_tv",
+        "philo",
+        "spectrum_on_demand"
+      ]
+    },
+    {
+      "imdb_id": "tt0452046",
+      "title": "Criminal Minds",
+      "year": 2005,
+      "type": "tvSeries",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "hulu",
+        "paramount_plus",
+        "apple_tv_plus",
+        "prime_video",
+        "philo",
+        "pluto_tv"
+      ]
+    },
+    {
+      "imdb_id": "tt0096697",
+      "title": "The Simpsons",
+      "year": 1989,
+      "type": "tvSeries",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "disney_plus",
+        "hulu",
+        "fubotv",
+        "youtube_tv",
+        "fox",
+        "fxnow",
+        "spectrum_on_demand"
+      ]
+    },
+    {
+      "imdb_id": "tt1586680",
+      "title": "Shameless",
+      "year": 2011,
+      "type": "tvSeries",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "netflix"
+      ]
+    },
+    {
+      "imdb_id": "tt0118401",
+      "title": "Midsomer Murders",
+      "year": 1997,
+      "type": "tvSeries",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "prime_video",
+        "fubotv",
+        "acorn_tv",
+        "spectrum_on_demand",
+        "apple_tv_plus",
+        "the_cw",
+        "hoopla",
+        "plex",
+        "plex_channel",
+        "fawesome",
+        "the_roku_channel",
+        "tubi_tv",
+        "pluto_tv"
+      ]
+    },
+    {
+      "imdb_id": "tt0115147",
+      "title": "The Daily Show",
+      "year": 1996,
+      "type": "tvSeries",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "fubotv",
+        "paramount_plus",
+        "apple_tv_plus",
+        "prime_video",
+        "philo"
+      ]
+    },
+    {
+      "imdb_id": "tt3502248",
+      "title": "Bosch",
+      "year": 2015,
+      "type": "tvSeries",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "prime_video"
+      ]
+    },
+    {
+      "imdb_id": "tt0247082",
+      "title": "CSI: Crime Scene Investigation",
+      "year": 2000,
+      "type": "tvSeries",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "hulu",
+        "paramount_plus",
+        "apple_tv_plus",
+        "prime_video"
+      ]
+    },
+    {
+      "imdb_id": "tt1405406",
+      "title": "The Vampire Diaries",
+      "year": 2009,
+      "type": "tvSeries",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "max",
+        "prime_video",
+        "peacock"
+      ]
+    },
+    {
+      "imdb_id": "tt2306299",
+      "title": "Vikings",
+      "year": 2013,
+      "type": "tvSeries",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "netflix"
+      ]
+    },
+    {
+      "imdb_id": "tt1196946",
+      "title": "The Mentalist",
+      "year": 2008,
+      "type": "tvSeries",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "hulu"
+      ]
+    },
+    {
+      "imdb_id": "tt0397306",
+      "title": "American Dad!",
+      "year": 2005,
+      "type": "tvSeries",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "hulu",
+        "youtube_tv",
+        "adult_swim",
+        "tbs"
+      ]
+    },
+    {
+      "imdb_id": "tt0460627",
+      "title": "Bones",
+      "year": 2005,
+      "type": "tvSeries",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "prime_video",
+        "hulu",
+        "peacock",
+        "youtube_tv",
+        "philo",
+        "bbc_america",
+        "the_roku_channel"
+      ]
+    },
+    {
+      "imdb_id": "tt4052886",
+      "title": "Lucifer",
+      "year": 2016,
+      "type": "tvSeries",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "netflix"
+      ]
+    },
+    {
+      "imdb_id": "tt33043892",
+      "title": "Dexter: Resurrection",
+      "year": 2025,
+      "type": "tvSeries",
+      "seasons": 1,
+      "critic": 0.0,
+      "audience": 0.0,
+      "match": 62.0,
+      "providers": [
+        "fubotv",
+        "paramount_plus",
+        "apple_tv_plus",
+        "prime_video",
+        "spectrum_on_demand"
+      ]
+    }
+  ],
+  "considered_sample": [
+    "tt13186306",
+    "tt30445556",
+    "tt4978342",
+    "tt14205554",
+    "tt31868189",
+    "tt9619824",
+    "tt0295701",
+    "tt3566834",
+    "tt13357520",
+    "tt14961624",
+    "tt9150192",
+    "tt13622970",
+    "tt0899043",
+    "tt14513804",
+    "tt31193180",
+    "tt7068946",
+    "tt15398776",
+    "tt0816692",
+    "tt18259086",
+    "tt7510222",
+    "tt23060698",
+    "tt6263850",
+    "tt13654226",
+    "tt22022452",
+    "tt36463894",
+    "tt0322330",
+    "tt0111161",
+    "tt0241527",
+    "tt6208148",
+    "tt13186482",
+    "tt0848228",
+    "tt4154756",
+    "tt16366836",
+    "tt8115900",
+    "tt0068646",
+    "tt10872600",
+    "tt0120667",
+    "tt8041270",
+    "tt26584495",
+    "tt1457767",
+    "tt0120338",
+    "tt32434379",
+    "tt1375666",
+    "tt17526714",
+    "tt0116483",
+    "tt29623480",
+    "tt0499549",
+    "tt5433140",
+    "tt0120737",
+    "tt30955489",
+    "tt8790086",
+    "tt0468569",
+    "tt28443655",
+    "tt18412256",
+    "tt1630029",
+    "tt9218128",
+    "tt2250912",
+    "tt28249919",
+    "tt0145487",
+    "tt32550101",
+    "tt4419684",
+    "tt21692408",
+    "tt0363771",
+    "tt0369610",
+    "tt0295297",
+    "tt0167260",
+    "tt0486576",
+    "tt0126029",
+    "tt0451279",
+    "tt1877830",
+    "tt31121295",
+    "tt2948356",
+    "tt1228705",
+    "tt0325980",
+    "tt1745960",
+    "tt0330373",
+    "tt9362722",
+    "tt0137523",
+    "tt0304141",
+    "tt0317705",
+    "tt10078772",
+    "tt15239678",
+    "tt0110912",
+    "tt0373889",
+    "tt14948432",
+    "tt0078748",
+    "tt28607951",
+    "tt1646971",
+    "tt1099212",
+    "tt4126476",
+    "tt10366206",
+    "tt1431045",
+    "tt6334354",
+    "tt7888964",
+    "tt1502712",
+    "tt2975590",
+    "tt13443470",
+    "tt7587890",
+    "tt14016500",
+    "tt0203259",
+    "tt0413573",
+    "tt0773262",
+    "tt0460681",
+    "tt0944947",
+    "tt0455275",
+    "tt0182576",
+    "tt0364845",
+    "tt0452046",
+    "tt0903747",
+    "tt0096697",
+    "tt0098844",
+    "tt1586680",
+    "tt0118401",
+    "tt0412142",
+    "tt2861424",
+    "tt0115147",
+    "tt1520211",
+    "tt4574334",
+    "tt3502248",
+    "tt0247082",
+    "tt1405406",
+    "tt2306299",
+    "tt2741602",
+    "tt1196946",
+    "tt0397306",
+    "tt0460627",
+    "tt4052886",
+    "tt0108778",
+    "tt9813792",
+    "tt33043892",
+    "tt0386676",
+    "tt0410975",
+    "tt0804484",
+    "tt2193021",
+    "tt3107288",
+    "tt0279600",
+    "tt0369179",
+    "tt0411008",
+    "tt2261391",
+    "tt1219024",
+    "tt4236770",
+    "tt7767422",
+    "tt1632701",
+    "tt1442437",
+    "tt2442560",
+    "tt0121955",
+    "tt7335184",
+    "tt1600194",
+    "tt0313043",
+    "tt0285331",
+    "tt6111130",
+    "tt31510819",
+    "tt0112022",
+    "tt1595859",
+    "tt0141842",
+    "tt0050051",
+    "tt0185103",
+    "tt3121722",
+    "tt2805096",
+    "tt9288030",
+    "tt6470478",
+    "tt1567432",
+    "tt1466074",
+    "tt6226232",
+    "tt0072562",
+    "tt0052451",
+    "tt0094525",
+    "tt0460649",
+    "tt3444938",
+    "tt0491738",
+    "tt0075529",
+    "tt0118375",
+    "tt14688458",
+    "tt1305826",
+    "tt0158552",
+    "tt1751634",
+    "tt0212671",
+    "tt0118480",
+    "tt2085059",
+    "tt4655480",
+    "tt1442449",
+    "tt1942683",
+    "tt1190634",
+    "tt7235466",
+    "tt16358384",
+    "tt1124373",
+    "tt6741278",
+    "tt2356777",
+    "tt31710822",
+    "tt0106179",
+    "tt1888075",
+    "tt0924651",
+    "tt24053860"
+  ]
+}
