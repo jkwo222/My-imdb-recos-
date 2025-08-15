@@ -1,28 +1,40 @@
 # engine/filtering.py
 from __future__ import annotations
-from typing import List, Dict, Any, Tuple
-import re
+from typing import Dict, List, Any, Iterable, Optional
+from .seen_index import SeenIndex, _norm_title
 
-_norm_re = re.compile(r"[^a-z0-9]+")
+def _candidates(item: Dict[str, Any]) -> List[str]:
+    c = []
+    for k in ("title", "name"):
+        v = item.get(k)
+        if v: c.append(v)
+    for v in item.get("alt_titles", []) or []:
+        c.append(v)
+    # dedupe while preserving order
+    out, seen = [], set()
+    for t in c:
+        nt = _norm_title(t)
+        if nt and nt not in seen:
+            out.append(t)
+            seen.add(nt)
+    return out
 
-def _norm(t: str) -> str:
-    return _norm_re.sub("", (t or "").lower())
+def _kind(item: Dict[str, Any]) -> str:
+    t = (item.get("type") or "").lower()
+    if t in ("tv", "tvseries", "tvminiseries"): return "tvSeries"
+    return "movie" if t == "movie" else "movie"
 
-def _title_year_key(item: Dict[str, Any]) -> Tuple[str, int] | None:
-    title = item.get("title") or item.get("name") or ""
-    year = item.get("year")
-    if not title or not year:
-        return None
-    return _norm(title), int(year)
-
-def filter_unseen(pool: List[Dict[str, Any]], seen) -> List[Dict[str, Any]]:
-    out = []
-    for x in pool:
-        imdb_id = (x.get("imdb_id") or "").strip()
-        if imdb_id and imdb_id in seen.ttids:
-            continue
-        k = _title_year_key(x)
-        if k and k in seen.by_title_year:
-            continue
-        out.append(x)
+def filter_unseen(pool: Iterable[Dict[str, Any]], seen: SeenIndex) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for it in pool:
+        k = _kind(it)
+        y = it.get("year")
+        titles = _candidates(it)
+        keep = True
+        for t in titles:
+            if seen.has(k, t, y):
+                keep = False
+                break
+        if keep:
+            out.append(it)
     return out
