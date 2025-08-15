@@ -1,175 +1,181 @@
 # engine/catalog_builder.py
-import os, time, requests
-from typing import Dict, List, Tuple, Any
-from rich import print as rprint
-from .cache import get_fresh, set as cache_set
+import os, time, datetime, requests
+from typing import Dict, Any, List, Tuple
 
-TMDB_API = "https://api.themoviedb.org/3"
-OMDB_API = "http://www.omdbapi.com/"
+# ---- CONFIG / ENV ---------------------------------------------
+REGION = os.environ.get("REGION", "US").upper()
+TMDB_KEY = os.environ.get("TMDB_API_KEY", "").strip()
+OMDB_KEY = os.environ.get("OMDB_API_KEY", "").strip()
 
-UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"}
+PAGES_MOVIE = int(os.environ.get("TMDB_PAGES_MOVIE", "5"))
+PAGES_TV    = int(os.environ.get("TMDB_PAGES_TV", "5"))
 
-def _tmdb_key() -> str:
-    k = os.environ.get("TMDB_API_KEY","").strip()
-    if not k:
-        raise RuntimeError("TMDB_API_KEY not set")
-    return k
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "RecoEngine/2.13 (+github-actions)"
+})
 
-def _omdb_key() -> str:
-    k = os.environ.get("OMDB_API_KEY","").strip()
-    if not k:
-        raise RuntimeError("OMDB_API_KEY not set")
-    return k
+# ---- TMDB CLIENT ----------------------------------------------
+TMDB_BASE = "https://api.themoviedb.org/3"
 
-def _tmdb_get(path: str, params: Dict[str,Any]) -> Dict:
-    params = dict(params or {})
-    headers = {"Authorization": f"Bearer {_tmdb_key()}"} if len(_tmdb_key()) > 40 else {}
-    # support v3 key as fallback (query param)
-    if not headers:
-        params["api_key"] = _tmdb_key()
-    key = f"tmdb:{path}:{sorted(params.items())}"
-    cached = get_fresh(key, ttl_days=2)
-    if cached is not None:
-        return cached
-    url = f"{TMDB_API}{path}"
-    r = requests.get(url, params=params, headers=headers or UA, timeout=30)
-    if r.status_code == 401:
-        raise RuntimeError("TMDB 401 Unauthorized — check TMDB_API_KEY (Bearer v4 token or v3 key).")
-    if r.status_code >= 500:
-        time.sleep(1.0)
-    r.raise_for_status()
-    data = r.json()
-    cache_set(key, data)
-    return data
+def _tmdb_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    if not TMDB_KEY:
+        return {}
+    url = f"{TMDB_BASE}{path}"
+    p = {"api_key": TMDB_KEY, **(params or {})}
+    for attempt in range(3):
+        r = SESSION.get(url, params=p, timeout=20)
+        if r.status_code == 200:
+            return r.json()
+        time.sleep(0.8 * (attempt + 1))
+    return {}
 
-def _omdb_get(params: Dict[str,Any]) -> Dict:
-    params = dict(params or {})
-    params["apikey"] = _omdb_key()
-    key = f"omdb:{sorted(params.items())}"
-    cached = get_fresh(key, ttl_days=7)
-    if cached is not None:
-        return cached
-    r = requests.get(OMDB_API, params=params, headers=UA, timeout=30)
-    if r.status_code >= 500:
-        time.sleep(1.0)
-    r.raise_for_status()
-    data = r.json()
-    cache_set(key, data)
-    return data
-
-def _discover(kind: str, pages: int) -> List[Dict]:
-    assert kind in ("movie", "tv")
-    out: List[Dict] = []
-    for p in range(1, pages+1):
-        params = {
-            "with_original_language": "en",   # English originals (US/UK/AU/CA/etc)
-            "include_adult": "false",
-            "page": p,
-            "sort_by": "popularity.desc",
-            "language": "en-US",              # response language (does not filter)
-        }
-        data = _tmdb_get(f"/discover/{kind}", params)
-        results = data.get("results", []) or []
-        rprint(f"[tmdb] discover {kind} page={p} results={len(results)}")
-        out.extend(results)
-        time.sleep(0.2)
-    return out
-
-def _external_ids(kind: str, tmdb_id: int) -> Dict:
+def _tmdb_external_ids(kind: str, tmdb_id: int) -> Dict[str, Any]:
     return _tmdb_get(f"/{kind}/{tmdb_id}/external_ids", {})
 
-def _tv_details(tmdb_id: int) -> Dict:
-    return _tmdb_get(f"/tv/{tmdb_id}", {"language": "en-US"})
+def _providers(kind: str, tmdb_id: int) -> List[str]:
+    data = _tmdb_get(f"/{kind}/{tmdb_id}/watch/providers", {})
+    results = (data or {}).get("results", {})
+    r = results.get(REGION) or {}
+    out: List[str] = []
 
-def _ratings_from_omdb(imdb_id: str) -> Tuple[float, float]:
-    """returns (critic, audience) in [0,1], tolerant to missing fields."""
-    if not imdb_id:
-        return (0.0, 0.0)
-    try:
-        j = _omdb_get({"i": imdb_id, "tomatoes": "true"})
-    except Exception as e:
-        rprint(f"[yellow][omdb] {imdb_id} failed: {e}[/yellow]")
-        return (0.0, 0.0)
+    buckets = []
+    for k in ("flatrate", "free", "ads"):
+        if r.get(k):
+            buckets.append(k)
+    # if nothing on subs, capture buy/rent (still normalized; runner will filter)
+    if not buckets:
+        for k in ("buy", "rent"):
+            if r.get(k):
+                buckets.append(k)
 
-    # Audience: IMDb rating if present
-    try:
-        aud = float(j.get("imdbRating","0") or 0) / 10.0
-    except:
+    seen = set()
+    for k in buckets:
+        for it in (r.get(k) or []):
+            name = (it.get("provider_name") or "").lower()
+            if not name: continue
+            if "netflix" in name: norm = "netflix"
+            elif "prime" in name or "amazon" in name: norm = "prime_video"
+            elif name == "hulu": norm = "hulu"
+            elif "max" in name or "hbo" in name: norm = "max"
+            elif "disney" in name: norm = "disney_plus"
+            elif "apple tv" in name: norm = "apple_tv_plus"
+            elif "peacock" in name: norm = "peacock"
+            elif "paramount" in name: norm = "paramount_plus"
+            else: norm = name.replace(" ", "_")
+            if norm not in seen:
+                seen.add(norm); out.append(norm)
+    return out
+
+# ---- OMDb ratings (IMDb + RT) ---------------------------------
+def _omdb_ratings(imdb_id: str, title: str, year: int) -> Tuple[float, float]:
+    """
+    Returns (critic, audience) in 0..1
+    critic -> RottenTomatoes Tomatometer if present, else Metascore/100, else 0
+    audience -> IMDb rating/10
+    """
+    if not OMDB_KEY:
+        return (0.0, 0.0)
+    params = {"apikey": OMDB_KEY, "tomatoes": "true"}
+    if imdb_id:
+        params["i"] = imdb_id
+    else:
+        params["t"] = title
+        if year: params["y"] = str(year)
+
+    for attempt in range(2):
+        r = SESSION.get("http://www.omdbapi.com/", params=params, timeout=20)
+        if r.status_code != 200:
+            time.sleep(0.6); continue
+        j = r.json()
+        if not j or j.get("Response") != "True":
+            return (0.0, 0.0)
+        # IMDb rating
         aud = 0.0
-
-    # Critic: RottenTomatoes (Tomatometer) if present; else Metascore
-    critic = 0.0
-    ratings = j.get("Ratings") or []
-    for r in ratings:
-        if r.get("Source") == "Rotten Tomatoes":
-            v = r.get("Value","").strip().replace("%","")
-            if v.isdigit():
-                critic = max(critic, float(v)/100.0)
-    if critic == 0.0:
         try:
-            ms = float(j.get("Metascore","0") or 0)
-            critic = ms/100.0
-        except:
-            critic = 0.0
-    return (critic, aud)
+            ir = j.get("imdbRating")
+            if ir and ir != "N/A":
+                aud = max(0.0, min(1.0, float(ir) / 10.0))
+        except:  # noqa
+            pass
+        # RT critic (tomatometer) or Metascore
+        crit = 0.0
+        try:
+            # Ratings array sometimes includes Rotten Tomatoes entry
+            for entry in (j.get("Ratings") or []):
+                if entry.get("Source") == "Rotten Tomatoes":
+                    v = entry.get("Value","").strip().rstrip("%")
+                    crit = max(crit, min(1.0, float(v)/100.0))
+            if crit == 0.0:
+                ms = j.get("Metascore")
+                if ms and ms != "N/A":
+                    crit = max(0.0, min(1.0, float(ms)/100.0))
+        except:  # noqa
+            pass
+        return (crit, aud)
+    return (0.0, 0.0)
 
-def build_catalog(pages_movie: int, pages_tv: int, include_tv_seasons: bool=True) -> List[Dict]:
-    # 1) discover lists
-    movies = _discover("movie", max(1, pages_movie))
-    tvs    = _discover("tv",    max(1, pages_tv))
-    rprint(f"[catalog] discovered movies={len(movies)} tv={len(tvs)} (pre-enrich)")
+# ---- DISCOVER helpers ------------------------------------------
+def _discover(kind: str, pages: int) -> List[Dict[str, Any]]:
+    """
+    kind: 'movie' or 'tv'
+    """
+    out: List[Dict[str, Any]] = []
+    today = datetime.date.today().isoformat()
+    for page in range(1, max(1, pages) + 1):
+        params: Dict[str, Any] = {
+            "with_original_language": "en",          # ORIGINAL language English
+            "watch_region": REGION,
+            "with_watch_monetization_types": "flatrate|free|ads",
+            "page": page,
+            "sort_by": "popularity.desc"
+        }
+        if kind == "movie":
+            params["primary_release_date.lte"] = today
+            params["vote_count.gte"] = 200
+            j = _tmdb_get("/discover/movie", params)
+        else:
+            params["first_air_date.lte"] = today
+            params["vote_count.gte"] = 100
+            j = _tmdb_get("/discover/tv", params)
+        results = (j or {}).get("results") or []
+        for r in results:
+            tmdb_id = int(r.get("id") or 0)
+            if not tmdb_id: continue
+            title = r.get("title") or r.get("name") or ""
+            date_key = "release_date" if kind == "movie" else "first_air_date"
+            year = 0
+            if r.get(date_key):
+                try: year = int((r[date_key])[:4])
+                except: year = 0
+            seasons = int(r.get("number_of_seasons") or 1) if kind == "tv" else 0
 
-    if len(movies) + len(tvs) == 0:
-        raise RuntimeError("TMDB discover returned 0 results — likely API key/permission problem.")
+            # providers
+            provs = _providers(kind, tmdb_id)
 
-    # 2) enrich with imdb_id (+ seasons for TV) and ratings
-    out: List[Dict] = []
-    # movies
-    for m in movies:
-        tid = m.get("id")
-        title = m.get("title") or m.get("original_title") or ""
-        year = 0
-        if m.get("release_date"):
-            year = int((m["release_date"] or "0000")[:4])
-        ext = _external_ids("movie", tid)
-        imdb_id = (ext.get("imdb_id") or "").strip()
-        critic, audience = _ratings_from_omdb(imdb_id)
-        out.append({
-            "imdb_id": imdb_id,
-            "title": title,
-            "year": year,
-            "type": "movie",
-            "critic": round(critic, 3),
-            "audience": round(audience, 3),
-        })
-        time.sleep(0.15)
+            # external ids -> imdb
+            imdb_id = ""
+            ext = _tmdb_external_ids(kind, tmdb_id)
+            imdb_id = (ext or {}).get("imdb_id") or ""
 
-    # tv
-    for t in tvs:
-        tid = t.get("id")
-        title = t.get("name") or t.get("original_name") or ""
-        first_air_year = 0
-        if t.get("first_air_date"):
-            first_air_year = int((t["first_air_date"] or "0000")[:4])
-        ext = _external_ids("tv", tid)
-        imdb_id = (ext.get("imdb_id") or "").strip()
-        seasons = 1
-        if include_tv_seasons:
-            det = _tv_details(tid)
-            seasons = int(det.get("number_of_seasons") or 1)
-        critic, audience = _ratings_from_omdb(imdb_id)
-        out.append({
-            "imdb_id": imdb_id,
-            "title": title,
-            "year": first_air_year,
-            "type": "tvSeries",
-            "seasons": seasons,
-            "critic": round(critic, 3),
-            "audience": round(audience, 3),
-        })
-        time.sleep(0.15)
+            # ratings
+            critic, audience = _omdb_ratings(imdb_id, title, year)
 
-    # 3) keep entries that at least have a title (ratings can be 0.0)
-    clean = [x for x in out if (x.get("title") or "").strip()]
-    rprint(f"[catalog] enriched total={len(clean)} (movies={len(movies)} tv={len(tvs)})")
-    return clean
+            out.append({
+                "imdb_id": imdb_id,
+                "title": title,
+                "year": year,
+                "type": "movie" if kind == "movie" else "tvSeries",
+                "seasons": seasons or 1,
+                "providers": provs,
+                "critic": round(critic, 4),
+                "audience": round(audience, 4),
+            })
+        # be nice to APIs
+        time.sleep(0.4)
+    return out
+
+def build_catalog() -> List[Dict[str, Any]]:
+    movies = _discover("movie", PAGES_MOVIE)
+    tv     = _discover("tv",    PAGES_TV)
+    return movies + tv
