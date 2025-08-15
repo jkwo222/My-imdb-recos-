@@ -1,39 +1,73 @@
 # engine/recommender.py
 from typing import List, Dict, Any
-from .seen_index import is_seen
-from .taste import taste_boost_for
 
-def score(c: Dict[str,Any], w: Dict[str,Any], taste_profile: Dict[str,float]) -> float:
-    crit = float(c.get("critic", 0.0))      # RT (0..1)
-    aud  = float(c.get("audience", 0.0))    # IMDb (0..1)
-    consensus = (w.get("critic_weight",0.52) * crit) + (w.get("audience_weight",0.48) * aud)
+def _to_float(x, d=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return d
 
-    # Taste boost from your genre affinities (0..~0.15) → scaled to ~0..+6 points
-    tb = taste_boost_for(c.get("genres") or [], taste_profile)
-    taste_points = 40.0 * tb  # up to about +6.0
+def score(item: Dict[str, Any], w: Dict[str, Any]) -> float:
+    """
+    Personalized score driven by OMDb + your weights.
+    Range-bounded to 60–98.
+    """
+    rt = _to_float(item.get("rt_pct"), 0.0) / 100.0          # 0..1
+    imdb = _to_float(item.get("imdb_rating"), 0.0) / 10.0    # 0..1
 
-    s = 60.0 + 28.0 * consensus + taste_points
+    # if either missing, backfill lightly so everything isn't flat 62.
+    if rt == 0 and imdb == 0:
+        rt = 0.50
+        imdb = 0.55
 
-    # Commitment cost: all unseen multi-season shows are penalized; miniseries exempt
-    if c.get("type") == "tvSeries":
-        seasons = int(c.get("seasons", 1))
+    critic_w = float(w.get("critic_weight", 0.5))
+    aud_w = float(w.get("audience_weight", 0.5))
+    base = 60.0
+    blended = critic_w * rt + aud_w * imdb
+    s = base + 36.0 * blended   # 60..96 typically
+
+    # commitment cost (multi-season series you've not seen)
+    if item.get("type") == "tvSeries":
+        seasons = int(item.get("seasons") or 1)
         if seasons >= 3:
-            s -= 10.0 * w.get("commitment_cost_scale", 1.0)
+            s -= 9.0 * float(w.get("commitment_cost_scale", 1.0))
         elif seasons == 2:
-            s -= 5.0 * w.get("commitment_cost_scale", 1.0)
+            s -= 4.0 * float(w.get("commitment_cost_scale", 1.0))
 
-    # Light novelty pressure
-    s += 5.0 * float(w.get("novelty_pressure",0.15))
+    # tiny quality boost for big RT (signal)
+    if item.get("rt_pct", 0) >= 90:
+        s += 1.0
 
-    return max(50.0, min(98.0, round(s, 1)))
+    # clamp
+    if s < 60.0: s = 60.0
+    if s > 98.0: s = 98.0
+    return round(s, 1)
 
-def recommend(catalog: List[Dict[str,Any]], w: Dict[str,Any], taste_profile: Dict[str,float]) -> List[Dict[str,Any]]:
+def reason(item: Dict[str, Any]) -> str:
+    bits = []
+    if item.get("lang_is_english"): bits.append("English-language")
+    if item.get("rt_pct"): bits.append(f"RT {int(item['rt_pct'])}%")
+    if item.get("imdb_rating"): bits.append(f"IMDb {item['imdb_rating']}/10")
+    g = (item.get("omdb", {}) or {}).get("genres")
+    if g: bits.append(g)
+    cert = item.get("cert")
+    if cert: bits.append(cert)
+    if item.get("type") == "tvSeries" and item.get("seasons"):
+        bits.append(f"{int(item['seasons'])} seasons")
+    return " • ".join(bits) or "Signals matched your taste profile"
+
+def recommend(catalog: List[Dict[str, Any]], w: Dict[str, Any], seen_checker) -> List[Dict[str, Any]]:
     out = []
     for c in catalog:
-        if is_seen(c.get("title",""), c.get("imdb_id",""), int(c.get("year",0))):
+        # final filter on type (allow movies, series, miniseries, TV movies/specials)
+        if c.get("type") not in ("movie","tvSeries","tvMiniSeries","tvMovie","tvSpecial"):
+            continue
+        # skip seen
+        if seen_checker(c):
             continue
         x = dict(c)
-        x["match"] = score(c, w, taste_profile)
+        x["match"] = score(x, w)
+        x["why"] = reason(x)
         out.append(x)
-    out.sort(key=lambda x: x["match"], reverse=True)
-    return out
+    out.sort(key=lambda z: z["match"], reverse=True)
+    return out[:50]
