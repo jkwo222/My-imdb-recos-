@@ -1,58 +1,67 @@
 # engine/seen_index.py
+from __future__ import annotations
 import json, os
-from bloom_filter2 import BloomFilter
-from .utils import normalize_title, fuzzy_match
+from pathlib import Path
+from typing import Iterable, Set, Dict, Any
 
-SEEN_PATH = "data/seen_index_v3.json"
+_SEEN_DIR = Path("data/seen")
+_SEEN_DIR.mkdir(parents=True, exist_ok=True)
 
-def _load_seen():
-    if os.path.exists(SEEN_PATH):
-        return json.load(open(SEEN_PATH, "r", encoding="utf-8"))
-    return {"by_imdb": {}, "by_key": {}, "meta": {"count": 0}}
+# Canonical store (simple and robust)
+_SEEN_JSON = _SEEN_DIR / "seen.json"
 
-def _save_seen(seen):
-    os.makedirs("data", exist_ok=True)
-    json.dump(seen, open(SEEN_PATH,"w",encoding="utf-8"), ensure_ascii=False, indent=2)
+# In-memory cache
+_seen_cache: Set[str] | None = None
 
-def _build_bloom_from_seen(seen):
-    """Build an in-memory Bloom filter from the persisted JSON."""
-    n = max(10000, seen["meta"]["count"]*2)
-    bf = BloomFilter(max_elements=n, error_rate=0.001)
-    for iid in seen["by_imdb"]:
-        bf.add(f"imdb:{iid}")
-    for k in seen["by_key"]:
-        bf.add(f"key:{k}")
-    return bf
+def _normalize_imdb_id(v: str | None) -> str | None:
+    if not v:
+        return None
+    v = v.strip()
+    if not v:
+        return None
+    if not v.startswith("tt"):
+        # Accept raw numeric ids
+        v = "tt" + v
+    return v
 
-def update_seen_from_ratings(rows):
-    """Persist ratings into seen_index_v3.json (title keys + imdb ids)."""
-    seen = _load_seen()
+def _load() -> Set[str]:
+    global _seen_cache
+    if _seen_cache is not None:
+        return _seen_cache
+    s: Set[str] = set()
+    if _SEEN_JSON.exists():
+        try:
+            data = json.load(open(_SEEN_JSON, "r", encoding="utf-8"))
+            for x in data or []:
+                nid = _normalize_imdb_id(x)
+                if nid: s.add(nid)
+        except Exception:
+            # Corrupt? start fresh
+            s = set()
+    _seen_cache = s
+    return s
+
+def _save(seen: Set[str]) -> None:
+    arr = sorted(seen)
+    json.dump(arr, open(_SEEN_JSON, "w", encoding="utf-8"), indent=2)
+
+def is_seen_imdb(imdb_id: str | None) -> bool:
+    nid = _normalize_imdb_id(imdb_id)
+    if not nid:
+        return False
+    return nid in _load()
+
+def update_seen_from_ratings(rows: Iterable[Dict[str, Any]]) -> None:
+    """
+    Accepts CSV rows (IMDb export). Any row with a valid const/imdb_id is marked seen.
+    """
+    seen = _load()
+    added = 0
     for r in rows:
-        iid = (r.get("imdb_id") or "").strip()
-        title = r.get("title",""); year = int(r.get("year") or 0)
-        key = normalize_title(title)
-        if iid:
-            seen["by_imdb"][iid] = {"year": year, "title": title}
-        if key:
-            seen["by_key"][key] = {"year": year, "title": title}
-    seen["meta"]["count"] = max(len(seen["by_imdb"]), len(seen["by_key"]))
-    _save_seen(seen)  # Bloom is rebuilt on demand; no disk persistence needed.
-
-def is_seen(title: str, imdb_id: str = "", year: int = 0, thr: float = 0.92, tol: int = 1) -> bool:
-    """Fast membership check with Bloom first, then fuzzy/Year tolerance fallback."""
-    seen = _load_seen()
-    bf = _build_bloom_from_seen(seen)  # in-memory bloom
-
-    if imdb_id and f"imdb:{imdb_id}" in bf:
-        return True
-    key = normalize_title(title)
-    if key and f"key:{key}" in bf:
-        return True
-
-    # Bloom says "maybe" or miss; do precise fuzzy fallback with year tolerance
-    for k, meta in seen["by_key"].items():
-        if fuzzy_match(key, k, thr):
-            y = int(meta.get("year") or 0)
-            if (year == 0) or (abs(y - year) <= tol):
-                return True
-    return False
+        imdb_id = r.get("imdb_id") or r.get("const")
+        nid = _normalize_imdb_id(imdb_id)
+        if nid and nid not in seen:
+            seen.add(nid)
+            added += 1
+    _save(seen)
+    print(f"[seen] updated: +{added} (total={len(seen)})")
