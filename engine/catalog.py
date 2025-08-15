@@ -2,9 +2,9 @@
 from __future__ import annotations
 import hashlib
 import json
-import math
 import os
 import random
+import re
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -16,15 +16,29 @@ CACHE_DIR = os.environ.get("CACHE_DIR", "data/cache")
 USER_PROVIDERS_JSON = os.path.join(CACHE_DIR, "user_providers.json")
 PROVIDER_MAP_JSON = os.path.join(CACHE_DIR, "provider_map.json")
 
-# language/region defaults (English only)
+# ---- Language/region (accept both old & new env names)
 LANG = os.environ.get("LANGUAGE", "en-US")
-WITH_ORIG_LANG = os.environ.get("WITH_ORIGINAL_LANGUAGE", "en")
-WATCH_REGION = os.environ.get("WATCH_REGION", "US")
+WATCH_REGION = os.environ.get("WATCH_REGION") or os.environ.get("REGION") or "US"
 
-# page counts & rotation
-MOVIE_PAGES = int(os.environ.get("MOVIE_PAGES", "48"))
-TV_PAGES = int(os.environ.get("TV_PAGES", "48"))
-ROTATE_MIN = int(os.environ.get("ROTATE_MINUTES", "15"))  # per your spec
+# We pin to English per your instruction, but accept ORIGINAL_LANGS/WITH_ORIGINAL_LANGUAGE if present.
+_orig_lang_env = os.environ.get("WITH_ORIGINAL_LANGUAGE") or os.environ.get("ORIGINAL_LANGS") or "en"
+WITH_ORIG_LANG = "en"  # force English only
+
+# ---- Page counts & rotation (accept legacy envs; ensure "substantially increased")
+def _int_env(*names: str, default: int) -> int:
+    for n in names:
+        v = os.environ.get(n)
+        if v and str(v).strip().isdigit():
+            try:
+                return int(v)
+            except Exception:
+                pass
+    return default
+
+# Minimum 48 each unless you explicitly set higher
+MOVIE_PAGES = max(48, _int_env("MOVIE_PAGES", "TMDB_PAGES_MOVIE", default=48))
+TV_PAGES    = max(48, _int_env("TV_PAGES", "TMDB_PAGES_TV", default=48))
+ROTATE_MIN  = _int_env("ROTATE_MINUTES", default=15)  # 15-minute rotation
 
 _LAST_META: Dict = {}
 
@@ -45,9 +59,7 @@ def _get(url: str, params: Dict) -> Dict:
     return r.json()
 
 def _slot_and_salt() -> Tuple[int, int]:
-    # 15-min rotation slot (configurable)
     slot = int(time.time() // (ROTATE_MIN * 60))
-    # persistent salt for this environment
     _ensure_dirs()
     salt_path = os.path.join(CACHE_DIR, "tmdb_page_salt.txt")
     if os.path.exists(salt_path):
@@ -60,44 +72,52 @@ def _slot_and_salt() -> Tuple[int, int]:
     return slot, salt
 
 def _permute(total_pages: int, desired: int, slot: int, salt: int, label: str) -> List[int]:
-    """
-    Choose 'desired' distinct pages in [1..total_pages], rotating each slot.
-    We use a coprime step and a hash-mixed start so pages change frequently.
-    """
-    desired = max(1, min(desired, total_pages))
-    # derive a pseudo-random start and step from salt+label
+    desired = max(1, min(desired, max(1, total_pages)))
     h = int(hashlib.blake2s(f"{salt}:{slot}:{label}".encode(), digest_size=8).hexdigest(), 16)
-    start = (h % total_pages)
-    # pick an odd step coprime-ish to total_pages
-    step = (2 * (h % (total_pages // 2)) + 1) or 1
-    pages = []
-    seen = set()
-    cur = start
+    start = (h % max(1, total_pages))
+    step = (2 * (h % max(1, total_pages // 2)) + 1) or 1  # odd step
+    pages, seen, cur = [], set(), start
     while len(pages) < desired:
-        p = (cur % total_pages) + 1
+        p = (cur % max(1, total_pages)) + 1
         if p not in seen:
-            pages.append(p)
-            seen.add(p)
+            pages.append(p); seen.add(p)
         cur += step
     return pages
 
+# ---- Provider name handling
+
+_NONALNUM = re.compile(r"[^a-z0-9]+")
+
+def _norm(s: str) -> str:
+    return _NONALNUM.sub("", (s or "").lower())
+
 def _load_user_provider_names() -> List[str]:
     """
-    Your services only. Sources (in order):
-      1) ENV MY_STREAMING_PROVIDERS (CSV of names)
-      2) /mnt/data/providers.json  (["Netflix","Max",..."])
-      3) cached snapshot data/cache/user_providers.json
+    Your services only. Sources (in priority order):
+      1) SUBS_INCLUDE (csv)
+      2) MY_STREAMING_PROVIDERS (csv)
+      3) /mnt/data/providers.json  (["Netflix","Max",..."])
+      4) cached snapshot (data/cache/user_providers.json)
     """
-    # 1) env
-    envv = os.environ.get("MY_STREAMING_PROVIDERS", "").strip()
-    if envv:
-        names = [x.strip() for x in envv.split(",") if x.strip()]
+    # 1) SUBS_INCLUDE (used in your workflow)
+    env_subs = os.environ.get("SUBS_INCLUDE", "")
+    if env_subs.strip():
+        names = [x.strip() for x in env_subs.split(",") if x.strip()]
         _ensure_dirs()
         with open(USER_PROVIDERS_JSON, "w", encoding="utf-8") as f:
             json.dump(names, f, ensure_ascii=False, indent=2)
         return names
 
-    # 2) file
+    # 2) MY_STREAMING_PROVIDERS
+    env_my = os.environ.get("MY_STREAMING_PROVIDERS", "")
+    if env_my.strip():
+        names = [x.strip() for x in env_my.split(",") if x.strip()]
+        _ensure_dirs()
+        with open(USER_PROVIDERS_JSON, "w", encoding="utf-8") as f:
+            json.dump(names, f, ensure_ascii=False, indent=2)
+        return names
+
+    # 3) file on disk
     try:
         path = "/mnt/data/providers.json"
         if os.path.exists(path):
@@ -112,7 +132,7 @@ def _load_user_provider_names() -> List[str]:
     except Exception:
         pass
 
-    # 3) cached
+    # 4) cached
     if os.path.exists(USER_PROVIDERS_JSON):
         try:
             with open(USER_PROVIDERS_JSON, "r", encoding="utf-8") as f:
@@ -122,25 +142,21 @@ def _load_user_provider_names() -> List[str]:
         except Exception:
             pass
 
-    # Last resort: no names (we will NOT fail—pool would be too fragile)
     return []
 
 def _provider_map(kind: str) -> Dict[str, int]:
     """
-    Map provider names -> IDs for a given kind ("movie" or "tv") in WATCH_REGION.
-    Cached to avoid spamming TMDB.
+    Map normalized provider name -> id (for the given kind) in WATCH_REGION.
+    Cached for both movie & tv.
     """
     _ensure_dirs()
-    cache_key = f"{PROVIDER_MAP_JSON}"
     data = {}
-    if os.path.exists(cache_key):
+    if os.path.exists(PROVIDER_MAP_JSON):
         try:
-            with open(cache_key, "r", encoding="utf-8") as f:
+            with open(PROVIDER_MAP_JSON, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception:
             data = {}
-    if kind in (data.get("movie") or {}) and kind in (data.get("tv") or {}):
-        pass
 
     if kind not in data:
         data[kind] = {}
@@ -152,33 +168,74 @@ def _provider_map(kind: str) -> Dict[str, int]:
         name = (entry.get("provider_name") or "").strip()
         pid = entry.get("provider_id")
         if name and isinstance(pid, int):
-            mp[name.lower()] = pid
+            mp[_norm(name)] = pid
     data[kind] = mp
-    with open(cache_key, "w", encoding="utf-8") as f:
+
+    with open(PROVIDER_MAP_JSON, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     return mp
 
-def _names_to_ids(names: List[str], kind: str) -> List[int]:
-    mp = _provider_map(kind)
-    ids = []
-    for n in names:
-        k = n.strip().lower()
-        if k in mp:
-            ids.append(mp[k])
-    # de-dup preserve order
+# fuzzy-ish synonyms
+_SYNONYMS = {
+    "amazon": "amazonprimevideo",
+    "primevideo": "amazonprimevideo",
+    "prime_video": "amazonprimevideo",
+    "amazonprime": "amazonprimevideo",
+    "hbomax": "max",
+    "hbomax": "max",
+    "disneyplus": "disneyplus",
+    "disney+": "disneyplus",
+    "apple tv+": "appletvplus",
+    "apple_tv_plus": "appletvplus",
+    "appletv+": "appletvplus",
+    "paramountplus": "paramountplus",
+    "paramount+": "paramountplus",
+}
+
+def _normalize_user_name(n: str) -> str:
+    s = n.strip().lower().replace("_", " ").replace("+", " plus")
+    s = re.sub(r"\s+", " ", s).strip()
+    key = _norm(s)
+    key = _SYNONYMS.get(key, key)
+    return key
+
+def _names_to_ids(user_names: List[str], kind: str) -> List[int]:
+    mp = _provider_map(kind)  # normalized TMDB names -> id
+    ids: List[int] = []
+    keys = list(mp.keys())
+
+    for raw in user_names:
+        ukey = _normalize_user_name(raw)
+        # exact match
+        if ukey in mp:
+            ids.append(mp[ukey])
+            continue
+        # substring or close match
+        matched = None
+        for k in keys:
+            if ukey in k or k in ukey:
+                matched = k
+                break
+        if matched:
+            ids.append(mp[matched])
+
+    # de-dup, preserve order
     out, seen = [], set()
-    for x in ids:
-        if x not in seen:
-            out.append(x); seen.add(x)
+    for i in ids:
+        if i not in seen:
+            out.append(i); seen.add(i)
     return out
 
+# ---- Discover helpers
+
 def _discover(kind: str, pages: List[int], provider_ids: List[int]) -> List[Dict]:
-    """
-    Fetch discover results for kind in those pages. English only.
-    """
     items: List[Dict] = []
     with_prov = "|".join(str(i) for i in provider_ids) if provider_ids else None
-    sorts = ["popularity.desc", "vote_count.desc", "primary_release_date.desc" if kind=="movie" else "first_air_date.desc"]
+    sorts = [
+        "popularity.desc",
+        "vote_count.desc",
+        "primary_release_date.desc" if kind == "movie" else "first_air_date.desc",
+    ]
     for i, pg in enumerate(pages):
         sort_by = sorts[i % len(sorts)]
         params = {
@@ -187,10 +244,11 @@ def _discover(kind: str, pages: List[int], provider_ids: List[int]) -> List[Dict
             "page": pg,
             "sort_by": sort_by,
             "watch_region": WATCH_REGION,
-            "with_watch_monetization_types": "flatrate,ads,free"
+            "with_watch_monetization_types": "flatrate,ads,free",
         }
-        if with_prov := with_prov:
+        if with_prov:
             params["with_watch_providers"] = with_prov
+
         url = f"{BASE}/discover/{'movie' if kind=='movie' else 'tv'}"
         data = _get(url, params)
         for r in data.get("results", []):
@@ -226,7 +284,7 @@ def _total_pages(kind: str, provider_ids: List[int]) -> int:
         "with_original_language": WITH_ORIG_LANG,
         "page": 1,
         "watch_region": WATCH_REGION,
-        "with_watch_monetization_types": "flatrate,ads,free"
+        "with_watch_monetization_types": "flatrate,ads,free",
     }
     if provider_ids:
         params["with_watch_providers"] = "|".join(str(i) for i in provider_ids)
@@ -236,12 +294,13 @@ def _total_pages(kind: str, provider_ids: List[int]) -> int:
 
 def _plan_pages() -> Dict[str, List[int]]:
     slot, salt = _slot_and_salt()
-    # Provider names -> IDs
+
+    # Your provider names → ids (honor only your list)
     names = _load_user_provider_names()
     movie_ids = _names_to_ids(names, "movie")
     tv_ids = _names_to_ids(names, "tv")
 
-    # Get total pages once to bound the permutation
+    # Bound permutations by the actual total pages for current filters
     try:
         total_m = _total_pages("movie", movie_ids)
     except Exception:
@@ -251,7 +310,6 @@ def _plan_pages() -> Dict[str, List[int]]:
     except Exception:
         total_t = 1
 
-    # Plan rotating pages
     pages_m = _permute(total_m, MOVIE_PAGES, slot, salt, "movie")
     pages_t = _permute(total_t, TV_PAGES, slot, salt, "tv")
 
@@ -265,21 +323,21 @@ def _plan_pages() -> Dict[str, List[int]]:
         "provider_ids": {"movie": movie_ids, "tv": tv_ids},
         "language": LANG,
         "with_original_language": WITH_ORIG_LANG,
-        "watch_region": WATCH_REGION
+        "watch_region": WATCH_REGION,
     }
     return {"movie": pages_m, "tv": pages_t, "meta": meta}
 
 def build_pool() -> List[Dict]:
     """
-    Returns a combined list of movie+tv dicts honoring your provider & language constraints.
-    Rotation ensures pages change every ROTATE_MIN minutes.
+    Combined movie+tv honoring your providers & English-only constraints.
+    Pages rotate every ROTATE_MIN minutes and are different across slots.
     """
     global _LAST_META
     _ensure_dirs()
     plan = _plan_pages()
     _LAST_META = plan["meta"]
-    prov_ids_m = plan["meta"]["provider_ids"]["movie"]
-    prov_ids_t = plan["meta"]["provider_ids"]["tv"]
+    prov_ids_m = _LAST_META["provider_ids"]["movie"]
+    prov_ids_t = _LAST_META["provider_ids"]["tv"]
 
     _hb(f"plan: movies={len(plan['movie'])} tv={len(plan['tv'])} slot={_LAST_META['slot']} "
         f"prov_m={len(prov_ids_m)} prov_t={len(prov_ids_t)}")
