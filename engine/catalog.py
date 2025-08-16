@@ -1,279 +1,198 @@
-import os
-import time
 import json
-import hashlib
-from typing import Dict, List, Tuple, Any
-import requests
+import math
+import os
+import random
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
 
-# ---------- Defaults ----------
-# (You can override all of these via env; safe defaults provided.)
+from .config import Config
+from .http import DiskCache, TMDB
 
-# TMDB watch-provider IDs for US (override with PROVIDER_IDS, e.g.
-# "netflix:8,prime_video:119,hulu:15,max:384,disney_plus:337,apple_tv_plus:350,peacock:386,paramount_plus:531")
-PROVIDER_ID_MAP_US = {
-    "netflix": 8,
-    "prime_video": 119,
-    "hulu": 15,
-    "max": 384,            # HBO Max/Max
-    "disney_plus": 337,
-    "apple_tv_plus": 350,
-    "peacock": 386,
-    "paramount_plus": 531,
-}
+JSON = Dict[str, Any]
 
-def _env_str(key: str, default: str) -> str:
-    v = os.getenv(key)
-    return v if v is not None and str(v).strip() != "" else default
+_STATE_PATH = "data/cache/discover_state.json"
 
-def _env_int(key: str, default: int) -> int:
+def _load_state() -> JSON:
+    p = Path(_STATE_PATH)
+    if not p.exists():
+        return {"movie": {"cursor": 1, "total_pages": 1},
+                "tv":    {"cursor": 1, "total_pages": 1}}
     try:
-        return int(_env_str(key, str(default)))
+        return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
-        return default
+        return {"movie": {"cursor": 1, "total_pages": 1},
+                "tv":    {"cursor": 1, "total_pages": 1}}
 
-def _hash32(s: str) -> int:
-    return int(hashlib.sha256(s.encode("utf-8")).hexdigest()[:8], 16)
+def _save_state(st: JSON) -> None:
+    p = Path(_STATE_PATH)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(st, indent=2), encoding="utf-8")
 
-def _dedupe(items: List[dict]) -> List[dict]:
+def _provider_ids_for_names(tmdb: TMDB, names: List[str]) -> List[int]:
+    """
+    Map human-friendly names to TMDB provider IDs.
+    Names should be provided in snake/lower or plain words.
+    We normalize both sides to loose-match (lowercase, spaces->spaces).
+    """
+    name_variants = {
+        "netflix": ["netflix"],
+        "prime_video": ["amazon prime video", "prime video"],
+        "hulu": ["hulu"],
+        "max": ["max", "hbo max"],
+        "disney_plus": ["disney plus", "disney+"],
+        "apple_tv_plus": ["apple tv+", "apple tv plus"],
+        "peacock": ["peacock"],
+        "paramount_plus": ["paramount plus", "paramount+"],
+    }
+
+    prov_map = tmdb.providers_map(country=tmdb.region)
+    out: List[int] = []
+
+    for key in names:
+        needle = key.strip().lower()
+        candidates = name_variants.get(needle, [needle])
+        found = None
+        for cand in candidates:
+            cand2 = cand.replace("_", " ").strip()
+            if cand2 in prov_map:
+                found = prov_map[cand2]
+                break
+        if found is not None:
+            out.append(int(found))
+    # Dedup
+    return sorted(set(out))
+
+def _unique_items(items: List[JSON]) -> List[JSON]:
     seen = set()
     out = []
     for it in items:
-        k = (it.get("media_type"), it.get("id"))
+        k = (it.get("media_type"), int(it.get("id")))
         if k not in seen:
             seen.add(k)
             out.append(it)
     return out
 
-class TmdbClient:
-    def __init__(self, api_key: str, language: str, watch_region: str, cb: str, throttle_ms: int = 0):
-        self.api_key = api_key
-        self.language = language
-        self.watch_region = watch_region
-        self.cb = cb
-        self.base = "https://api.themoviedb.org/3"
-        self.s = requests.Session()
-        self.s.headers.update({"Accept": "application/json"})
-        self.throttle_ms = max(0, int(throttle_ms))
-        self.request_count = 0
+def _results_to_pool(kind: str, page_blob: JSON) -> List[JSON]:
+    pool: List[JSON] = []
+    for r in page_blob.get("results", []):
+        tmdb_id = int(r.get("id"))
+        title = (r.get("title") or r.get("name") or "").strip()
+        release = (r.get("release_date") or r.get("first_air_date") or "")[:4]
+        year = int(release) if release.isdigit() else None
+        pool.append({
+            "media_type": kind,
+            "tmdb_id": tmdb_id,
+            "title": title,
+            "year": year,
+            "popularity": r.get("popularity"),
+            "vote_average": r.get("vote_average"),
+            "vote_count": r.get("vote_count"),
+        })
+    return pool
 
-    def _params(self, extra: Dict[str, Any]) -> Dict[str, Any]:
-        p = {
-            "api_key": self.api_key,
-            "language": self.language,
-            "watch_region": self.watch_region,
-            "include_adult": "false",
-            # explicit cache-buster so GitHub Actions doesn't reuse CDN aggressively
-            "cb": self.cb,
-        }
-        p.update(extra or {})
-        return p
+def _next_chunk(start: int, count: int, total_pages: int) -> List[int]:
+    if total_pages <= 0:
+        return []
+    pages = []
+    cur = start
+    for _ in range(max(0, count)):
+        pages.append(cur)
+        cur += 1
+        if cur > total_pages:
+            cur = 1
+    return sorted(set(pages))
 
-    def get(self, path: str, params: Dict[str, Any]) -> dict:
-        if self.throttle_ms:
-            time.sleep(self.throttle_ms / 1000.0)
-        url = f"{self.base}{path}"
-        r = self.s.get(url, params=self._params(params), timeout=30)
-        self.request_count += 1
-        r.raise_for_status()
-        return r.json()
+def _sample_pages(seed: int, count: int, total_pages: int) -> List[int]:
+    if total_pages <= 1:
+        return [1]
+    n = min(count, total_pages)
+    rng = random.Random(seed)
+    return sorted(rng.sample(range(1, total_pages + 1), n))
 
-# ---------- Provider resolution ----------
+def build_pool(cfg: Config, slot: int) -> Tuple[List[JSON], JSON]:
+    # Init cache + client
+    cache = DiskCache(cfg.cache_dir) if cfg.enable_discover_cache else None
+    tmdb = TMDB(cfg.tmdb_api_key, cfg.region, cfg.language, cache)
 
-def _resolve_provider_ids() -> Tuple[List[int], Dict[str, int], List[str]]:
-    names = [x.strip().lower() for x in _env_str("SUBS_INCLUDE", "").split(",") if x.strip()]
-    custom = _env_str("PROVIDER_IDS", "")
-    id_map = PROVIDER_ID_MAP_US.copy()
-    if custom:
-        for token in custom.split(","):
-            token = token.strip()
-            if not token or ":" not in token:
-                continue
-            nm, idstr = token.split(":", 1)
-            nm = nm.strip().lower()
-            try:
-                id_map[nm] = int(idstr.strip())
-            except Exception:
-                pass
-    ids, unknown = [], []
-    for nm in names:
-        pid = id_map.get(nm)
-        if isinstance(pid, int):
-            ids.append(pid)
-        else:
-            unknown.append(nm)
-    return ids, id_map, unknown
+    # Provider IDs from runtime lookup (cached)
+    pids = _provider_ids_for_names(tmdb, cfg.subs_include)
+    with_provider_ids = ",".join(str(x) for x in pids) if pids else ""
 
-# ---------- Item extraction ----------
+    state = _load_state()
 
-def _rating_safe(val) -> float:
-    try:
-        return float(val or 0.0)
-    except Exception:
-        return 0.0
-
-def _extract_item(kind: str, r: dict) -> dict:
-    title = r.get("title") if kind == "movie" else r.get("name")
-    date_key = "release_date" if kind == "movie" else "first_air_date"
-    year = None
-    d = r.get(date_key) or ""
-    if len(d) >= 4:
-        try:
-            year = int(d[:4])
-        except Exception:
-            year = None
-    return {
-        "id": r.get("id"),
-        "media_type": "movie" if kind == "movie" else "tvSeries",
-        "title": title,
-        "year": year,
-        "popularity": _rating_safe(r.get("popularity")),
-        "tmdb_vote_average": _rating_safe(r.get("vote_average")),
-        "tmdb_vote_count": int(r.get("vote_count") or 0),
-        "origin_language": r.get("original_language"),
-    }
-
-# ---------- CSV (seen list) helper exposed for runner ----------
-
-def _load_seen_csv(path: str) -> Dict[str, int]:
-    seen = {}
-    if not path or not os.path.exists(path):
-        return seen
-    try:
-        import csv
-        with open(path, newline="", encoding="utf-8") as f:
-            r = csv.DictReader(f)
-            for row in r:
-                t = (row.get("const") or row.get("tconst") or "").strip()
-                if t:
-                    seen[f"imdb:{t}"] = 1
-                nm = (row.get("Title") or row.get("title") or "").strip().lower()
-                yr = (row.get("Year") or row.get("year") or "").strip()
-                if nm:
-                    seen[f"title:{nm}|{yr}"] = 1
-    except Exception:
-        pass
-    return seen
-
-# ---------- Core: FETCH ALL PAGES for movie and tv ----------
-
-def _discover_all_pages(
-    tmdb: TmdbClient,
-    kind: str,
-    provider_ids: List[int],
-    with_original_language: str,
-    extra_filters: Dict[str, Any],
-    max_pages_cap: int,
-) -> Tuple[List[dict], Dict[str, Any]]:
-    """
-    Fetches page=1..total_pages (capped by max_pages_cap) for /discover/{movie|tv}.
-    TMDB caps total_pages to 500 for most discover queries; we walk the full range.
-    """
-    params_base = dict(
-        sort_by="popularity.desc",
-        page=1,
-        with_watch_monetization_types="flatrate",
-        with_original_language=with_original_language,
+    # Fetch total pages (cached briefly) to guard randrange issues & know bounds
+    total_movie = tmdb.total_pages(
+        "movie", with_provider_ids, cfg.with_original_language,
+        slot, cfg.discover_cache_ttl_min, cfg.enable_discover_cache
     )
-    if provider_ids:
-        params_base["with_watch_providers"] = "|".join(str(p) for p in provider_ids)
-    if extra_filters:
-        params_base.update(extra_filters)
+    total_tv = tmdb.total_pages(
+        "tv", with_provider_ids, cfg.with_original_language,
+        slot, cfg.discover_cache_ttl_min, cfg.enable_discover_cache
+    )
 
-    # First page: determine total_pages
-    first = tmdb.get(f"/discover/{kind}", params_base)
-    total_pages = max(1, int(first.get("total_pages") or 1))
-    cap = max(1, min(total_pages, int(max_pages_cap)))
+    state["movie"]["total_pages"] = int(total_movie or 1)
+    state["tv"]["total_pages"] = int(total_tv or 1)
+    movie_cursor = int(state["movie"].get("cursor", 1))
+    tv_cursor = int(state["tv"].get("cursor", 1))
 
-    items = [_extract_item(kind, r) for r in first.get("results", [])]
-    # page 2..cap
-    for p in range(2, cap + 1):
-        params = dict(params_base)
-        params["page"] = p
-        try:
-            data = tmdb.get(f"/discover/{kind}", params)
-            items.extend(_extract_item(kind, r) for r in data.get("results", []) or [])
-        except Exception:
-            # Keep going if a single page hiccups (transient API/network)
-            continue
+    # Build page lists
+    # 1) rotating sample that changes with slot
+    movie_sample = _sample_pages(seed=hash(("movie", slot)), count=cfg.sample_pages_movie, total_pages=total_movie)
+    tv_sample = _sample_pages(seed=hash(("tv", slot)), count=cfg.sample_pages_tv, total_pages=total_tv)
+
+    # 2) sequential fill to grow local cache toward full coverage
+    movie_fill = _next_chunk(start=movie_cursor, count=cfg.fill_pages_movie, total_pages=total_movie)
+    tv_fill = _next_chunk(start=tv_cursor, count=cfg.fill_pages_tv, total_pages=total_tv)
+
+    movie_pages = sorted(set(movie_sample + movie_fill))
+    tv_pages = sorted(set(tv_sample + tv_fill))
+
+    # Advance cursors for next run
+    if total_movie > 0 and cfg.fill_pages_movie > 0:
+        new_movie_cursor = movie_fill[-1] + 1 if movie_fill else movie_cursor
+        if new_movie_cursor > total_movie:
+            new_movie_cursor = 1
+        state["movie"]["cursor"] = new_movie_cursor
+
+    if total_tv > 0 and cfg.fill_pages_tv > 0:
+        new_tv_cursor = tv_fill[-1] + 1 if tv_fill else tv_cursor
+        if new_tv_cursor > total_tv:
+            new_tv_cursor = 1
+        state["tv"]["cursor"] = new_tv_cursor
+
+    _save_state(state)
+
+    # Collect pages
+    pool_movie: List[JSON] = []
+    for pg in movie_pages:
+        blob = tmdb.discover("movie", pg, with_provider_ids, cfg.with_original_language,
+                             slot, cfg.discover_cache_ttl_min, cfg.enable_discover_cache)
+        pool_movie += _results_to_pool("movie", blob)
+
+    pool_tv: List[JSON] = []
+    for pg in tv_pages:
+        blob = tmdb.discover("tv", pg, with_provider_ids, cfg.with_original_language,
+                             slot, cfg.discover_cache_ttl_min, cfg.enable_discover_cache)
+        pool_tv += _results_to_pool("tv", blob)
+
+    # Dedup and cap
+    pool = _unique_items(pool_movie + pool_tv)
+    if cfg.max_catalog > 0 and len(pool) > cfg.max_catalog:
+        pool = pool[:cfg.max_catalog]
 
     meta = {
-        "total_pages": total_pages,
-        "pages_used": list(range(1, cap + 1)),
-        "want_pages": cap,
-        "fetch_all": True,
-        "requests_first_kind": tmdb.request_count,
-    }
-    return _dedupe(items), meta
-
-# ---------- Public: build_pool (always fetch-all) ----------
-
-def build_pool() -> Tuple[List[dict], Dict[str, Any]]:
-    api_key = _env_str("TMDB_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("TMDB_API_KEY is required")
-
-    language = _env_str("LANGUAGE", _env_str("LANG", "en-US"))
-    watch_region = _env_str("REGION", "US")
-    with_original_language = _env_str("ORIGINAL_LANGS", "en").split(",")[0].strip() or "en"
-
-    # Strong cache-buster; defaults to GitHub run number if present
-    cb_default = os.getenv("GITHUB_RUN_NUMBER") or str(_hash32(str(time.time())))
-    cb = _env_str("TMDB_CB", cb_default)
-
-    throttle_ms = _env_int("TMDB_THROTTLE_MS", 0)  # Optional: 0..100ms if you see 429s
-
-    provider_ids, id_map, unknown = _resolve_provider_ids()
-    if unknown:
-        print(f"[hb] WARN: unknown providers={unknown} (using known IDs only)")
-    if not provider_ids:
-        print("[hb] WARN: no provider IDs resolved — queries will NOT filter by provider.")
-
-    tmdb = TmdbClient(api_key, language, watch_region, cb, throttle_ms=throttle_ms)
-
-    # TMDB caps discover to 500 pages; allow an env cap (defaults to 500)
-    max_pages_movie = _env_int("TMDB_MAX_PAGES_MOVIE", 500)
-    max_pages_tv    = _env_int("TMDB_MAX_PAGES_TV", 500)
-
-    extra_filters: Dict[str, Any] = {}  # hook for future filters if needed
-
-    # ---- ALWAYS FETCH ALL PAGES ----
-    movie_items, m_meta = _discover_all_pages(
-        tmdb, "movie", provider_ids, with_original_language, extra_filters, max_pages_movie
-    )
-    tv_items, t_meta = _discover_all_pages(
-        tmdb, "tv", provider_ids, with_original_language, extra_filters, max_pages_tv
-    )
-
-    pool = _dedupe(movie_items + tv_items)
-
-    page_plan = {
-        "movie_pages": m_meta.get("want_pages"),
-        "tv_pages": t_meta.get("want_pages"),
-        "rotate_minutes": _env_int("ROTATE_MINUTES", 15),   # still reported (harmless here)
-        "slot": None,
-        "total_pages_movie": m_meta.get("total_pages", 1),
-        "total_pages_tv": t_meta.get("total_pages", 1),
-        "movie_pages_used": m_meta.get("pages_used", [1]),
-        "tv_pages_used": t_meta.get("pages_used", [1]),
-        "provider_names": [x.strip() for x in _env_str("SUBS_INCLUDE", "").split(",") if x.strip()],
-        "language": language,
-        "with_original_language": with_original_language,
-        "watch_region": watch_region,
+        "movie_pages_used": movie_pages,
+        "tv_pages_used": tv_pages,
+        "total_pages_movie": total_movie,
+        "total_pages_tv": total_tv,
+        "provider_names": cfg.subs_include,
+        "language": cfg.language,
+        "with_original_language": cfg.with_original_language,
+        "watch_region": cfg.region,
         "pool_counts": {
-            "movie": sum(1 for x in pool if x["media_type"] == "movie"),
-            "tv": sum(1 for x in pool if x["media_type"] == "tvSeries"),
-        },
-        "total_pages": [m_meta.get("total_pages", 1), t_meta.get("total_pages", 1)],
-        "fetch_all_movie": True,
-        "fetch_all_tv": True,
-        "requests_made": tmdb.request_count,
-        "throttle_ms": throttle_ms,
+            "movie": len(pool_movie),
+            "tv": len(pool_tv),
+        }
     }
 
-    meta = {
-        "page_plan": page_plan,
-        "provider_id_map": id_map,
-        "provider_ids_used": provider_ids,
-        "unknown_providers": unknown,
-    }
     return pool, meta
