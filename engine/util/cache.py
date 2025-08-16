@@ -1,4 +1,4 @@
-# File: engine/util/cache.py
+# FILE: engine/util/cache.py
 from __future__ import annotations
 import hashlib
 import json
@@ -11,6 +11,7 @@ class DiskCache:
     Tiny JSON disk cache for API responses (URL+params key).
     Files live under {root}/{prefix}/{sha}.json with mtime-based TTL.
     """
+
     def __init__(self, root: str, ttl_secs: int):
         self.root = root
         self.ttl = ttl_secs
@@ -18,7 +19,8 @@ class DiskCache:
 
     def _key(self, prefix: str, url: str, params: dict | None) -> str:
         base = f"{url}|{json.dumps(params or {}, sort_keys=True)}".encode("utf-8")
-        return os.path.join(self.root, prefix, hashlib.sha256(base).hexdigest() + ".json")
+        sha = hashlib.sha256(base).hexdigest()
+        return os.path.join(self.root, prefix, f"{sha}.json")
 
     def get(self, prefix: str, url: str, params: dict | None) -> Optional[Any]:
         path = self._key(prefix, url, params)
@@ -26,6 +28,7 @@ class DiskCache:
             return None
         age = time.time() - os.path.getmtime(path)
         if self.ttl > 0 and age > self.ttl:
+            # stale; best-effort delete
             try:
                 os.remove(path)
             except Exception:
