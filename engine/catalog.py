@@ -1,211 +1,177 @@
 # engine/catalog.py
 from __future__ import annotations
-
 import os
-import random
 from typing import Any, Dict, List, Tuple
+from types import SimpleNamespace
 
-from .catalog_store import load_store, save_store, merge_discover_batch, all_items
+from .catalog_store import (
+    load_store,
+    save_store,
+    merge_discover_batch,
+    all_items,
+)
 
-# Import TMDB discover helpers exposed by engine.tmdb
+# We import the discover callables from engine.tmdb.
+# They must exist with these exact names.
 try:
-    from .tmdb import discover_movie_page, discover_tv_page
-except Exception:
+    from .tmdb import discover_movie_page as _tmdb_discover_movie
+    from .tmdb import discover_tv_page as _tmdb_discover_tv
+except Exception as e:
     raise ImportError(
         "engine.catalog: unable to import discover_movie_page/discover_tv_page from engine.tmdb. "
         "Ensure engine/tmdb.py exports those symbols."
-    )
+    ) from e
 
-# -------------------------
-# small utils
-# -------------------------
 
-def _int(v: Any, default: int) -> int:
+def _coerce_cfg(cfg: Any) -> SimpleNamespace:
+    """Accepts dict, SimpleNamespace, or any object with attributes/env."""
+    if isinstance(cfg, dict):
+        return SimpleNamespace(**cfg)
+    return cfg  # assume it already exposes attributes
+
+
+def _get_env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return default
     try:
         return int(v)
-    except Exception:
+    except ValueError:
         return default
 
 
-def _cfg_get(cfg, key, default=None):
-    """
-    Read a setting from:
-      1) cfg.get(key, default) if available
-      2) cfg[key] if cfg is a dict
-      3) getattr(cfg, key) if attribute exists
-      4) environment variable
-      5) provided default
-    """
-    try:
-        if hasattr(cfg, "get") and callable(getattr(cfg, "get")):
-            return cfg.get(key, default)
-    except Exception:
-        pass
-    if isinstance(cfg, dict):
-        return cfg.get(key, default)
-    if hasattr(cfg, key):
-        return getattr(cfg, key)
-    return os.getenv(key, default)
+def _get_env_str(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return default if v is None or str(v).strip() == "" else str(v)
 
 
-# -------------------------
-# page planning
-# -------------------------
+def _get_attr_or_env(cfg: SimpleNamespace, name: str, default: Any) -> Any:
+    if hasattr(cfg, name):
+        val = getattr(cfg, name)
+        if val is not None:
+            return val
+    # fall back to env
+    if isinstance(default, int):
+        return _get_env_int(name, default)
+    elif isinstance(default, str):
+        return _get_env_str(name, default)
+    else:
+        # no good env decoding — just return default
+        return default
 
-def _make_page_plan(cfg) -> Dict[str, Any]:
-    movie_pages = _int(_cfg_get(cfg, "TMDB_PAGES_MOVIE", 24), 24)
-    tv_pages = _int(_cfg_get(cfg, "TMDB_PAGES_TV", 24), 24)
-    slot = random.randint(1_000_000, 9_999_999)
+
+def _make_page_plan(cfg: SimpleNamespace) -> Dict[str, Any]:
+    movie_pages = _get_attr_or_env(cfg, "TMDB_PAGES_MOVIE", 24)
+    tv_pages = _get_attr_or_env(cfg, "TMDB_PAGES_TV", 24)
+
+    # A deterministic slot (optional cosmetics)
     rotate_minutes = 15
+    slot = (movie_pages * 100000) + (tv_pages * 1000) + rotate_minutes
     return {
-        "movie_pages": movie_pages,
-        "tv_pages": tv_pages,
+        "movie_pages": int(movie_pages),
+        "tv_pages": int(tv_pages),
         "rotate_minutes": rotate_minutes,
         "slot": slot,
     }
 
 
-def _provider_names(cfg) -> List[str]:
-    raw = str(_cfg_get(cfg, "SUBS_INCLUDE", "") or "")
-    return [p.strip() for p in raw.split(",") if p.strip()]
-
-
-def _provider_param_for_tmdb(names: List[str]) -> str | None:
-    """
-    TMDB 'with_watch_providers' expects numeric IDs.
-    If the concatenated string has no digits (likely names like 'netflix,hulu'),
-    skip the filter to avoid getting 0 results.
-    """
-    if not names:
-        return None
-    s = ",".join(names)
-    return s if any(ch.isdigit() for ch in s) else None
-
-
-# -------------------------
-# build pool
-# -------------------------
-
-def build_pool(cfg) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    1) Load cumulative store (data/catalog_store.json)
-    2) Discover TMDB titles for configured pages/providers/lang/region
-    3) Merge into store and save
-    4) Return (pool_items, meta)
-    """
-    plan = _make_page_plan(cfg)
-    movie_pages = plan["movie_pages"]
-    tv_pages = plan["tv_pages"]
-
-    provider_names = _provider_names(cfg)
-    provider_param = _provider_param_for_tmdb(provider_names)
-
-    language = (str(_cfg_get(cfg, "ORIGINAL_LANGS", "en")) or "en").strip()
-    watch_region = (str(_cfg_get(cfg, "REGION", "US")) or "US").strip()
-    include_tv_seasons = str(_cfg_get(cfg, "INCLUDE_TV_SEASONS", "true")).lower() in {"1", "true", "yes", "y"}
-    max_catalog = _int(_cfg_get(cfg, "MAX_CATALOG", 10000), 10000)
-
-    store_path = "data/catalog_store.json"
-    store = load_store(store_path)
-
-    pool_items: List[Dict[str, Any]] = []
-    added_movie = updated_movie = 0
-    added_tv = updated_tv = 0
-
-    # --- movies ---
-    total_pages_seen_movie = 0
-    for page in range(1, movie_pages + 1):
-        results, total_pages = discover_movie_page(
-            page=page,
-            watch_region=watch_region,
-            with_watch_providers=provider_param,
-            with_original_language=language,
-        )
-        total_pages_seen_movie = total_pages
-        a, u = merge_discover_batch(
-            store,
-            results,
-            media_type="movie",
-            region=watch_region,
-            providers=provider_names,
-        )
-        added_movie += a
-        updated_movie += u
-        pool_items.extend(
-            {
-                "type": "movie",
-                "id": r.get("id"),
-                "title": r.get("title") or r.get("original_title"),
-                "year": (r.get("release_date") or "")[:4] if r.get("release_date") else None,
+def _default_meta() -> Dict[str, Any]:
+    # Always present keys so downstream code never KeyErrors.
+    return {
+        "pool_counts": {"movie": 0, "tv": 0},
+        "telemetry": {
+            "counts": {
+                "tmdb_pool": 0,
+                "eligible_unseen": 0,
+                "shortlist": 0,
+                "shown": 0,
             }
-            for r in (results or [])
-        )
-        if len(all_items(store)) >= max_catalog:
-            break
-
-    # --- TV ---
-    total_pages_seen_tv = 0
-    for page in range(1, tv_pages + 1):
-        results, total_pages = discover_tv_page(
-            page=page,
-            watch_region=watch_region,
-            with_watch_providers=provider_param,
-            with_original_language=language,
-        )
-        total_pages_seen_tv = total_pages
-        a, u = merge_discover_batch(
-            store,
-            results,
-            media_type="tv",
-            region=watch_region,
-            providers=provider_names,
-        )
-        added_tv += a
-        updated_tv += u
-        pool_items.extend(
-            {
-                "type": "tvSeries",
-                "id": r.get("id"),
-                "title": r.get("name") or r.get("original_name"),
-                "year": (r.get("first_air_date") or "")[:4] if r.get("first_air_date") else None,
-            }
-            for r in (results or [])
-        )
-        if len(all_items(store)) >= max_catalog:
-            break
-
-    # Persist the cumulative store
-    save_store(store, store_path)
-
-    # Pool counts for the current run (what runner.py expects)
-    pool_count_movie = sum(1 for x in pool_items if x["type"] == "movie")
-    pool_count_tv = sum(1 for x in pool_items if x["type"] == "tvSeries")
-    pool_total = pool_count_movie + pool_count_tv
-
-    # Full metadata
-    meta: Dict[str, Any] = {
-        "page_plan": {
-            **plan,
-            "movie_total_pages_seen": total_pages_seen_movie,
-            "tv_total_pages_seen": total_pages_seen_tv,
         },
-        "provider_names": provider_names,
-        "language": language,
-        "watch_region": watch_region,
-        "include_tv_seasons": include_tv_seasons,
-        "limits": {"max_catalog": max_catalog},
-        "store_counts": {
-            "movie": len(store.get("movie", {})),
-            "tv": len(store.get("tv", {})),
-            "added_this_run": {"movie": added_movie, "tv": added_tv},
-            "updated_this_run": {"movie": updated_movie, "tv": updated_tv},
-        },
-        # 👇 this block fixes the KeyError in runner.py
-        "pool_counts": {
-            "movie": pool_count_movie,
-            "tv": pool_count_tv,
-            "total": pool_total,
-        },
+        "page_plan": {"movie_pages": 0, "tv_pages": 0, "rotate_minutes": 0, "slot": 0},
+        "providers": [],
     }
 
-    return pool_items, meta
+
+def _provider_names_list(cfg: SimpleNamespace) -> List[str]:
+    raw = _get_attr_or_env(cfg, "SUBS_INCLUDE", "")
+    if not raw:
+        return []
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def build_pool(cfg: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Build the nightly candidate pool.
+    Returns (pool_list, meta_dict).
+    Meta ALWAYS has the keys used by runner & summary.
+    """
+    cfg = _coerce_cfg(cfg)
+
+    plan = _make_page_plan(cfg)
+    provider_names = _provider_names_list(cfg)
+    language = _get_attr_or_env(cfg, "ORIGINAL_LANGS", "en")
+    with_original_language = language or "en"
+    watch_region = _get_attr_or_env(cfg, "REGION", "US")
+    include_tv_seasons = str(_get_attr_or_env(cfg, "INCLUDE_TV_SEASONS", "true")).lower() == "true"
+    max_catalog = int(_get_attr_or_env(cfg, "MAX_CATALOG", 10000))
+
+    # Load cumulative store first (may be empty)
+    store = load_store("data/catalog_store.json")
+
+    print("[hb] | catalog:begin", flush=True)
+
+    # Discover fresh pages (new titles each run) — robust fallback in tmdb.* functions.
+    pool_movie: List[Dict[str, Any]] = []
+    for p in range(1, plan["movie_pages"] + 1):
+        batch = _tmdb_discover_movie(
+            page=p,
+            provider_names=provider_names,
+            watch_region=watch_region,
+            with_original_language=with_original_language,
+        )
+        if not batch:
+            break
+        pool_movie.extend(batch)
+        if len(pool_movie) >= max_catalog:
+            break
+
+    pool_tv: List[Dict[str, Any]] = []
+    for p in range(1, plan["tv_pages"] + 1):
+        batch = _tmdb_discover_tv(
+            page=p,
+            provider_names=provider_names,
+            watch_region=watch_region,
+            with_original_language=with_original_language,
+            include_tv_seasons=include_tv_seasons,
+        )
+        if not batch:
+            break
+        pool_tv.extend(batch)
+        if len(pool_tv) >= max_catalog:
+            break
+
+    # Merge into store (growing over time)
+    added_m = merge_discover_batch(store, pool_movie)
+    added_t = merge_discover_batch(store, pool_tv)
+
+    # Persist the store so future runs pick it up
+    save_store("data/catalog_store.json", store)
+
+    # Compose tonight’s pool = store items limited to MAX_CATALOG (latest-first)
+    cumulative = all_items(store)
+    if len(cumulative) > max_catalog:
+        cumulative = cumulative[:max_catalog]
+
+    # Meta & telemetry
+    movie_count = sum(1 for it in cumulative if it.get("type") == "movie")
+    tv_count = sum(1 for it in cumulative if it.get("type") == "tv")
+
+    meta = _default_meta()
+    meta["pool_counts"] = {"movie": movie_count, "tv": tv_count}
+    meta["telemetry"]["counts"]["tmdb_pool"] = movie_count + tv_count
+    meta["page_plan"] = plan
+    meta["providers"] = provider_names
+    meta["store_added"] = {"movie": int(added_m), "tv": int(added_t)}
+
+    print(f"[hb] | catalog:end pool={movie_count + tv_count} movie={movie_count} tv={tv_count}", flush=True)
+    return cumulative, meta
