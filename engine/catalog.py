@@ -1,125 +1,79 @@
 # engine/catalog.py
+from __future__ import annotations
+
 import os
-from typing import Callable, Dict, List, Tuple
+from typing import Dict, List, Tuple
+
 from .config import Config
 from .catalog_store import load_store, save_store, merge_discover_batch, all_items
+from .tmdb import discover_movie_page, discover_tv_page, providers_from_env
 
-# Try both historic and current symbol names (to avoid import errors).
-def _resolve_callable(*names: str) -> Callable:
-    import importlib
-    tm = importlib.import_module("engine.tmdb")
-    for n in names:
-        if hasattr(tm, n):
-            return getattr(tm, n)
-    raise ImportError(f"engine.catalog: none of the expected functions exist in engine.tmdb: {names}")
 
-_DISCOVER_MOVIE = _resolve_callable("discover_movie_page")
-_DISCOVER_TV = _resolve_callable("discover_tv_page")
+def _make_page_plan(cfg: Config) -> Dict[str, int]:
+    """Decide how many pages to fetch for movie/tv."""
+    return {
+        "movie": int(cfg.tmdb_pages_movie),
+        "tv": int(cfg.tmdb_pages_tv),
+    }
 
-def _make_page_plan(cfg: Config) -> Dict:
+
+def _fetch_all_tmdb(cfg: Config) -> Tuple[List[Dict], Dict]:
+    """
+    Fetch both movie and tv discovery across *all* user services (OR union),
+    page by page, then merge to one pool; also compute simple meta counts.
+    """
+    subs_csv = cfg.subs_include  # e.g., "netflix,prime_video,hulu,..."
+    provider_ids = providers_from_env(subs_csv)
+    region = cfg.watch_region
+    langs = [s.strip() for s in (cfg.with_original_language or "").split(",") if s.strip()]
+
     movie_pages = int(cfg.tmdb_pages_movie)
     tv_pages = int(cfg.tmdb_pages_tv)
-    return {"movie_pages": movie_pages, "tv_pages": tv_pages}
 
-def _rank(items: List[Dict], critic_weight: float, audience_weight: float) -> List[Dict]:
-    # For now, use TMDB vote_average as audience-ish proxy. Hook in RT/IMDb later.
-    ranked = []
-    for it in items:
-        va = (it.get("vote_average") or 0) * 10  # TMDB is 0..10 → 0..100
-        critic = it.get("metascore") or 0       # place-holder slot for future RT/Meta
-        score = critic_weight*critic + audience_weight*va
-        ranked.append({**it, "match": round(float(score), 1)})
-    ranked.sort(key=lambda x: (x.get("match") or 0, x.get("vote_count") or 0, x.get("popularity") or 0), reverse=True)
-    return ranked
+    pool: List[Dict] = []
+    meta = {"pool_counts": {"movie": 0, "tv": 0}}
 
-def _load_seen_ids(cfg: Config) -> Dict[str, bool]:
-    # Read IMDb CSV (ids-only OK)
-    seen = {}
-    path = cfg.imdb_ratings_csv_path
-    if os.path.exists(path):
-        try:
-            import csv
-            with open(path, newline="", encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    tid = (row.get("const") or row.get("tconst") or "").strip()
-                    if tid:
-                        seen[tid] = True
-        except Exception:
-            pass
-    # Optional: future — scrape user list by cfg.imdb_user_id
-    return seen
+    # Movies
+    for p in range(1, movie_pages + 1):
+        items, _page = discover_movie_page(p, region=region, provider_ids=provider_ids, original_langs=langs)
+        for it in items:
+            it["type"] = "movie"
+        pool.extend(items)
+    meta["pool_counts"]["movie"] = len([x for x in pool if x.get("type") == "movie"])
 
-def _filter_unseen(items: List[Dict], seen_index: Dict[str, bool]) -> List[Dict]:
-    # We don't have IMDb IDs here; conservatively keep all items (you can add matching later)
-    # If you map TMDB -> IMDb elsewhere, filter using that map.
-    return items
+    # TV
+    for p in range(1, tv_pages + 1):
+        items, _page = discover_tv_page(p, region=region, provider_ids=provider_ids, original_langs=langs)
+        for it in items:
+            it["type"] = "tv"
+        pool.extend(items)
+    meta["pool_counts"]["tv"] = len([x for x in pool if x.get("type") == "tv"])
+
+    # Cap if needed
+    if cfg.max_catalog and len(pool) > int(cfg.max_catalog):
+        pool = pool[: int(cfg.max_catalog)]
+
+    return pool, meta
+
 
 def build_pool(cfg: Config) -> Tuple[List[Dict], Dict]:
     """
-    1) Load cumulative store
-    2) Discover new pages from TMDB and merge
-    3) Produce today's candidate pool (bounded by max_catalog)
-    4) Return (pool, meta) where meta['pool_counts'] always exists
+    Public entry: builds the full pool (movies + tv) guaranteed to include titles
+    available on ANY of the user's subscribed services for this run.
+    Also persists/merges into the store.
     """
     print("[hb] | catalog:begin", flush=True)
 
+    # fetch fresh pages each run (new titles) – no provider filtering later:
+    fresh_pool, meta = _fetch_all_tmdb(cfg)
+
+    # merge into cumulative store (avoid losing seen metadata/history)
     store = load_store()
-    before_movie = len(store.get("movie", {}))
-    before_tv = len(store.get("tv", {}))
+    merged = merge_discover_batch(store, fresh_pool)
+    save_store(merged)
 
-    plan = _make_page_plan(cfg)
-
-    # Discover & merge
-    added_movie = 0
-    for p in range(1, plan["movie_pages"] + 1):
-        batch = _DISCOVER_MOVIE(
-            cfg.tmdb_api_key, p, cfg.region, cfg.with_original_language, cfg.provider_names
-        )
-        a, _ = merge_discover_batch(store, batch, "movie")
-        added_movie += a
-
-    added_tv = 0
-    for p in range(1, plan["tv_pages"] + 1):
-        batch = _DISCOVER_TV(
-            cfg.tmdb_api_key, p, cfg.region, cfg.with_original_language, cfg.provider_names
-        )
-        a, _ = merge_discover_batch(store, batch, "tv")
-        added_tv += a
-
-    # Persist cumulative store (so later steps & next runs can use it)
-    save_store(store)
-
-    total_movie = len(store.get("movie", {}))
-    total_tv = len(store.get("tv", {}))
-    pool_items = all_items(store)[: cfg.max_catalog]
-
-    # Filtering
-    seen_index = _load_seen_ids(cfg)
-    unseen = _filter_unseen(pool_items, seen_index)
-
-    # Ranking
-    ranked = _rank(unseen, cfg.critic_weight, cfg.audience_weight)
-
-    meta = {
-        "pool_counts": {"movie": total_movie, "tv": total_tv},
-        "added_this_run": {"movie": added_movie, "tv": added_tv},
-        "telemetry": {
-            "counts": {
-                "tmdb_pool": len(pool_items),
-                "eligible_unseen": len(unseen),
-                "shortlist": min(50, len(ranked)),
-                "shown": min(10, len(ranked)),
-            },
-            "weights": {"critic": cfg.critic_weight, "audience": cfg.audience_weight},
-            "plan": {
-                "movie_pages": plan["movie_pages"],
-                "tv_pages": plan["tv_pages"],
-                "providers": list(cfg.provider_names),
-                "region": cfg.region,
-                "with_original_language": cfg.with_original_language,
-            },
-        },
-    }
-
-    print(f"[hb] | catalog:end pool={len(pool_items)} movie={total_movie} tv={total_tv}", flush=True)
-    return ranked, meta
+    # Produce final one-run pool from merged store to hand back to runner
+    # (all newly discovered + anything we kept historically if you want).
+    # For "pool includes everything found now", we just pass fresh_pool onward.
+    print(f"[hb] | catalog:end pool={len(fresh_pool)} movie={meta['pool_counts']['movie']} tv={meta['pool_counts']['tv']}", flush=True)
+    return fresh_pool, meta
