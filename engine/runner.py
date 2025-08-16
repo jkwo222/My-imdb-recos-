@@ -1,4 +1,3 @@
-# FILE: engine/runner.py
 from __future__ import annotations
 import json
 import os
@@ -6,10 +5,8 @@ from datetime import datetime
 from typing import Dict, List, Tuple
 
 from .config import from_env, Config
-from .catalog import build_pool
-from .seen_index import load_imdb_ratings_csv_auto
-from .filtering import filter_unseen
 from . import scoring as sc
+from .catalog import build_pool
 
 OUT_LATEST = "data/out/latest"
 OUT_DAILY_DIR = "data/out/daily"
@@ -26,63 +23,41 @@ def main():
     cfg = from_env()
     _ensure_dirs()
 
-    # IMDb ingest (by CSV)
-    seen_idx, added, csv_path = load_imdb_ratings_csv_auto()
+    # IMDb ingest (CSV + public list scrape)
+    seen_idx = sc.load_seen_index(cfg.imdb_ratings_csv_path)
     try:
-        row_count = len(seen_idx.ids) or 0  # explicit ids we rely on
-        total_signals = len(seen_idx)       # ids + title keys
-        src = csv_path or os.environ.get("IMDB_RATINGS_CSV_PATH", "data/ratings.csv")
-        _warn_or_info(f"IMDb ingest: {src} — {row_count} ids ({total_signals} total signals)")
-        if total_signals == 0:
-            _warn_or_info("[warn] ratings.csv missing or unreadable; continuing without seen filtering.")
+        row_count = len([k for k in seen_idx.keys() if k.startswith("tt")])
+        _warn_or_info(f"IMDb ingest: {cfg.imdb_ratings_csv_path} — {row_count} rows (ids only)")
+        _warn_or_info(f"Seen index: {row_count} keys (+title/year fuzzy list loaded)")
+        if row_count == 0:
+            _warn_or_info("[warn] No IMDb IDs found; relying on public-page titles if available.")
     except Exception:
-        _warn_or_info("[warn] ratings.csv could not be parsed; continuing.")
+        _warn_or_info("[warn] IMDb ingest issue; continuing.")
 
     print("[hb] | catalog:begin", flush=True)
     pool, meta = build_pool(cfg)
     print(f"[hb] | catalog:end pool={len(pool)} movie={meta['pool_counts']['movie']} tv={meta['pool_counts']['tv']}", flush=True)
 
-    # Unseen filter with debug sample of drops
+    # Unseen filter
     print("[hb] | filter:unseen", flush=True)
-    eligible, dropped = filter_unseen(pool, seen_idx)
-    print(f"[hb] | filter:end kept={len(eligible)} dropped={len(dropped)}", flush=True)
-
-    # --- NEW: sample the first few dropped items for debugging (IDs first) ---
-    if dropped:
-        # prefer to show those dropped by imdb_id first
-        print("[debug] seen-filter drop sample (up to 10):", flush=True)
-        # stable order: imdb_id reason first, then title reason
-        by_id = [d for d in dropped if d.get("reason") == "imdb_id"]
-        by_title = [d for d in dropped if d.get("reason") == "title"]
-        sample = (by_id + by_title)[:10]
-        for d in sample:
-            reason = d.get("reason")
-            if reason == "imdb_id":
-                print(f"  - {d['title']} ({d.get('year') or ''})  [IMDB {d.get('imdb_id','')}] -> dropped by imdb_id", flush=True)
-            else:
-                print(f"  - {d['title']} ({d.get('year') or ''})  -> dropped by title match '{d.get('matched_title','')}'", flush=True)
-    else:
-        print("[debug] seen-filter: no items dropped.", flush=True)
+    eligible = sc.filter_unseen(pool, seen_idx)
+    print(f"[hb] | filter:end kept={len(eligible)} dropped={len(pool)-len(eligible)}", flush=True)
 
     # Score
     print(f"[hb] | score:begin cw={cfg.critic_weight:.3f} aw={cfg.audience_weight:.3f} np={cfg.novelty_pressure:.2f} cc={cfg.commitment_cost_scale:.1f}", flush=True)
     ranked = sc.score_items(cfg, eligible)
     print(f"[hb] | score:end ranked={len(ranked)}", flush=True)
 
-    # Format top10
+    # Top N
     top_n = 10
     top = ranked[:top_n]
 
-    # Telemetry block
     telemetry = {
         "pool": len(pool),
         "eligible": len(eligible),
-        "after_skip": len(eligible),  # reserved
+        "after_skip": len(eligible),
         "shown": len(top),
-        "weights": {
-            "critic": cfg.critic_weight,
-            "audience": cfg.audience_weight,
-        },
+        "weights": {"critic": cfg.critic_weight, "audience": cfg.audience_weight},
         "counts": {
             "tmdb_pool": len(pool),
             "eligible_unseen": len(eligible),
@@ -92,7 +67,6 @@ def main():
         "page_plan": meta,
     }
 
-    # Compose assistant_feed.json
     feed = {
         "version": 1,
         "disclaimer": "This product uses the TMDB and OMDb APIs but is not endorsed or certified by them.",
@@ -104,18 +78,11 @@ def main():
         },
         "telemetry": telemetry,
         "top10": [
-            {
-                "rank": i+1,
-                "match": item["match"],
-                "title": item["title"],
-                "year": item["year"],
-                "type": item["type"],
-            }
+            {"rank": i+1, "match": item["match"], "title": item["title"], "year": item["year"], "type": item["type"]}
             for i, item in enumerate(top)
         ],
     }
 
-    # Write outputs
     today = datetime.utcnow().strftime("%Y-%m-%d")
     latest_path = os.path.join(OUT_LATEST, "assistant_feed.json")
     daily_dir = os.path.join(OUT_DAILY_DIR, today)
@@ -128,18 +95,12 @@ def main():
 
     print("Run complete.\n", flush=True)
     print(f"Weights: critic={cfg.critic_weight:.2f}, audience={cfg.audience_weight:.2f}", flush=True)
-    print(
-        f"Counts: tmdb_pool={telemetry['counts']['tmdb_pool']}, "
-        f"eligible_unseen={telemetry['counts']['eligible_unseen']}, "
-        f"shortlist={telemetry['counts']['shortlist']}, shown={telemetry['counts']['shown']}",
-        flush=True,
-    )
-    print(
-        f"Page plan: movie_pages={meta['movie_pages']} tv_pages={meta['tv_pages']} "
-        f"rotate_minutes={meta['rotate_minutes']} slot={meta['slot']}",
-        flush=True,
-    )
-    print("Providers: " + ", ".join(meta["provider_names"]), flush=True)
+    print(f"Counts: tmdb_pool={telemetry['counts']['tmdb_pool']}, eligible_unseen={telemetry['counts']['eligible_unseen']}, shortlist={telemetry['counts']['shortlist']}, shown={telemetry['counts']['shown']}", flush=True)
+    print(f"Page plan: movie_pages={meta['movie_pages']} tv_pages={meta['tv_pages']} rotate_minutes={meta['rotate_minutes']} slot={meta['slot']}", flush=True)
+    print("Providers: " + ", ".join(meta['provider_names']), flush=True)
+    if 'store_counts' in meta:
+        scs = meta['store_counts']
+        print(f"Catalog store: movie={scs['movie']} tv={scs['tv']} (added this run m={scs['added_this_run']['movie']} t={scs['added_this_run']['tv']})", flush=True)
     print(f"Output: {daily_dir}\n", flush=True)
 
 if __name__ == "__main__":
