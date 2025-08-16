@@ -28,7 +28,7 @@ class Config:
     Small config wrapper with:
       - Config.from_env(): build from environment variables
       - .get(key, default)
-      - attribute access (cfg.REGION)
+      - attribute access (cfg.REGION or cfg.region)
       - item access (cfg["REGION"])
       - .to_dict()
     """
@@ -50,7 +50,7 @@ class Config:
         original_langs = _csv_list(os.getenv("ORIGINAL_LANGS", "en"))
         with_original_language = original_langs[:]  # alias used by some modules
 
-        # Streaming providers to include (already normalized in your workflow)
+        # Streaming providers to include
         provider_names = _csv_list(
             os.getenv(
                 "SUBS_INCLUDE",
@@ -65,8 +65,8 @@ class Config:
         include_tv_seasons = _to_bool(os.getenv("INCLUDE_TV_SEASONS"), True)
         skip_window_days = _to_int(os.getenv("SKIP_WINDOW_DAYS"), 4)
 
+        # Base dictionary (UPPER-CASE canonical keys)
         data: Dict[str, Any] = {
-            # keys referenced around the codebase
             "TMDB_API_KEY": tmdb_key,
             "OMDB_API_KEY": omdb_key,
             "IMDB_USER_ID": imdb_user,
@@ -86,6 +86,29 @@ class Config:
             "INCLUDE_TV_SEASONS": include_tv_seasons,
             "SKIP_WINDOW_DAYS": skip_window_days,
         }
+
+        # ---- lower-case mirrors (for modules that access lower-case attrs) ----
+        lc_aliases = {
+            "tmdb_api_key": tmdb_key,
+            "omdb_api_key": omdb_key,
+            "imdb_user_id": imdb_user,
+            "imdb_ratings_csv_path": ratings_csv,
+
+            "region": region,
+            "watch_region": region,  # already lower-case above; keep as-is
+
+            "original_langs": original_langs,
+            "with_original_language": with_original_language,
+
+            "provider_names": provider_names,
+
+            "tmdb_pages_movie": tmdb_pages_movie,
+            "tmdb_pages_tv": tmdb_pages_tv,
+            "max_catalog": max_catalog,
+            "include_tv_seasons": include_tv_seasons,
+            "skip_window_days": skip_window_days,
+        }
+        data.update(lc_aliases)
 
         return Config(data)
 
