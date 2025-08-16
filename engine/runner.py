@@ -1,147 +1,156 @@
-# engine/runner.py
-from __future__ import annotations
-import json, os, time, shutil
-from typing import Tuple, List, Dict, Any
+import os
+import json
+import csv
+import pathlib
+from datetime import datetime
+from typing import List, Dict, Any
 
 from . import catalog as cat
-from .seen_index import load_imdb_ratings_csv_auto, update_seen_from_ratings, load_seen
-from .filtering import filter_unseen
-from .scoring import score_and_rank
+from . import scoring as sc
 
-OUT_DIR = os.environ.get("OUT_DIR", "data/out")
+OUT_ROOT = pathlib.Path("data/out")
+DBG_ROOT = pathlib.Path("data/debug")
+LATEST_DIR = OUT_ROOT / "latest"
 
-def _hb(msg: str) -> None:
-    print(f"[hb] {time.strftime('%H:%M:%S')} | {msg}", flush=True)
+def _ensure_dirs():
+    for p in [OUT_ROOT, DBG_ROOT, LATEST_DIR]:
+        p.mkdir(parents=True, exist_ok=True)
 
-def _dump_json(path: str, obj) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+def _load_seen() -> Dict[str, int]:
+    ratings_path = os.getenv("IMDB_RATINGS_CSV_PATH", "data/ratings.csv")
+    seen = cat._load_seen_csv(ratings_path)
+    # Optional extra list: a GitHub CSV of your list (if you keep one)
+    mylist_path = os.getenv("MYLIST_CSV_PATH", "")
+    if mylist_path and os.path.exists(mylist_path):
+        try:
+            with open(mylist_path, newline="", encoding="utf-8") as f:
+                r = csv.DictReader(f)
+                for row in r:
+                    nm = (row.get("title") or row.get("Title") or "").strip().lower()
+                    yr = (row.get("year") or row.get("Year") or "").strip()
+                    if nm:
+                        seen[f"title:{nm}|{yr}"] = 1
+        except Exception:
+            pass
+    return seen
+
+def _is_seen(it: dict, seen: Dict[str, int]) -> bool:
+    nm = (it.get("title") or "").strip().lower()
+    yr = str(it.get("year") or "").strip()
+    if seen.get(f"title:{nm}|{yr}"):
+        return True
+    # If you add imdb IDs later, also check seen.get(f"imdb:{tt}")
+    return False
+
+def _write_json(path: pathlib.Path, obj: Any):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
-def _weights_from_env() -> Tuple[float, float, float, float]:
-    # audience-forward defaults; normalize if overridden
-    cw = float(os.environ.get("CRITIC_WEIGHT", os.environ.get("CRITIC_SCORE_WEIGHT", 0.25)))
-    aw = float(os.environ.get("AUDIENCE_WEIGHT", os.environ.get("AUDIENCE_SCORE_WEIGHT", 0.75)))
-    np = float(os.environ.get("NOVELTY_PRESSURE", 0.15))
-    cc = float(os.environ.get("COMMITMENT_COST_SCALE", 1.0))
-    total = cw + aw
-    if total <= 0:
-        cw, aw, total = 0.25, 0.75, 1.0
-    return cw/total, aw/total, np, cc
-
-def _write_all_targets(feed: dict, telemetry: dict, top10: list, date_tag: str) -> str:
-    # daily folder
-    daily_dir = os.path.join(OUT_DIR, "daily", date_tag)
-    os.makedirs(daily_dir, exist_ok=True)
-
-    # latest folder
-    latest_dir = os.path.join(OUT_DIR, "latest")
-    os.makedirs(latest_dir, exist_ok=True)
-
-    # legacy root files (to kill any stale readers)
-    root_dir = OUT_DIR
-
-    files = {
-        os.path.join(daily_dir, "assistant_feed.json"): feed,
-        os.path.join(daily_dir, "telemetry.json"): telemetry,
-        os.path.join(daily_dir, "top10.json"): top10,
-
-        os.path.join(latest_dir, "assistant_feed.json"): feed,
-        os.path.join(latest_dir, "telemetry.json"): telemetry,
-        os.path.join(latest_dir, "top10.json"): top10,
-
-        # overwrite legacy locations so old scripts can’t read stale data
-        os.path.join(root_dir, "assistant_feed.json"): feed,
-        os.path.join(root_dir, "telemetry.json"): telemetry,
-        os.path.join(root_dir, "top10.json"): top10,
-    }
-    for p, obj in files.items():
-        _dump_json(p, obj)
-    return daily_dir
-
 def main():
-    start = time.time()
+    _ensure_dirs()
 
-    rows, ratings_path = load_imdb_ratings_csv_auto()
-    if ratings_path:
-        print(f"IMDb ingest: {ratings_path} — {len(rows)} rows")
-        seen, added = update_seen_from_ratings(rows)
+    # Read weights (audience > critic as requested)
+    weights = {
+        "critic": float(os.getenv("WEIGHT_CRITIC", "0.25")),
+        "audience": float(os.getenv("WEIGHT_AUDIENCE", "0.75")),
+        "novelty_pressure": float(os.getenv("NOVELTY_PRESSURE", "0.15")),
+        "commitment_cost_scale": float(os.getenv("COMMITMENT_COST_SCALE", "1.0")),
+    }
+
+    # Load seen lists
+    ratings_path = os.getenv("IMDB_RATINGS_CSV_PATH", "data/ratings.csv")
+    if os.path.exists(ratings_path):
+        # Small, friendly header for your logs
+        import pandas as _pd  # optional; safe if pandas installed per requirements
+        try:
+            df = _pd.read_csv(ratings_path)
+            print(f"IMDb ingest: {ratings_path} — {len(df)} rows")
+        except Exception:
+            # Fallback to manual count
+            c = 0
+            with open(ratings_path, encoding="utf-8") as f:
+                for _ in f:
+                    c += 1
+            print(f"IMDb ingest: {ratings_path} — ~{max(0,c-1)} rows")
     else:
-        print("IMDb ingest: (no ratings CSV found) — 0 rows")
-        seen = load_seen()
-        added = 0
-    print(f"Seen index: {len(seen.keys)} keys (+{added} new)")
+        print(f"IMDb ingest: {ratings_path} — (missing)")
 
-    _hb("catalog:begin")
+    seen = _load_seen()
+    print(f"Seen index: {len(seen)} keys")
+
+    # ---- Build catalog pool ----
+    print("[hb] catalog:begin")
     pool, meta = cat.build_pool()
-    _hb(f"catalog:end pool={len(pool)} movie={meta.get('pool_counts',{}).get('movie',0)} tv={meta.get('pool_counts',{}).get('tv',0)}")
+    print(f"[hb] catalog:end pool={len(pool)} movie={sum(1 for x in pool if x['media_type']=='movie')} tv={sum(1 for x in pool if x['media_type']=='tvSeries')}")
 
-    _hb("filter:unseen")
-    pool_unseen = filter_unseen(pool, seen)
-    _hb(f"filter:end kept={len(pool_unseen)} dropped={len(pool)-len(pool_unseen)}")
+    # ---- Filter: unseen only ----
+    print("[hb] filter:unseen")
+    eligible = [x for x in pool if not _is_seen(x, seen)]
+    print(f"[hb] filter:end kept={len(eligible)} dropped={len(pool) - len(eligible)}")
 
-    cw, aw, np, cc = _weights_from_env()
-    _hb(f"score:begin cw={cw:.3f} aw={aw:.3f} np={np} cc={cc}")
-    ranked = score_and_rank(pool_unseen,
-                            critic_weight=cw,
-                            audience_weight=aw,
-                            novelty_pressure=np,
-                            commitment_cost_scale=cc)
-    _hb(f"score:end ranked={len(ranked)}")
+    # ---- Score ----
+    print(f"[hb] score:begin cw={weights['critic']:.3f} aw={weights['audience']:.3f} np={weights['novelty_pressure']:.2f} cc={weights['commitment_cost_scale']:.1f}")
+    ranked, score_meta = sc.score_items(eligible, weights, shortlist_size=250)
+    print(f"[hb] score:end ranked={len(ranked)}")
 
-    shortlist_size = int(os.environ.get("SHORTLIST_SIZE", "50"))
-    shown_size = int(os.environ.get("SHOWN_SIZE", "10"))
-    shortlist = ranked[:shortlist_size]
-    shown = shortlist[:shown_size]
+    # ---- Select Top N ----
+    topn = int(os.getenv("TOP_N", "10"))
+    picks = ranked[:topn]
+
+    # ---- Emit outputs ----
+    today = datetime.utcnow().date().isoformat()
+    daily_dir = OUT_ROOT / "daily" / today
+    daily_dir.mkdir(parents=True, exist_ok=True)
 
     telemetry = {
         "pool": len(pool),
-        "eligible": len(pool_unseen),
-        "after_skip": len(pool_unseen),
-        "shown": len(shown),
-        "weights": {"critic": round(cw, 3), "audience": round(aw, 3)},
+        "eligible": len(eligible),
+        "after_skip": len(eligible),
+        "shown": len(picks),
+        "weights": {"critic": weights["critic"], "audience": weights["audience"]},
         "counts": {
             "tmdb_pool": len(pool),
-            "eligible_unseen": len(pool_unseen),
-            "shortlist": len(shortlist),
-            "shown": len(shown),
+            "eligible_unseen": len(eligible),
+            "shortlist": len(ranked),
+            "shown": len(picks),
         },
-        "page_plan": meta,
+        "page_plan": meta.get("page_plan", {}),
     }
 
-    date_tag = time.strftime("%Y-%m-%d")
-
-    top10 = []
-    for rank, item in enumerate(shown, 1):
-        top10.append({
-            "rank": rank,
-            "match": round(float(item.get("match", item.get("score", 0.0))), 1),
-            "title": item.get("title") or item.get("name"),
-            "year": item.get("year"),
-            "type": item.get("type", "movie"),
-        })
-
+    # Assistant feed (contract you’ve been pasting)
     feed = {
         "version": 1,
         "disclaimer": "This product uses the TMDB and OMDb APIs but is not endorsed or certified by them.",
-        "weights": {
-            "critic": round(cw, 3),
-            "audience": round(aw, 3),
-            "novelty_pressure": np,
-            "commitment_cost_scale": cc,
-        },
+        "weights": weights,
         "telemetry": telemetry,
-        "top10": top10,
+        "top10": [
+            {
+                "rank": i+1,
+                "match": p.get("match", 0.0),
+                "title": p.get("title"),
+                "year": p.get("year"),
+                "type": p.get("media_type"),
+            }
+            for i, p in enumerate(picks)
+        ],
     }
 
-    out_dir = _write_all_targets(feed, telemetry, top10, date_tag)
+    # Save artifacts
+    _write_json(daily_dir / "assistant_feed.json", feed)
+    _write_json(LATEST_DIR / "assistant_feed.json", feed)
+    _write_json(DBG_ROOT / "page_plan.json", meta.get("page_plan", {}))
 
-    print(f"Run complete in {int(time.time()-start)}s.")
-    print(f"Weights: critic={cw:.2f}, audience={aw:.2f}")
-    print(f"Counts: tmdb_pool={len(pool)}, eligible_unseen={len(pool_unseen)}, shortlist={len(shortlist)}, shown={len(shown)}")
-    print(f"Page plan: movie_pages={meta.get('movie_pages')} tv_pages={meta.get('tv_pages')} rotate_minutes={meta.get('rotate_minutes')} slot={meta.get('slot')}")
-    print(f"Providers: {', '.join(meta.get('provider_names', [])) or '(none)'}")
-    print(f"Output: {out_dir}")
+    # Console summary
+    print("Run complete.")
+    print(f"Weights: critic={weights['critic']:.2f}, audience={weights['audience']:.2f}")
+    print(f"Counts: tmdb_pool={len(pool)}, eligible_unseen={len(eligible)}, shortlist={len(ranked)}, shown={len(picks)}")
+    pp = meta.get("page_plan", {})
+    if pp:
+        print(f"Page plan: movie_pages={pp.get('movie_pages')} tv_pages={pp.get('tv_pages')} rotate_minutes={pp.get('rotate_minutes')} slot={pp.get('slot')}")
+    providers = (pp.get("provider_names") or [])
+    if providers:
+        print("Providers: " + ", ".join(providers))
+    print(f"Output: {daily_dir}")
 
 if __name__ == "__main__":
     main()
