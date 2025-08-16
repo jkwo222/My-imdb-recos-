@@ -2,10 +2,12 @@
 from __future__ import annotations
 import csv
 import os
+import re
 import unicodedata
 from typing import Dict, Iterable, List, Optional, Tuple
 
 RATINGS_PATH_ENV = os.environ.get("IMDB_RATINGS_CSV_PATH", "data/ratings.csv")
+_TCONST_RE = re.compile(r"(tt\d{6,9})", re.IGNORECASE)
 
 def _norm_title(t: str) -> str:
     t = unicodedata.normalize("NFKD", t or "").encode("ascii", "ignore").decode("ascii")
@@ -21,7 +23,7 @@ def _kind_from_title_type(tt: str) -> Optional[str]:
     tt = (tt or "").strip().lower()
     if tt in ("movie", "feature", "video", "tvmovie"): return "movie"
     if tt in ("tv series", "tvseries", "tv miniseries", "tvminiseries"): return "tvSeries"
-    if tt in ("tvepisode", "episode"): return None  # ignore episodes
+    if tt in ("tvepisode", "episode"): return None
     return None
 
 def _parse_int(x: str) -> Optional[int]:
@@ -30,22 +32,41 @@ def _parse_int(x: str) -> Optional[int]:
     except Exception:
         return None
 
+def _maybe_tconst(cell: str) -> Optional[str]:
+    if not cell: return None
+    m = _TCONST_RE.search(cell)
+    return m.group(1).lower() if m else None
+
 class SeenIndex:
-    """Title+year keyed index with tolerant lookups."""
+    """
+    Stores:
+      - exact IMDb IDs (set[str])
+      - tolerant title+year keys for movie/tvSeries
+    """
     def __init__(self) -> None:
-        self.keys = set()  # e.g. "movie:normalized:1997" or "tvSeries:normalized:*"
+        self.ids: set[str] = set()
+        self.keys: set[str] = set()  # "movie:normalized:1997" or "tvSeries:normalized:*"
 
     def __len__(self) -> int:
-        return len(self.keys)
+        # report total unique signals (ids + title keys)
+        return len(self.ids) + len(self.keys)
 
-    def add(self, kind: str, title: str, year: Optional[int]) -> None:
+    def add_id(self, imdb_id: Optional[str]) -> None:
+        if imdb_id and imdb_id.startswith("tt"):
+            self.ids.add(imdb_id.lower())
+
+    def add_title(self, kind: str, title: str, year: Optional[int]) -> None:
         if not title or not kind: return
         nt = _norm_title(title)
         if not nt: return
         y = str(year) if year else "*"
         self.keys.add(f"{kind}:{nt}:{y}")
 
-    def has(self, kind: str, title: str, year: Optional[int]) -> bool:
+    def has_id(self, imdb_id: Optional[str]) -> bool:
+        if not imdb_id: return False
+        return imdb_id.lower() in self.ids
+
+    def has_title(self, kind: str, title: str, year: Optional[int]) -> bool:
         if not title or not kind: return False
         nt = _norm_title(title)
         if not nt: return False
@@ -71,14 +92,29 @@ def update_seen_from_ratings(rows: Iterable[dict]) -> Tuple[SeenIndex, int]:
     idx = SeenIndex()
     added = 0
     for r in rows:
-        # Flexible schema
+        # IDs — prefer direct match, else sniff any column for tt…
+        imdb_id = (
+            r.get("Const") or r.get("const") or r.get("tconst") or
+            r.get("IMDb Title ID") or r.get("imdb_id") or r.get("id") or ""
+        ).strip()
+        imdb_id = _maybe_tconst(imdb_id) or imdb_id.lower() if imdb_id.startswith("tt") else None
+        if not imdb_id:
+            for v in r.values():
+                imdb_id = _maybe_tconst(v)
+                if imdb_id:
+                    break
+        if imdb_id:
+            idx.add_id(imdb_id)
+            added += 1
+
+        # Titles (fallback signal)
         title = r.get("Title") or r.get("title") or r.get("originalTitle") or r.get("Original Title")
         year = _parse_int(r.get("Year") or r.get("year") or r.get("startYear") or r.get("Release Year") or "")
         ttype = r.get("Title Type") or r.get("Title type") or r.get("titleType") or r.get("Type") or r.get("constType") or ""
         kind = _kind_from_title_type(ttype) or ("tvSeries" if (ttype or "").lower()=="tvepisode" else "movie")
         if title:
-            idx.add(kind, title, year)
-            added += 1
+            idx.add_title(kind, title, year)
+
     return idx, added
 
 def load_imdb_ratings_csv_auto() -> Tuple[SeenIndex, int, Optional[str]]:
