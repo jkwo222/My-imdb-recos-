@@ -1,73 +1,85 @@
+# engine/tmdb.py
 from __future__ import annotations
-from typing import Any, Dict, List, Optional
+
+import os
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
 import requests
-from .util.cache import DiskCache
 
 _TMDB_BASE = "https://api.themoviedb.org/3"
+_TMDB_TIMEOUT = 12  # seconds
 
-class TMDB:
-    def __init__(self, api_key: str, cache: DiskCache):
-        self.api_key = api_key
-        self.cache = cache
 
-    def _get(self, path: str, params: Dict[str, Any], group: Optional[str]=None, ttl_min: int=7*24*60) -> Dict[str, Any]:
-        url = f"{_TMDB_BASE}{path}"
-        full_params = {"api_key": self.api_key, **params}
-        cached = self.cache.get(group or "http", url, full_params)
-        if cached is not None:
-            return cached
-        resp = requests.get(url, params=full_params, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-        self.cache.set(group or "http", url, full_params, data)
-        return data
+class TmdbError(RuntimeError):
+    pass
 
-    def discover(self, kind: str, page: int, language: str, with_original_language: List[str], watch_region: str) -> Dict[str, Any]:
-        assert kind in ("movie","tv")
-        params = {
-            "page": page,
-            "language": language,
-            "watch_region": watch_region,
-            "sort_by": "popularity.desc",
-        }
-        if with_original_language:
-            params["with_original_language"] = ",".join(with_original_language)
-        return self._get(f"/discover/{kind}", params, group=f"discover_{kind}", ttl_min=6*60)  # 6h
 
-    def total_pages(self, kind: str, language: str, with_original_language: List[str], watch_region: str) -> int:
-        first = self.discover(kind, 1, language, with_original_language, watch_region)
-        total = int(first.get("total_pages", 1)) if isinstance(first, dict) else 1
-        return max(1, min(total, 500))
+def _api_key() -> str:
+    key = os.getenv("TMDB_API_KEY", "").strip()
+    if not key:
+        raise TmdbError("TMDB_API_KEY is not configured.")
+    return key
 
-    def providers_for_title(self, kind: str, tmdb_id: int, region: str) -> List[str]:
-        data = self._get(f"/{kind}/{tmdb_id}/watch/providers", {}, group="providers", ttl_min=24*60)  # 24h
-        res = data.get("results", {})
-        region_block = res.get(region.upper(), {})
-        names = []
-        for key in ("flatrate", "ads", "free", "rent", "buy"):
-            for item in region_block.get(key, []) or []:
-                n = item.get("provider_name")
-                if n: names.append(n)
-        return sorted(set(names))
 
-# same map as before
-_PROVIDER_NAME_TO_SLUG = {
-    "Netflix": "netflix",
-    "Amazon Prime Video": "prime_video",
-    "Hulu": "hulu",
-    "Max": "max",
-    "HBO Max": "max",
-    "Disney Plus": "disney_plus",
-    "Disney+": "disney_plus",
-    "Apple TV Plus": "apple_tv_plus",
-    "Apple TV+": "apple_tv_plus",
-    "Peacock": "peacock",
-    "Paramount Plus": "paramount_plus",
-    "Paramount+": "paramount_plus",
-}
+def _get(endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{_TMDB_BASE}/{endpoint.lstrip('/')}"
+    p = {"api_key": _api_key(), **params}
+    r = requests.get(url, params=p, timeout=_TMDB_TIMEOUT)
+    if r.status_code != 200:
+        raise TmdbError(f"TMDB {endpoint} -> {r.status_code}: {r.text[:200]}")
+    return r.json()
 
-def normalize_provider_names(provider_names: List[str]) -> List[str]:
-    out = []
-    for n in provider_names:
-        out.append(_PROVIDER_NAME_TO_SLUG.get(n, n.strip().lower().replace(" ", "_").replace("+", "plus")))
-    return sorted(set(out))
+
+def discover_movie_page(
+    *,
+    page: int,
+    watch_region: Optional[str] = None,
+    with_watch_providers: Optional[str] = None,
+    with_original_language: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    Return (results, total_pages) for a single TMDB discover/movie page.
+    Filters are optional and mirror TMDB API parameters.
+    """
+    params: Dict[str, Any] = {
+        "page": page,
+        "sort_by": "popularity.desc",
+        "include_adult": "false",
+        "include_video": "false",
+    }
+    if watch_region:
+        params["watch_region"] = watch_region
+    if with_watch_providers:
+        params["with_watch_providers"] = with_watch_providers
+    if with_original_language:
+        params["with_original_language"] = with_original_language
+
+    data = _get("discover/movie", params)
+    return data.get("results", []), int(data.get("total_pages", 1) or 1)
+
+
+def discover_tv_page(
+    *,
+    page: int,
+    watch_region: Optional[str] = None,
+    with_watch_providers: Optional[str] = None,
+    with_original_language: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    Return (results, total_pages) for a single TMDB discover/tv page.
+    """
+    params: Dict[str, Any] = {
+        "page": page,
+        "sort_by": "popularity.desc",
+        "include_null_first_air_dates": "false",
+    }
+    if watch_region:
+        params["watch_region"] = watch_region
+    if with_watch_providers:
+        params["with_watch_providers"] = with_watch_providers
+    if with_original_language:
+        params["with_original_language"] = with_original_language
+
+    data = _get("discover/tv", params)
+    return data.get("results", []), int(data.get("total_pages", 1) or 1)
