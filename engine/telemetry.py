@@ -1,4 +1,4 @@
-# engine/telemetry.py
+# File: engine/telemetry.py
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Any, List
@@ -31,7 +31,6 @@ def provider_histogram(items: List[dict], field: str = "providers") -> Dict[str,
     hist: Dict[str, int] = {}
     for o in items or []:
         for p in (o.get(field) or []):
-            if not isinstance(p, str):
-                continue
-            hist[p] = hist.get(p, 0) + 1
+            if isinstance(p, str):
+                hist[p] = hist.get(p, 0) + 1
     return hist
