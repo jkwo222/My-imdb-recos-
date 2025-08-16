@@ -3,7 +3,7 @@ name: Nightly Recommendations
 
 on:
   schedule:
-    # UTC; adjust as you like (04:15 UTC ≈ 12:15am ET during DST)
+    # ~12:15am US/Eastern (04:15 UTC) — adjust as needed
     - cron: '15 4 * * *'
   workflow_dispatch: {}
 
@@ -65,22 +65,40 @@ jobs:
           path: |
             data/out/latest/assistant_feed.json
             data/debug/runner.log
-          if-no-files-found: ignore   # avoid warning => avoid fail emails
+          if-no-files-found: ignore
 
-      - name: Post run summary
-        uses: actions/github-script@v7
-        env:
-          FEED_PATH: data/out/latest/assistant_feed.json
+      - name: Prepare email subject/body
+        id: email
+        run: |
+          FEED="data/out/latest/assistant_feed.json"
+          SUBJ="Nightly Recommendations: run complete"
+          BODY="<p>Nightly engine run completed.</p>"
+          if [ -f "$FEED" ]; then
+            POOL=$(jq -r '.telemetry.counts.tmdb_pool // 0' "$FEED")
+            UNSEEN=$(jq -r '.telemetry.counts.eligible_unseen // 0' "$FEED")
+            SHORT=$(jq -r '.telemetry.counts.shortlist // 0' "$FEED")
+            SHOWN=$(jq -r '.telemetry.counts.shown // 0' "$FEED")
+            SUBJ="Nightly Recos • Pool ${POOL} • Unseen ${UNSEEN} • Shown ${SHOWN}"
+            # Top 10 compact table
+            echo "<h3>Top 10</h3><table border='1' cellpadding='6' cellspacing='0'><tr><th>#</th><th>Title</th><th>Year</th><th>Type</th><th>Match</th></tr>" > email.html
+            jq -r '.top10[] | "<tr><td>\(.rank)</td><td>\(.title | gsub("&";"&amp;"))</td><td>\(.year // "")</td><td>\(.type)</td><td>\(.match)</td></tr>"' "$FEED" >> email.html
+            echo "</table>" >> email.html
+            BODY="<p>Pool: <b>${POOL}</b> • Unseen: <b>${UNSEEN}</b> • Shortlist: <b>${SHORT}</b> • Shown: <b>${SHOWN}</b></p>$(cat email.html)"
+          fi
+          echo "subject=${SUBJ}" >> "$GITHUB_OUTPUT"
+          printf "%s" "$BODY" > body.html
+
+      - name: Send email
+        uses: dawidd6/action-send-mail@v3
         with:
-          script: |
-            const fs = require('fs');
-            let summary = 'Nightly engine run completed.';
-            try {
-              const p = process.env.FEED_PATH;
-              if (fs.existsSync(p)) {
-                const data = JSON.parse(fs.readFileSync(p, 'utf8'));
-                const counts = data?.telemetry?.counts || {};
-                summary = `Pool: ${counts.tmdb_pool ?? 0}, Unseen: ${counts.eligible_unseen ?? 0}, Shortlist: ${counts.shortlist ?? 0}, Shown: ${counts.shown ?? 0}`;
-              }
-            } catch (e) {}
-            core.summary.addHeading('Nightly Recommendations').addRaw(summary).write();
+          server_address: ${{ secrets.SMTP_HOST }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: ${{ steps.email.outputs.subject }}
+          to: ${{ secrets.MAIL_TO }}
+          from: ${{ secrets.MAIL_FROM }}
+          content_type: text/html
+          body_file: body.html
+          attachments: |
+            data/out/latest/assistant_feed.json
