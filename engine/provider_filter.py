@@ -1,8 +1,7 @@
-# engine/provider_filter.py
+# File: engine/provider_filter.py
 from __future__ import annotations
 from typing import Dict, List, Tuple
 
-# Slug normalization for common services
 _CANON = {
     "netflix": "netflix",
     "amazon prime video": "prime_video",
@@ -25,7 +24,6 @@ def _slugify(name: str) -> str:
     return _CANON.get(name.strip().lower(), name.strip().lower().replace(" ", "_"))
 
 def pick_region_data(providers_json: dict, region: str) -> dict:
-    # TMDB /watch/providers returns { results: { REGION: { flatrate:[...], ads:[...], rent:[], buy:[] } } }
     if not providers_json or "results" not in providers_json:
         return {}
     return providers_json["results"].get(region.upper(), {}) or {}
@@ -35,13 +33,9 @@ def title_has_allowed_provider(
     allowed_slugs: List[str],
     region: str
 ) -> Tuple[bool, List[str]]:
-    """
-    True if any 'flatrate' or 'ads' provider in region matches allowed_slugs.
-    Also returns the matching provider slugs for breakdown accounting.
-    """
     rd = pick_region_data(providers_json, region)
     hits: List[str] = []
-    for bucket in ("flatrate", "ads"):
+    for bucket in ("flatrate", "ads", "free"):
         for entry in rd.get(bucket, []) or []:
             slug = _slugify(entry.get("provider_name", ""))
             if slug in allowed_slugs:
