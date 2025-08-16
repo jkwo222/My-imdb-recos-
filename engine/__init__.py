@@ -1,2 +1,2 @@
-# Minimal package init to avoid circular imports.
-__all__ = []
+# Intentionally empty.
+# Keeping __init__ clean ensures relative imports like `from . import scoring` work.
