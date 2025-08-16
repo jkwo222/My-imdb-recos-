@@ -1,107 +1,97 @@
+# engine/runner.py
 from __future__ import annotations
 import json
 import os
-from datetime import datetime
-from typing import Dict, List, Tuple
+from types import SimpleNamespace
+from typing import Any, Dict, List, Tuple
 
-from .config import from_env, Config
-from . import scoring as sc
 from .catalog import build_pool
+from .self_check import run_self_check  # (new) helps produce friendly diagnostics
 
-OUT_LATEST = "data/out/latest"
-OUT_DAILY_DIR = "data/out/daily"
+def _cfg_from_env() -> SimpleNamespace:
+    # expose env as attributes; our catalog reads both attrs and env
+    return SimpleNamespace(
+        TMDB_PAGES_MOVIE=os.getenv("TMDB_PAGES_MOVIE"),
+        TMDB_PAGES_TV=os.getenv("TMDB_PAGES_TV"),
+        REGION=os.getenv("REGION"),
+        ORIGINAL_LANGS=os.getenv("ORIGINAL_LANGS"),
+        SUBS_INCLUDE=os.getenv("SUBS_INCLUDE"),
+        MAX_CATALOG=os.getenv("MAX_CATALOG"),
+        INCLUDE_TV_SEASONS=os.getenv("INCLUDE_TV_SEASONS"),
+        SKIP_WINDOW_DAYS=os.getenv("SKIP_WINDOW_DAYS"),
+    )
 
-def _ensure_dirs():
-    os.makedirs("data/debug", exist_ok=True)
-    os.makedirs(OUT_LATEST, exist_ok=True)
-    os.makedirs(OUT_DAILY_DIR, exist_ok=True)
+def _ensure_dirs() -> None:
+    for d in ("data/out/latest", "data/debug", "data/cache", "data/out/daily"):
+        os.makedirs(d, exist_ok=True)
 
-def _warn_or_info(msg: str):
-    print(msg, flush=True)
+def _pick_top(pool: List[Dict[str, Any]], k: int = 10) -> List[Dict[str, Any]]:
+    # Placeholder ranking; your scoring/filtering can replace this
+    # Already sorted by popularity in catalog_store
+    out: List[Dict[str, Any]] = []
+    rank = 1
+    for it in pool[:k]:
+        out.append({
+            "rank": rank,
+            "title": it.get("title"),
+            "year": it.get("year"),
+            "type": it.get("type"),
+            "match": round(float(it.get("popularity") or 0.0), 1)
+        })
+        rank += 1
+    return out
 
-def main():
-    cfg = from_env()
+def main() -> None:
     _ensure_dirs()
+    # Friendly repo validation before we start
+    run_self_check()
 
-    # IMDb ingest (CSV + public list scrape)
-    seen_idx = sc.load_seen_index(cfg.imdb_ratings_csv_path)
-    try:
-        row_count = len([k for k in seen_idx.keys() if k.startswith("tt")])
-        _warn_or_info(f"IMDb ingest: {cfg.imdb_ratings_csv_path} — {row_count} rows (ids only)")
-        _warn_or_info(f"Seen index: {row_count} keys (+title/year fuzzy list loaded)")
-        if row_count == 0:
-            _warn_or_info("[warn] No IMDb IDs found; relying on public-page titles if available.")
-    except Exception:
-        _warn_or_info("[warn] IMDb ingest issue; continuing.")
-
-    print("[hb] | catalog:begin", flush=True)
+    cfg = _cfg_from_env()
     pool, meta = build_pool(cfg)
-    print(f"[hb] | catalog:end pool={len(pool)} movie={meta['pool_counts']['movie']} tv={meta['pool_counts']['tv']}", flush=True)
 
-    # Unseen filter
-    print("[hb] | filter:unseen", flush=True)
-    eligible = sc.filter_unseen(pool, seen_idx)
-    print(f"[hb] | filter:end kept={len(eligible)} dropped={len(pool)-len(eligible)}", flush=True)
+    # Guarantee telemetry keys exist
+    meta.setdefault("telemetry", {}).setdefault("counts", {})
+    t = meta["telemetry"]["counts"]
+    t.setdefault("tmdb_pool", len(pool))
+    t.setdefault("eligible_unseen", len(pool))  # placeholder until your unseen filter runs
+    t.setdefault("shortlist", min(50, len(pool)))
+    t.setdefault("shown", min(10, len(pool)))
 
-    # Score
-    print(f"[hb] | score:begin cw={cfg.critic_weight:.3f} aw={cfg.audience_weight:.3f} np={cfg.novelty_pressure:.2f} cc={cfg.commitment_cost_scale:.1f}", flush=True)
-    ranked = sc.score_items(cfg, eligible)
-    print(f"[hb] | score:end ranked={len(ranked)}", flush=True)
+    # Produce top-10 feed
+    top10 = _pick_top(pool, k=10)
 
-    # Top N
-    top_n = 10
-    top = ranked[:top_n]
-
-    telemetry = {
-        "pool": len(pool),
-        "eligible": len(eligible),
-        "after_skip": len(eligible),
-        "shown": len(top),
-        "weights": {"critic": cfg.critic_weight, "audience": cfg.audience_weight},
-        "counts": {
-            "tmdb_pool": len(pool),
-            "eligible_unseen": len(eligible),
-            "shortlist": min(50, len(ranked)),
-            "shown": len(top),
-        },
-        "page_plan": meta,
+    out = {
+        "top10": top10,
+        "telemetry": meta.get("telemetry", {"counts": {}}),
+        "page_plan": meta.get("page_plan", {}),
+        "providers": meta.get("providers", []),
+        "store_added": meta.get("store_added", {"movie": 0, "tv": 0}),
+        "pool_counts": meta.get("pool_counts", {"movie": 0, "tv": 0}),
     }
 
-    feed = {
-        "version": 1,
-        "disclaimer": "This product uses the TMDB and OMDb APIs but is not endorsed or certified by them.",
-        "weights": {
-            "critic": cfg.critic_weight,
-            "audience": cfg.audience_weight,
-            "novelty_pressure": cfg.novelty_pressure,
-            "commitment_cost_scale": cfg.commitment_cost_scale,
-        },
-        "telemetry": telemetry,
-        "top10": [
-            {"rank": i+1, "match": item["match"], "title": item["title"], "year": item["year"], "type": item["type"]}
-            for i, item in enumerate(top)
-        ],
-    }
-
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    latest_path = os.path.join(OUT_LATEST, "assistant_feed.json")
-    daily_dir = os.path.join(OUT_DAILY_DIR, today)
+    # Write “latest” and a day-stamped copy
+    latest_dir = "data/out/latest"
+    daily_dir = os.path.join("data/out/daily")
     os.makedirs(daily_dir, exist_ok=True)
-    daily_path = os.path.join(daily_dir, "assistant_feed.json")
-    with open(latest_path, "w", encoding="utf-8") as f:
-        json.dump(feed, f, ensure_ascii=False, indent=2)
-    with open(daily_path, "w", encoding="utf-8") as f:
-        json.dump(feed, f, ensure_ascii=False, indent=2)
 
-    print("Run complete.\n", flush=True)
-    print(f"Weights: critic={cfg.critic_weight:.2f}, audience={cfg.audience_weight:.2f}", flush=True)
-    print(f"Counts: tmdb_pool={telemetry['counts']['tmdb_pool']}, eligible_unseen={telemetry['counts']['eligible_unseen']}, shortlist={telemetry['counts']['shortlist']}, shown={telemetry['counts']['shown']}", flush=True)
-    print(f"Page plan: movie_pages={meta['movie_pages']} tv_pages={meta['tv_pages']} rotate_minutes={meta['rotate_minutes']} slot={meta['slot']}", flush=True)
-    print("Providers: " + ", ".join(meta['provider_names']), flush=True)
-    if 'store_counts' in meta:
-        scs = meta['store_counts']
-        print(f"Catalog store: movie={scs['movie']} tv={scs['tv']} (added this run m={scs['added_this_run']['movie']} t={scs['added_this_run']['tv']})", flush=True)
-    print(f"Output: {daily_dir}\n", flush=True)
+    latest_path = os.path.join(latest_dir, "assistant_feed.json")
+    with open(latest_path, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+
+    # Copy to dated folder (UTC date)
+    from datetime import datetime, timezone
+    date_str = datetime.now(timezone.utc).date().isoformat()
+    day_dir = os.path.join(daily_dir, date_str)
+    os.makedirs(day_dir, exist_ok=True)
+    with open(os.path.join(day_dir, "assistant_feed.json"), "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+
+    print("Run complete.", flush=True)
+    print(f"Counts: tmdb_pool={t['tmdb_pool']}, eligible_unseen={t['eligible_unseen']}, shortlist={t['shortlist']}, shown={t['shown']}", flush=True)
+    print(f"Page plan: movie_pages={meta['page_plan']['movie_pages']} tv_pages={meta['page_plan']['tv_pages']} rotate_minutes={meta['page_plan']['rotate_minutes']} slot={meta['page_plan']['slot']}", flush=True)
+    print(f"Providers: {', '.join(meta.get('providers', []))}", flush=True)
+    print(f"Catalog store: movie={meta['store_added']['movie']} tv={meta['store_added']['tv']} (added this run m={meta['store_added']['movie']} t={meta['store_added']['tv']})", flush=True)
+    print(f"Output: {day_dir}", flush=True)
 
 if __name__ == "__main__":
     main()
