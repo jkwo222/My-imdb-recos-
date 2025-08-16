@@ -1,3 +1,4 @@
+# File: engine/config.py
 from __future__ import annotations
 import os
 from dataclasses import dataclass
@@ -9,8 +10,7 @@ def _env(name: str, default: str | None = None) -> str | None:
 
 def _env_int(name: str, default: int) -> int:
     try:
-        v = int(_env(name, str(default)))
-        return v
+        return int(_env(name, str(default)))
     except Exception:
         return default
 
@@ -25,65 +25,42 @@ class Config:
     tmdb_api_key: str
     omdb_api_key: str | None
     imdb_ratings_csv_path: str
-
     region: str
-    language: str                 # TMDB UI language, e.g. "en-US"
+    language: str
     with_original_langs: List[str]
-
-    # Provider slugs (your services only)
     subs_include: List[str]
-
-    # Page targets (capped internally by TMDB’s 500-page limit)
     tmdb_pages_movie: int
     tmdb_pages_tv: int
-
-    # Limits
     max_catalog: int
-
-    # Behavior toggles
     include_tv_seasons: bool
     skip_window_days: int
-
-    # Scoring weights (audience heavier than critics)
     critic_weight: float
     audience_weight: float
     novelty_pressure: float
     commitment_cost_scale: float
-
-    # Cache
     cache_dir: str
     cache_ttl_secs: int
 
 def from_env() -> Config:
-    # Language + region
     region = _env("REGION", "US")
     language = _env("LANGUAGE", "en-US")
     orig_langs = _env("ORIGINAL_LANGS", "en")
-    with_original_langs = [s.strip() for s in orig_langs.split(",") if s.strip()]
+    with_original_langs = [s.strip() for s in (orig_langs or "").split(",") if s.strip()]
 
-    # Providers (your list only; defaults match your earlier runs)
-    subs_raw = _env(
-        "SUBS_INCLUDE",
-        "netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus",
-    )
-    subs_include = [s.strip() for s in subs_raw.split(",") if s.strip()]
+    subs_raw = _env("SUBS_INCLUDE","netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus")
+    subs_include = [s.strip() for s in (subs_raw or "").split(",") if s.strip()]
 
-    # Pages: default larger pools; still safe due to 500 cap
     tmdb_pages_movie = _env_int("TMDB_PAGES_MOVIE", 200)
     tmdb_pages_tv    = _env_int("TMDB_PAGES_TV", 200)
+    max_catalog      = _env_int("MAX_CATALOG", 20000)
 
-    # Limits
-    max_catalog = _env_int("MAX_CATALOG", 20000)
-
-    # Behavior
     include_tv_seasons = _env_bool("INCLUDE_TV_SEASONS", True)
     skip_window_days   = _env_int("SKIP_WINDOW_DAYS", 4)
 
-    # Weights (audience weighted higher as requested)
-    critic_weight = float(_env("CRITIC_WEIGHT", "0.25"))
-    audience_weight = float(_env("AUDIENCE_WEIGHT", "0.75"))
-    novelty_pressure = float(_env("NOVELTY_PRESSURE", "0.15"))
-    commitment_cost_scale = float(_env("COMMITMENT_COST_SCALE", "1.0"))
+    critic_weight = float(_env("CRITIC_WEIGHT", "0.25") or "0.25")
+    audience_weight = float(_env("AUDIENCE_WEIGHT", "0.75") or "0.75")
+    novelty_pressure = float(_env("NOVELTY_PRESSURE", "0.15") or "0.15")
+    commitment_cost_scale = float(_env("COMMITMENT_COST_SCALE", "1.0") or "1.0")
 
     cache_dir = _env("CACHE_DIR", "data/cache")
     cache_ttl_secs = _env_int("CACHE_TTL_SECS", 7 * 24 * 3600)
@@ -92,8 +69,8 @@ def from_env() -> Config:
         tmdb_api_key=os.environ["TMDB_API_KEY"],
         omdb_api_key=_env("OMDB_API_KEY"),
         imdb_ratings_csv_path=_env("IMDB_RATINGS_CSV_PATH", "data/ratings.csv"),
-        region=region,
-        language=language,
+        region=region or "US",
+        language=language or "en-US",
         with_original_langs=with_original_langs,
         subs_include=subs_include,
         tmdb_pages_movie=tmdb_pages_movie,
@@ -105,6 +82,6 @@ def from_env() -> Config:
         audience_weight=audience_weight,
         novelty_pressure=novelty_pressure,
         commitment_cost_scale=commitment_cost_scale,
-        cache_dir=cache_dir,
+        cache_dir=cache_dir or "data/cache",
         cache_ttl_secs=cache_ttl_secs,
     )
