@@ -1,2 +1,2 @@
-# Intentionally empty.
-# Keeping __init__ clean ensures relative imports like `from . import scoring` work.
+# File: engine/__init__.py
+# Intentionally empty to enable package imports.
