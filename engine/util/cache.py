@@ -1,3 +1,4 @@
+# File: engine/util/cache.py
 from __future__ import annotations
 import hashlib
 import json
@@ -10,7 +11,6 @@ class DiskCache:
     Tiny JSON disk cache for API responses (URL+params key).
     Files live under {root}/{prefix}/{sha}.json with mtime-based TTL.
     """
-
     def __init__(self, root: str, ttl_secs: int):
         self.root = root
         self.ttl = ttl_secs
@@ -24,7 +24,6 @@ class DiskCache:
         path = self._key(prefix, url, params)
         if not os.path.exists(path):
             return None
-        # TTL check
         age = time.time() - os.path.getmtime(path)
         if self.ttl > 0 and age > self.ttl:
             try:
