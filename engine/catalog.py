@@ -1,198 +1,153 @@
-import json
+from __future__ import annotations
 import math
-import os
 import random
-from pathlib import Path
-from typing import Any, Dict, List, Tuple
-
+from typing import Dict, Any, List, Tuple
+from datetime import datetime, timezone
 from .config import Config
-from .http import DiskCache, TMDB
+from .cache import JsonCache
+from .tmdb import TMDB
+from .providers import any_allowed
 
-JSON = Dict[str, Any]
+def _first_date(parts: Dict[str, Any]) -> int | None:
+    for k in ("release_date", "first_air_date"):
+        v = parts.get(k)
+        if v and isinstance(v, str) and len(v) >= 4 and v[:4].isdigit():
+            return int(v[:4])
+    return None
 
-_STATE_PATH = "data/cache/discover_state.json"
-
-def _load_state() -> JSON:
-    p = Path(_STATE_PATH)
-    if not p.exists():
-        return {"movie": {"cursor": 1, "total_pages": 1},
-                "tv":    {"cursor": 1, "total_pages": 1}}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {"movie": {"cursor": 1, "total_pages": 1},
-                "tv":    {"cursor": 1, "total_pages": 1}}
-
-def _save_state(st: JSON) -> None:
-    p = Path(_STATE_PATH)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(st, indent=2), encoding="utf-8")
-
-def _provider_ids_for_names(tmdb: TMDB, names: List[str]) -> List[int]:
-    """
-    Map human-friendly names to TMDB provider IDs.
-    Names should be provided in snake/lower or plain words.
-    We normalize both sides to loose-match (lowercase, spaces->spaces).
-    """
-    name_variants = {
-        "netflix": ["netflix"],
-        "prime_video": ["amazon prime video", "prime video"],
-        "hulu": ["hulu"],
-        "max": ["max", "hbo max"],
-        "disney_plus": ["disney plus", "disney+"],
-        "apple_tv_plus": ["apple tv+", "apple tv plus"],
-        "peacock": ["peacock"],
-        "paramount_plus": ["paramount plus", "paramount+"],
-    }
-
-    prov_map = tmdb.providers_map(country=tmdb.region)
-    out: List[int] = []
-
-    for key in names:
-        needle = key.strip().lower()
-        candidates = name_variants.get(needle, [needle])
-        found = None
-        for cand in candidates:
-            cand2 = cand.replace("_", " ").strip()
-            if cand2 in prov_map:
-                found = prov_map[cand2]
-                break
-        if found is not None:
-            out.append(int(found))
-    # Dedup
-    return sorted(set(out))
-
-def _unique_items(items: List[JSON]) -> List[JSON]:
-    seen = set()
-    out = []
-    for it in items:
-        k = (it.get("media_type"), int(it.get("id")))
-        if k not in seen:
-            seen.add(k)
-            out.append(it)
-    return out
-
-def _results_to_pool(kind: str, page_blob: JSON) -> List[JSON]:
-    pool: List[JSON] = []
-    for r in page_blob.get("results", []):
-        tmdb_id = int(r.get("id"))
-        title = (r.get("title") or r.get("name") or "").strip()
-        release = (r.get("release_date") or r.get("first_air_date") or "")[:4]
-        year = int(release) if release.isdigit() else None
-        pool.append({
-            "media_type": kind,
-            "tmdb_id": tmdb_id,
-            "title": title,
-            "year": year,
-            "popularity": r.get("popularity"),
-            "vote_average": r.get("vote_average"),
-            "vote_count": r.get("vote_count"),
-        })
-    return pool
-
-def _next_chunk(start: int, count: int, total_pages: int) -> List[int]:
+def _choose_pages(total_pages: int, want_pages: int, seed: int) -> List[int]:
+    # Robust guards for tiny totals
     if total_pages <= 0:
         return []
-    pages = []
-    cur = start
-    for _ in range(max(0, count)):
-        pages.append(cur)
-        cur += 1
-        if cur > total_pages:
-            cur = 1
-    return sorted(set(pages))
-
-def _sample_pages(seed: int, count: int, total_pages: int) -> List[int]:
-    if total_pages <= 1:
+    if total_pages == 1 or want_pages <= 1:
         return [1]
-    n = min(count, total_pages)
+
+    want = min(want_pages, total_pages)
     rng = random.Random(seed)
-    return sorted(rng.sample(range(1, total_pages + 1), n))
 
-def build_pool(cfg: Config, slot: int) -> Tuple[List[JSON], JSON]:
-    # Init cache + client
-    cache = DiskCache(cfg.cache_dir) if cfg.enable_discover_cache else None
-    tmdb = TMDB(cfg.tmdb_api_key, cfg.region, cfg.language, cache)
+    # Coprime stepping: choose an odd step < total_pages
+    # (if total_pages is even, odd step assures full cycle; if odd, pick any 1..total_pages-1 and ensure coprime)
+    step = None
+    max_tries = 50
+    for _ in range(max_tries):
+        candidate = rng.randrange(1, total_pages)
+        if math.gcd(candidate, total_pages) == 1:
+            step = candidate
+            break
+    if step is None:
+        step = 1
 
-    # Provider IDs from runtime lookup (cached)
-    pids = _provider_ids_for_names(tmdb, cfg.subs_include)
-    with_provider_ids = ",".join(str(x) for x in pids) if pids else ""
+    start = rng.randrange(1, total_pages + 1)
+    pages = []
+    x = start
+    seen = set()
+    while len(pages) < want:
+        if x not in seen:
+            pages.append(x)
+            seen.add(x)
+        x = ((x - 1 + step) % total_pages) + 1
+    return pages
 
-    state = _load_state()
+def _basic_item_from_result(kind: str, r: Dict[str, Any]) -> Dict[str, Any]:
+    title = r.get("title") or r.get("name") or "Unknown"
+    year = _first_date(r) or 0
+    tmdb_id = int(r.get("id"))
+    popularity = float(r.get("popularity", 0.0) or 0.0)
+    runtime = int(r.get("runtime") or 0)  # movies only; missing from discover
+    return {
+        "title": title,
+        "year": year,
+        "type": "tvSeries" if kind == "tv" else "movie",
+        "tmdb_id": tmdb_id,
+        "popularity": popularity,
+        "runtime": runtime,
+        # Fields to be added later:
+        "imdb_id": None,
+        "_providers": [],
+    }
 
-    # Fetch total pages (cached briefly) to guard randrange issues & know bounds
-    total_movie = tmdb.total_pages(
-        "movie", with_provider_ids, cfg.with_original_language,
-        slot, cfg.discover_cache_ttl_min, cfg.enable_discover_cache
-    )
-    total_tv = tmdb.total_pages(
-        "tv", with_provider_ids, cfg.with_original_language,
-        slot, cfg.discover_cache_ttl_min, cfg.enable_discover_cache
-    )
+def _enrich_ids_and_providers(api: TMDB, kind: str, item: Dict[str, Any], region: str) -> Dict[str, Any]:
+    tmdb_id = int(item["tmdb_id"])
+    # External IDs
+    try:
+        ids = api.external_ids_for(kind, tmdb_id)
+        imdb_id = ids.get("imdb_id")
+        if imdb_id:
+            item["imdb_id"] = imdb_id
+    except Exception:
+        pass
 
-    state["movie"]["total_pages"] = int(total_movie or 1)
-    state["tv"]["total_pages"] = int(total_tv or 1)
-    movie_cursor = int(state["movie"].get("cursor", 1))
-    tv_cursor = int(state["tv"].get("cursor", 1))
+    # Watch providers
+    try:
+        provs = api.watch_providers_for(kind, tmdb_id, region=region)
+        item["_providers"] = provs
+    except Exception:
+        item["_providers"] = []
 
-    # Build page lists
-    # 1) rotating sample that changes with slot
-    movie_sample = _sample_pages(seed=hash(("movie", slot)), count=cfg.sample_pages_movie, total_pages=total_movie)
-    tv_sample = _sample_pages(seed=hash(("tv", slot)), count=cfg.sample_pages_tv, total_pages=total_tv)
+    return item
 
-    # 2) sequential fill to grow local cache toward full coverage
-    movie_fill = _next_chunk(start=movie_cursor, count=cfg.fill_pages_movie, total_pages=total_movie)
-    tv_fill = _next_chunk(start=tv_cursor, count=cfg.fill_pages_tv, total_pages=total_tv)
+def build_pool(cfg: Config) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    cache = JsonCache(cfg.cache_dir)
+    tmdb = TMDB(cfg.tmdb_api_key, cache)
 
-    movie_pages = sorted(set(movie_sample + movie_fill))
-    tv_pages = sorted(set(tv_sample + tv_fill))
+    slot = cfg.rotation_slot()
 
-    # Advance cursors for next run
-    if total_movie > 0 and cfg.fill_pages_movie > 0:
-        new_movie_cursor = movie_fill[-1] + 1 if movie_fill else movie_cursor
-        if new_movie_cursor > total_movie:
-            new_movie_cursor = 1
-        state["movie"]["cursor"] = new_movie_cursor
+    # Total pages (cached via TMDB wrapper)
+    total_pages_movie = tmdb.total_pages("movie", cfg.language, cfg.with_original_langs, cfg.region)
+    total_pages_tv = tmdb.total_pages("tv", cfg.language, cfg.with_original_langs, cfg.region)
 
-    if total_tv > 0 and cfg.fill_pages_tv > 0:
-        new_tv_cursor = tv_fill[-1] + 1 if tv_fill else tv_cursor
-        if new_tv_cursor > total_tv:
-            new_tv_cursor = 1
-        state["tv"]["cursor"] = new_tv_cursor
+    # Choose pages deterministically per rotation slot (frequent reshuffle)
+    movie_pages = _choose_pages(total_pages_movie, cfg.tmdb_pages_movie, seed=slot * 1009 + 7)
+    tv_pages    = _choose_pages(total_pages_tv,    cfg.tmdb_pages_tv,    seed=slot * 1013 + 11)
 
-    _save_state(state)
+    pool: List[Dict[str, Any]] = []
+    per_kind_cap = max(1, cfg.max_catalog // 2)
 
-    # Collect pages
-    pool_movie: List[JSON] = []
-    for pg in movie_pages:
-        blob = tmdb.discover("movie", pg, with_provider_ids, cfg.with_original_language,
-                             slot, cfg.discover_cache_ttl_min, cfg.enable_discover_cache)
-        pool_movie += _results_to_pool("movie", blob)
+    # Movies
+    for p in movie_pages:
+        if len([x for x in pool if x["type"] == "movie"]) >= per_kind_cap:
+            break
+        data = tmdb.discover("movie", p, cfg.language, cfg.with_original_langs, cfg.region)
+        for r in data.get("results", []):
+            item = _basic_item_from_result("movie", r)
+            item = _enrich_ids_and_providers(tmdb, "movie", item, cfg.region)
+            if any_allowed(item.get("_providers"), cfg.subs_include):
+                pool.append(item)
+                if len([x for x in pool if x["type"] == "movie"]) >= per_kind_cap:
+                    break
 
-    pool_tv: List[JSON] = []
-    for pg in tv_pages:
-        blob = tmdb.discover("tv", pg, with_provider_ids, cfg.with_original_language,
-                             slot, cfg.discover_cache_ttl_min, cfg.enable_discover_cache)
-        pool_tv += _results_to_pool("tv", blob)
+    # TV
+    for p in tv_pages:
+        if len([x for x in pool if x["type"] == "tvSeries"]) >= per_kind_cap:
+            break
+        data = tmdb.discover("tv", p, cfg.language, cfg.with_original_langs, cfg.region)
+        for r in data.get("results", []):
+            item = _basic_item_from_result("tv", r)
+            item = _enrich_ids_and_providers(tmdb, "tv", item, cfg.region)
+            if any_allowed(item.get("_providers"), cfg.subs_include):
+                pool.append(item)
+                if len([x for x in pool if x["type"] == "tvSeries"]) >= per_kind_cap:
+                    break
 
-    # Dedup and cap
-    pool = _unique_items(pool_movie + pool_tv)
-    if cfg.max_catalog > 0 and len(pool) > cfg.max_catalog:
-        pool = pool[:cfg.max_catalog]
-
+    # Telemetry/meta for logging
     meta = {
+        "movie_pages": cfg.tmdb_pages_movie,
+        "tv_pages": cfg.tmdb_pages_tv,
+        "rotate_minutes": cfg.rotate_minutes,
+        "slot": slot,
+        "total_pages_movie": total_pages_movie,
+        "total_pages_tv": total_pages_tv,
         "movie_pages_used": movie_pages,
         "tv_pages_used": tv_pages,
-        "total_pages_movie": total_movie,
-        "total_pages_tv": total_tv,
         "provider_names": cfg.subs_include,
         "language": cfg.language,
-        "with_original_language": cfg.with_original_language,
+        "with_original_language": ",".join(cfg.with_original_langs),
         "watch_region": cfg.region,
         "pool_counts": {
-            "movie": len(pool_movie),
-            "tv": len(pool_tv),
-        }
+            "movie": sum(1 for x in pool if x["type"] == "movie"),
+            "tv": sum(1 for x in pool if x["type"] == "tvSeries"),
+        },
+        "total_pages": [total_pages_movie, total_pages_tv],
     }
 
     return pool, meta
