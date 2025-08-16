@@ -1,5 +1,5 @@
 # File: .github/workflows/nightly.yml
-# WHY: Single nightly engine with reliable output discovery + accurate issue content.
+# WHY: Single nightly workflow; assumes data/ratings.csv is in repo; normalizes outputs and posts accurate issue content.
 
 name: Nightly Recos
 
@@ -28,7 +28,7 @@ env:
   REGION: US
   ORIGINAL_LANGS: en
   SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
-  TMDB_PAGES_MOVIE: "12"
+  TMDB_PAGES_MOVIE: "12"   # WHY: matches your latest successful run
   TMDB_PAGES_TV: "12"
   MAX_CATALOG: "6000"
   INCLUDE_TV_SEASONS: "true"
@@ -49,6 +49,7 @@ jobs:
           cache: "pip"
 
       - name: Verify IMDb export exists
+        # WHY: You chose to keep ratings.csv in the repo; fail fast if missing.
         run: |
           if [ ! -s "data/ratings.csv" ]; then
             echo "::error file=data/ratings.csv::Missing or empty data/ratings.csv (export from IMDb)."
@@ -61,6 +62,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Prepare dirs
+        # WHY: Ensure all output dirs exist even if repo is clean.
         run: |
           mkdir -p "$CACHE_DIR" "$OUTPUT_DIR" "data/debug" "data/out"
 
@@ -72,6 +74,7 @@ jobs:
           python -m engine.runner 2>&1 | tee data/debug/runner.log
 
       - name: Normalize outputs (discover latest assistant_feed.json)
+        # WHY: Engine writes to dated subfolder (e.g., data/out/daily/2025-08-16); copy newest feed to data/out/latest.
         run: |
           set -euo pipefail
           mkdir -p data/out/latest
@@ -115,6 +118,7 @@ jobs:
             const pagePlan = tel.page_plan || {};
             const providers = process.env.SUBS_INCLUDE ? process.env.SUBS_INCLUDE.split(',').join(', ') : 'n/a';
 
+            // Derive counts robustly to avoid stale header metrics
             const pool = tel.pool ?? tel.pool_size ?? (tel.pool_counts ? (tel.pool_counts.movie||0)+(tel.pool_counts.tv||0) : undefined);
             const shortlist = tel.shortlist ?? items.length;
             const shown = items.length;
@@ -141,6 +145,7 @@ jobs:
             const body = lines.join('\n');
             const title = `Nightly picks — #${process.env.GITHUB_RUN_NUMBER}`;
 
+            // Rolling Nightly issue
             const { data: issues } = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -165,3 +170,25 @@ jobs:
                 labels: ['nightly-picks']
               });
             }
+
+# File: .gitignore
+# WHY: Keep repo clean; track ratings.csv but ignore generated outputs & caches.
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.build/
+.venv/
+venv/
+
+# Engine outputs & caches
+data/out/
+data/cache/
+data/debug/
+
+# Keep ratings.csv tracked even if you ignore data/*
+# (If you already ignore 'data/*', add the two lines below after that rule)
+#!data/
+#!data/ratings.csv
