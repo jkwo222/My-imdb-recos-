@@ -46,16 +46,19 @@ def _coerce_item(kind: str, raw: Dict[str, Any]) -> Dict[str, Any]:
     if kind == "movie":
         title = raw.get("title") or raw.get("original_title") or ""
         year = (raw.get("release_date") or "")[:4] or None
+        item_type = "movie"
     else:
         title = raw.get("name") or raw.get("original_name") or ""
         year = (raw.get("first_air_date") or "")[:4] or None
+        item_type = "tvSeries"
     return {
         "kind": kind,
+        "type": item_type,  # <<< added so filtering sees the right kind
         "tmdb_id": int(raw.get("id")),
         "title": title,
         "year": int(year) if (isinstance(year, str) and year.isdigit()) else year,
         "popularity": float(raw.get("popularity") or 0.0),
-        "vote_average": float(raw.get("vote_average") or 0.0),  # 0..10
+        "vote_average": float(raw.get("vote_average") or 0.0),
         "original_language": raw.get("original_language"),
     }
 
