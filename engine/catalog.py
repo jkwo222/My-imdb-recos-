@@ -1,28 +1,25 @@
 import os
 import time
-import math
 import json
 import hashlib
-import datetime as dt
 from typing import Dict, List, Tuple, Any
 import requests
 
-# ---- Provider ID map (TMDB watch providers; US region) ----
-# Override with env PROVIDER_IDS, e.g.:
-# "netflix:8,prime_video:119,hulu:15,max:384,disney_plus:337,apple_tv_plus:350,peacock:386,paramount_plus:531"
+# ---------- Defaults ----------
+# (You can override all of these via env; safe defaults provided.)
+
+# TMDB watch-provider IDs for US (override with PROVIDER_IDS, e.g.
+# "netflix:8,prime_video:119,hulu:15,max:384,disney_plus:337,apple_tv_plus:350,peacock:386,paramount_plus:531")
 PROVIDER_ID_MAP_US = {
     "netflix": 8,
     "prime_video": 119,
     "hulu": 15,
-    "max": 384,           # HBO Max/Max
+    "max": 384,            # HBO Max/Max
     "disney_plus": 337,
     "apple_tv_plus": 350,
     "peacock": 386,
     "paramount_plus": 531,
 }
-
-def _now_utc() -> int:
-    return int(time.time())
 
 def _env_str(key: str, default: str) -> str:
     v = os.getenv(key)
@@ -33,12 +30,6 @@ def _env_int(key: str, default: int) -> int:
         return int(_env_str(key, str(default)))
     except Exception:
         return default
-
-def _env_bool(key: str, default: bool) -> bool:
-    v = _env_str(key, "")
-    if v == "":
-        return default
-    return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 def _hash32(s: str) -> int:
     return int(hashlib.sha256(s.encode("utf-8")).hexdigest()[:8], 16)
@@ -71,6 +62,7 @@ class TmdbClient:
             "language": self.language,
             "watch_region": self.watch_region,
             "include_adult": "false",
+            # explicit cache-buster so GitHub Actions doesn't reuse CDN aggressively
             "cb": self.cb,
         }
         p.update(extra or {})
@@ -80,10 +72,12 @@ class TmdbClient:
         if self.throttle_ms:
             time.sleep(self.throttle_ms / 1000.0)
         url = f"{self.base}{path}"
-        r = self.s.get(url, params=self._params(params), timeout=25)
+        r = self.s.get(url, params=self._params(params), timeout=30)
         self.request_count += 1
         r.raise_for_status()
         return r.json()
+
+# ---------- Provider resolution ----------
 
 def _resolve_provider_ids() -> Tuple[List[int], Dict[str, int], List[str]]:
     names = [x.strip().lower() for x in _env_str("SUBS_INCLUDE", "").split(",") if x.strip()]
@@ -91,13 +85,15 @@ def _resolve_provider_ids() -> Tuple[List[int], Dict[str, int], List[str]]:
     id_map = PROVIDER_ID_MAP_US.copy()
     if custom:
         for token in custom.split(","):
-            if ":" in token:
-                nm, idstr = token.split(":", 1)
-                nm = nm.strip().lower()
-                try:
-                    id_map[nm] = int(idstr.strip())
-                except Exception:
-                    pass
+            token = token.strip()
+            if not token or ":" not in token:
+                continue
+            nm, idstr = token.split(":", 1)
+            nm = nm.strip().lower()
+            try:
+                id_map[nm] = int(idstr.strip())
+            except Exception:
+                pass
     ids, unknown = [], []
     for nm in names:
         pid = id_map.get(nm)
@@ -107,29 +103,7 @@ def _resolve_provider_ids() -> Tuple[List[int], Dict[str, int], List[str]]:
             unknown.append(nm)
     return ids, id_map, unknown
 
-def _choose_pages(total_pages: int, want_pages: int, seed: int) -> List[int]:
-    total_pages = max(1, int(total_pages))
-    want_pages = max(1, int(want_pages))
-    if total_pages == 1:
-        return [1]
-    want = min(want_pages, total_pages)
-
-    rng_seed = (seed ^ _hash32(f"tp={total_pages},wp={want_pages}")) & 0xFFFFFFFF
-    odd_candidates = [x for x in range(1, total_pages) if x % 2 == 1]
-    step = odd_candidates[_hash32(f"step:{rng_seed}") % len(odd_candidates)] if odd_candidates else 1
-    start = (_hash32(f"start:{rng_seed}") % total_pages) + 1
-
-    pages, used, cur = [], set(), start
-    for _ in range(total_pages):
-        if cur not in used:
-            used.add(cur)
-            pages.append(cur)
-            if len(pages) >= want:
-                break
-        cur += step
-        if cur > total_pages:
-            cur -= total_pages
-    return pages
+# ---------- Item extraction ----------
 
 def _rating_safe(val) -> float:
     try:
@@ -158,182 +132,7 @@ def _extract_item(kind: str, r: dict) -> dict:
         "origin_language": r.get("original_language"),
     }
 
-def _discover_all_pages(
-    tmdb: TmdbClient,
-    kind: str,
-    prov_param: str,
-    with_original_language: str,
-    base_filters: Dict[str, Any],
-    cap_pages: int,
-) -> Tuple[List[dict], Dict[str, Any]]:
-    """Fetch page=1..cap_pages (or total_pages), sequentially."""
-    first_params = dict(
-        sort_by="popularity.desc",
-        page=1,
-        with_original_language=with_original_language,
-        with_watch_monetization_types="flatrate",
-    )
-    if prov_param:
-        first_params["with_watch_providers"] = prov_param
-    first_params.update(base_filters or {})
-
-    first = tmdb.get(f"/discover/{kind}", first_params)
-    total_pages = max(1, int(first.get("total_pages") or 1))
-    cap = max(1, min(total_pages, int(cap_pages)))
-    items = [_extract_item(kind, r) for r in first.get("results", [])]
-
-    for p in range(2, cap + 1):
-        params = dict(first_params)
-        params["page"] = p
-        try:
-            data = tmdb.get(f"/discover/{kind}", params)
-            items.extend(_extract_item(kind, r) for r in data.get("results", []) or [])
-        except Exception:
-            continue
-
-    meta = {
-        "total_pages": total_pages,
-        "pages_used": list(range(1, cap + 1)),
-        "want_pages": cap,
-        "fetch_all": True,
-    }
-    return _dedupe(items), meta
-
-def _discover_sampled_pages(
-    tmdb: TmdbClient,
-    kind: str,
-    prov_param: str,
-    with_original_language: str,
-    base_filters: Dict[str, Any],
-    want_pages_env: int,
-    rotate_minutes: int,
-) -> Tuple[List[dict], Dict[str, Any]]:
-    """Pick many pages (rotating) – bigger defaults for larger pools."""
-    # Fetch first to learn total_pages
-    first_params = dict(
-        sort_by="popularity.desc",
-        page=1,
-        with_original_language=with_original_language,
-        with_watch_monetization_types="flatrate",
-    )
-    if prov_param:
-        first_params["with_watch_providers"] = prov_param
-    first_params.update(base_filters or {})
-    first = tmdb.get(f"/discover/{kind}", first_params)
-    total_pages = max(1, int(first.get("total_pages") or 1))
-
-    slot = math.floor(_now_utc() / (rotate_minutes * 60))
-    seed_basis = f"{kind}|slot={slot}|cb={_env_str('TMDB_CB', str(os.getenv('GITHUB_RUN_NUMBER') or slot))}"
-    seed = _hash32(seed_basis)
-
-    want_env = max(1, int(want_pages_env))
-    pages = _choose_pages(total_pages, want_env, seed)
-
-    items = [_extract_item(kind, r) for r in first.get("results", [])]
-    for p in pages:
-        if p == 1:
-            continue
-        params = dict(first_params)
-        params["page"] = p
-        try:
-            data = tmdb.get(f"/discover/{kind}", params)
-            items.extend(_extract_item(kind, r) for r in data.get("results", []) or [])
-        except Exception:
-            continue
-
-    # Optional auto-expand if small
-    min_pool = _env_int("MIN_POOL_PER_KIND", 1200)  # raise target per kind
-    if len(items) < min_pool and total_pages > len(pages):
-        extra_need = min(total_pages, len(pages) * 3)
-        extra_pages = _choose_pages(total_pages, extra_need, seed ^ 0xA5A5A5A5)
-        for p in extra_pages:
-            if p in pages or p == 1:
-                continue
-            params = dict(first_params)
-            params["page"] = p
-            try:
-                data = tmdb.get(f"/discover/{kind}", params)
-                items.extend(_extract_item(kind, r) for r in data.get("results", []) or [])
-            except Exception:
-                continue
-
-    meta = {
-        "total_pages": total_pages,
-        "pages_used": sorted(set([1] + pages)),
-        "want_pages": want_env,
-        "rotate_minutes": rotate_minutes,
-        "slot": slot,
-        "fetch_all": False,
-    }
-    return _dedupe(items), meta
-
-def _first_of_month_utc() -> str:
-    today = dt.datetime.utcnow().date()
-    return today.replace(day=1).isoformat()
-
-def _curated_feeds(
-    tmdb: TmdbClient,
-    provider_ids: List[int],
-    with_original_language: str,
-) -> List[dict]:
-    """Trending + new-this-month + best-of (per provider) without swamping the pool."""
-    out: List[dict] = []
-    # Trending (global)
-    for kind in ("movie", "tv"):
-        for page in (1, 2, 3):
-            try:
-                tr = tmdb.get(f"/trending/{kind}/week", {"page": page})
-                out.extend(_extract_item(kind, r) for r in tr.get("results", []) or [])
-            except Exception:
-                break
-
-    # New to service this month
-    date_gte = _first_of_month_utc()
-    for pid in provider_ids:
-        for kind in ("movie", "tv"):
-            params = {
-                "with_watch_providers": str(pid),
-                "with_watch_monetization_types": "flatrate",
-                "with_original_language": with_original_language,
-                "sort_by": "popularity.desc",
-                "page": 1,
-            }
-            if kind == "movie":
-                params["primary_release_date.gte"] = date_gte
-            else:
-                params["first_air_date.gte"] = date_gte
-            try:
-                data = tmdb.get(f"/discover/{kind}", params)
-                out.extend(_extract_item(kind, r) for r in data.get("results", []) or [])
-            except Exception:
-                continue
-
-    # Best-of on provider
-    for pid in provider_ids:
-        for kind in ("movie", "tv"):
-            params = {
-                "with_watch_providers": str(pid),
-                "with_watch_monetization_types": "flatrate",
-                "with_original_language": with_original_language,
-                "sort_by": "vote_average.desc",
-                "vote_count.gte": 1000,
-                "page": 1,
-            }
-            try:
-                data = tmdb.get(f"/discover/{kind}", params)
-                out.extend(_extract_item(kind, r) for r in data.get("results", []) or [])
-            except Exception:
-                continue
-
-    # Cap curated so main discover dominates
-    by_type = {"movie": [], "tvSeries": []}
-    for it in out:
-        by_type[it["media_type"]].append(it)
-    curated = []
-    for k in by_type:
-        cur = sorted(by_type[k], key=lambda x: (-x["tmdb_vote_count"], -x["popularity"]))[:400]
-        curated.extend(cur)
-    return _dedupe(curated)
+# ---------- CSV (seen list) helper exposed for runner ----------
 
 def _load_seen_csv(path: str) -> Dict[str, int]:
     seen = {}
@@ -355,30 +154,58 @@ def _load_seen_csv(path: str) -> Dict[str, int]:
         pass
     return seen
 
-def _discover_kind(
+# ---------- Core: FETCH ALL PAGES for movie and tv ----------
+
+def _discover_all_pages(
     tmdb: TmdbClient,
     kind: str,
     provider_ids: List[int],
     with_original_language: str,
-    base_filters: Dict[str, Any],
+    extra_filters: Dict[str, Any],
+    max_pages_cap: int,
 ) -> Tuple[List[dict], Dict[str, Any]]:
-    prov_param = "|".join(str(p) for p in provider_ids) if provider_ids else None
-    rotate_minutes = _env_int("ROTATE_MINUTES", 15)
+    """
+    Fetches page=1..total_pages (capped by max_pages_cap) for /discover/{movie|tv}.
+    TMDB caps total_pages to 500 for most discover queries; we walk the full range.
+    """
+    params_base = dict(
+        sort_by="popularity.desc",
+        page=1,
+        with_watch_monetization_types="flatrate",
+        with_original_language=with_original_language,
+    )
+    if provider_ids:
+        params_base["with_watch_providers"] = "|".join(str(p) for p in provider_ids)
+    if extra_filters:
+        params_base.update(extra_filters)
 
-    # Big defaults; can be overridden
-    want_pages_env = _env_int("TMDB_PAGES_MOVIE" if kind == "movie" else "TMDB_PAGES_TV", 120)
-    fetch_all = _env_bool("TMDB_FETCH_ALL_MOVIE" if kind == "movie" else "TMDB_FETCH_ALL_TV", False)
-    cap_pages = _env_int("TMDB_MAX_PAGES_MOVIE" if kind == "movie" else "TMDB_MAX_PAGES_TV", 1000)
+    # First page: determine total_pages
+    first = tmdb.get(f"/discover/{kind}", params_base)
+    total_pages = max(1, int(first.get("total_pages") or 1))
+    cap = max(1, min(total_pages, int(max_pages_cap)))
 
-    if fetch_all:
-        items, meta = _discover_all_pages(
-            tmdb, kind, prov_param, with_original_language, base_filters, cap_pages
-        )
-    else:
-        items, meta = _discover_sampled_pages(
-            tmdb, kind, prov_param, with_original_language, base_filters, want_pages_env, rotate_minutes
-        )
-    return items, meta
+    items = [_extract_item(kind, r) for r in first.get("results", [])]
+    # page 2..cap
+    for p in range(2, cap + 1):
+        params = dict(params_base)
+        params["page"] = p
+        try:
+            data = tmdb.get(f"/discover/{kind}", params)
+            items.extend(_extract_item(kind, r) for r in data.get("results", []) or [])
+        except Exception:
+            # Keep going if a single page hiccups (transient API/network)
+            continue
+
+    meta = {
+        "total_pages": total_pages,
+        "pages_used": list(range(1, cap + 1)),
+        "want_pages": cap,
+        "fetch_all": True,
+        "requests_first_kind": tmdb.request_count,
+    }
+    return _dedupe(items), meta
+
+# ---------- Public: build_pool (always fetch-all) ----------
 
 def build_pool() -> Tuple[List[dict], Dict[str, Any]]:
     api_key = _env_str("TMDB_API_KEY", "")
@@ -388,8 +215,12 @@ def build_pool() -> Tuple[List[dict], Dict[str, Any]]:
     language = _env_str("LANGUAGE", _env_str("LANG", "en-US"))
     watch_region = _env_str("REGION", "US")
     with_original_language = _env_str("ORIGINAL_LANGS", "en").split(",")[0].strip() or "en"
-    cb = _env_str("TMDB_CB", str(os.getenv("GITHUB_RUN_NUMBER") or math.floor(_now_utc() / (15*60))))
-    throttle_ms = _env_int("TMDB_THROTTLE_MS", 0)
+
+    # Strong cache-buster; defaults to GitHub run number if present
+    cb_default = os.getenv("GITHUB_RUN_NUMBER") or str(_hash32(str(time.time())))
+    cb = _env_str("TMDB_CB", cb_default)
+
+    throttle_ms = _env_int("TMDB_THROTTLE_MS", 0)  # Optional: 0..100ms if you see 429s
 
     provider_ids, id_map, unknown = _resolve_provider_ids()
     if unknown:
@@ -398,26 +229,28 @@ def build_pool() -> Tuple[List[dict], Dict[str, Any]]:
         print("[hb] WARN: no provider IDs resolved — queries will NOT filter by provider.")
 
     tmdb = TmdbClient(api_key, language, watch_region, cb, throttle_ms=throttle_ms)
-    base_filters: Dict[str, Any] = {}
 
-    # Core discover (movie + tv)
-    movie_items, m_meta = _discover_kind(
-        tmdb, "movie", provider_ids, with_original_language, base_filters
+    # TMDB caps discover to 500 pages; allow an env cap (defaults to 500)
+    max_pages_movie = _env_int("TMDB_MAX_PAGES_MOVIE", 500)
+    max_pages_tv    = _env_int("TMDB_MAX_PAGES_TV", 500)
+
+    extra_filters: Dict[str, Any] = {}  # hook for future filters if needed
+
+    # ---- ALWAYS FETCH ALL PAGES ----
+    movie_items, m_meta = _discover_all_pages(
+        tmdb, "movie", provider_ids, with_original_language, extra_filters, max_pages_movie
     )
-    tv_items, t_meta = _discover_kind(
-        tmdb, "tv", provider_ids, with_original_language, base_filters
+    tv_items, t_meta = _discover_all_pages(
+        tmdb, "tv", provider_ids, with_original_language, extra_filters, max_pages_tv
     )
 
-    # Curated extras
-    curated = _curated_feeds(tmdb, provider_ids, with_original_language)
-
-    pool = _dedupe(movie_items + tv_items + curated)
+    pool = _dedupe(movie_items + tv_items)
 
     page_plan = {
         "movie_pages": m_meta.get("want_pages"),
         "tv_pages": t_meta.get("want_pages"),
-        "rotate_minutes": _env_int("ROTATE_MINUTES", 15),
-        "slot": m_meta.get("slot", None),
+        "rotate_minutes": _env_int("ROTATE_MINUTES", 15),   # still reported (harmless here)
+        "slot": None,
         "total_pages_movie": m_meta.get("total_pages", 1),
         "total_pages_tv": t_meta.get("total_pages", 1),
         "movie_pages_used": m_meta.get("pages_used", [1]),
@@ -431,8 +264,8 @@ def build_pool() -> Tuple[List[dict], Dict[str, Any]]:
             "tv": sum(1 for x in pool if x["media_type"] == "tvSeries"),
         },
         "total_pages": [m_meta.get("total_pages", 1), t_meta.get("total_pages", 1)],
-        "fetch_all_movie": bool(m_meta.get("fetch_all", False)),
-        "fetch_all_tv": bool(t_meta.get("fetch_all", False)),
+        "fetch_all_movie": True,
+        "fetch_all_tv": True,
         "requests_made": tmdb.request_count,
         "throttle_ms": throttle_ms,
     }
