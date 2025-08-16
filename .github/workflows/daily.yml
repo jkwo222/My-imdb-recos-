@@ -1,5 +1,4 @@
 # File: .github/workflows/daily.yml
-# WHY: Previous YAML parse error & brittle steps; this is a clean, strict, CI-safe replacement.
 name: Daily Recos
 
 on:
@@ -70,6 +69,7 @@ jobs:
           python -m engine.runner 2>&1 | tee data/debug/runner.log
 
       - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: recos-${{ github.run_number }}
@@ -79,7 +79,6 @@ jobs:
           if-no-files-found: warn
 
       - name: Create/Update "Daily picks" issue
-        # WHY: Keep a single rolling issue, easy to follow; labeled for filtering.
         if: always()
         uses: actions/github-script@v7
         with:
@@ -87,229 +86,16 @@ jobs:
             const fs = require('fs');
             const core = require('@actions/core');
             const path = 'data/out/latest/assistant_feed.json';
-
             if (!fs.existsSync(path)) {
               core.warning('assistant_feed.json not found; skipping issue creation.');
               return;
             }
-
             const payload = JSON.parse(fs.readFileSync(path, 'utf8'));
-            const items = Array.isArray(payload.items) ? payload.items : [];
+            const items = Array.isArray(payload.items) ? payload.items : payload.top || [];
             const title = payload.title || `Daily picks — run #${process.env.GITHUB_RUN_NUMBER}`;
 
             const lines = [];
             lines.push(`**Run:** ${new Date().toISOString()}`);
             lines.push('');
             if (items.length) {
-              lines.push('### Top Picks');
-              items.forEach((it, i) => {
-                const name = it.title || it.name || 'Untitled';
-                const year = it.year || (it.release_date ? String(it.release_date).slice(0,4) : '');
-                lines.push(`${i+1}. ${name}${year ? ' ('+year+')' : ''}`);
-              });
-              lines.push('');
-            }
-            if (payload.telemetry) {
-              lines.push('### Telemetry');
-              lines.push('```json');
-              lines.push(JSON.stringify(payload.telemetry, null, 2));
-              lines.push('```');
-              lines.push('');
-            }
-            const body = lines.join('\n');
-
-            const { data: issues } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'daily-picks'
-            });
-
-            if (issues.length) {
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issues[0].number,
-                title,
-                body
-              });
-            } else {
-              await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title,
-                body,
-                labels: ['daily-picks']
-              });
-            }
-
-# File: .github/workflows/nightly.yml
-# WHY: Longer crawl/experiments on a separate cadence to avoid blocking daily signal.
-name: Nightly Recos (Extended)
-
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: "45 3 * * *"  # 03:45 UTC nightly
-
-concurrency:
-  group: nightly-recos-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: write
-  issues: write
-
-env:
-  PYTHONUNBUFFERED: "1"
-  PIP_DISABLE_PIP_VERSION_CHECK: "1"
-  DATA_DIR: data
-  CACHE_DIR: data/cache
-  OUTPUT_DIR: data/out/latest
-  TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
-  OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
-  IMDB_USER_ID: ${{ vars.IMDB_USER_ID || secrets.IMDB_USER_ID }}
-  REGION: US
-  LANGUAGE: en-US
-  ORIGINAL_LANGS: en
-  SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
-  TMDB_PAGES_MOVIE: "400"      # WHY: Nightly: go deeper.
-  TMDB_PAGES_TV: "400"
-  MAX_CATALOG: "50000"
-  INCLUDE_TV_SEASONS: "true"
-  SKIP_WINDOW_DAYS: "1"        # WHY: Allow faster revisit at night.
-
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Verify IMDb export exists
-        run: |
-          if [ ! -s "data/ratings.csv" ]; then
-            echo "::error file=data/ratings.csv::Missing or empty data/ratings.csv (export from IMDb)."
-            exit 1
-          fi
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Prepare dirs
-        run: |
-          mkdir -p "$CACHE_DIR" "$OUTPUT_DIR" "data/debug"
-
-      - name: Run engine (extended)
-        run: |
-          set -e
-          python -m engine.runner 2>&1 | tee data/debug/runner.log
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: nightly-recos-${{ github.run_number }}
-          path: |
-            data/debug/runner.log
-            data/out/latest/**
-          if-no-files-found: warn
-
-      - name: Create/Update "Nightly picks" issue
-        if: always()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const core = require('@actions/core');
-            const path = 'data/out/latest/assistant_feed.json';
-            if (!fs.existsSync(path)) {
-              core.warning('assistant_feed.json not found; skipping issue creation.');
-              return;
-            }
-            const payload = JSON.parse(fs.readFileSync(path, 'utf8'));
-            const items = Array.isArray(payload.items) ? payload.items : [];
-            const title = (payload.title ? payload.title.replace(/Daily/i,'Nightly') : null) || `Nightly picks — run #${process.env.GITHUB_RUN_NUMBER}`;
-            const lines = [];
-            lines.push(`**Run:** ${new Date().toISOString()}`);
-            lines.push('');
-            if (items.length) {
-              lines.push('### Top Picks');
-              items.forEach((it, i) => {
-                const name = it.title || it.name || 'Untitled';
-                const year = it.year || (it.release_date ? String(it.release_date).slice(0,4) : '');
-                lines.push(`${i+1}. ${name}${year ? ' ('+year+')' : ''}`);
-              });
-              lines.push('');
-            }
-            if (payload.telemetry) {
-              lines.push('### Telemetry');
-              lines.push('```json');
-              lines.push(JSON.stringify(payload.telemetry, null, 2));
-              lines.push('```');
-              lines.push('');
-            }
-            const body = lines.join('\n');
-
-            const { data: issues } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'nightly-picks'
-            });
-
-            if (issues.length) {
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issues[0].number,
-                title,
-                body
-              });
-            } else {
-              await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title,
-                body,
-                labels: ['nightly-picks']
-              });
-            }
-
-# File: .env.example
-# WHY: Make local runs mirror CI env easily.
-# Copy to .env and fill in secrets
-TMDB_API_KEY=your_tmdb_key
-OMDB_API_KEY=your_omdb_key
-IMDB_USER_ID=ur1234567
-REGION=US
-LANGUAGE=en-US
-ORIGINAL_LANGS=en
-SUBS_INCLUDE=netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
-TMDB_PAGES_MOVIE=200
-TMDB_PAGES_TV=200
-MAX_CATALOG=20000
-INCLUDE_TV_SEASONS=true
-SKIP_WINDOW_DAYS=4
-
-# File: Makefile
-# WHY: One-liners for parity with CI.
-.PHONY: setup run clean
-
-PY := python3
-
-setup:
-	$(PY) -m pip install --upgrade pip
-	pip install -r requirements.txt
-
-run:
-	@test -s data/ratings.csv || (echo "ERR: data/ratings.csv missing or empty"; exit 1)
-	mkdir -p data/cache data/out/latest data/debug
-	$(PY) -m engine.runner 2>&1 | tee data/debug/runner.log
-
-clean:
-	rm -rf data/cache data/out latest data/debug
+              lines.push('###
