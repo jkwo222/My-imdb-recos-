@@ -3,12 +3,13 @@ name: Nightly Recommendations
 
 on:
   schedule:
-    # ~12:15am US/Eastern (04:15 UTC) — adjust as needed
+    # ~12:15am US/Eastern (04:15 UTC). Adjust if you want.
     - cron: '15 4 * * *'
   workflow_dispatch: {}
 
 permissions:
   contents: read
+  issues: write   # needed to post/update the nightly issue comment
 
 concurrency:
   group: nightly-recos
@@ -67,38 +68,61 @@ jobs:
             data/debug/runner.log
           if-no-files-found: ignore
 
-      - name: Prepare email subject/body
-        id: email
+      - name: Build markdown summary
+        id: mk
         run: |
           FEED="data/out/latest/assistant_feed.json"
-          SUBJ="Nightly Recommendations: run complete"
-          BODY="<p>Nightly engine run completed.</p>"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          DATE_UTC="$(date -u +'%Y-%m-%d %H:%M UTC')"
+
+          echo "# Nightly Recommendations — ${DATE_UTC}" > summary.md
           if [ -f "$FEED" ]; then
             POOL=$(jq -r '.telemetry.counts.tmdb_pool // 0' "$FEED")
             UNSEEN=$(jq -r '.telemetry.counts.eligible_unseen // 0' "$FEED")
             SHORT=$(jq -r '.telemetry.counts.shortlist // 0' "$FEED")
             SHOWN=$(jq -r '.telemetry.counts.shown // 0' "$FEED")
-            SUBJ="Nightly Recos • Pool ${POOL} • Unseen ${UNSEEN} • Shown ${SHOWN}"
-            # Top 10 compact table
-            echo "<h3>Top 10</h3><table border='1' cellpadding='6' cellspacing='0'><tr><th>#</th><th>Title</th><th>Year</th><th>Type</th><th>Match</th></tr>" > email.html
-            jq -r '.top10[] | "<tr><td>\(.rank)</td><td>\(.title | gsub("&";"&amp;"))</td><td>\(.year // "")</td><td>\(.type)</td><td>\(.match)</td></tr>"' "$FEED" >> email.html
-            echo "</table>" >> email.html
-            BODY="<p>Pool: <b>${POOL}</b> • Unseen: <b>${UNSEEN}</b> • Shortlist: <b>${SHORT}</b> • Shown: <b>${SHOWN}</b></p>$(cat email.html)"
+            echo "" >> summary.md
+            echo "**Pool:** ${POOL}  •  **Unseen:** ${UNSEEN}  •  **Shortlist:** ${SHORT}  •  **Shown:** ${SHOWN}" >> summary.md
+            echo "" >> summary.md
+            echo "## Top 10" >> summary.md
+            echo "" >> summary.md
+            echo "| # | Title | Year | Type | Match |" >> summary.md
+            echo "|---:|---|---:|---|---:|" >> summary.md
+            jq -r '.top10[] | "| \(.rank) | \(.title|gsub("\\|";"\\|")) | \(.year//"") | \(.type) | \(.match) |"' "$FEED" >> summary.md
+            echo "" >> summary.md
+            echo "_Run logs & artifacts:_ ${RUN_URL}" >> summary.md
+          else
+            echo "" >> summary.md
+            echo "> No assistant_feed.json produced this run. See logs: ${RUN_URL}" >> summary.md
           fi
-          echo "subject=${SUBJ}" >> "$GITHUB_OUTPUT"
-          printf "%s" "$BODY" > body.html
 
-      - name: Send email
-        uses: dawidd6/action-send-mail@v3
+      - name: Post/update Issue (triggers GitHub email)
+        uses: actions/github-script@v7
         with:
-          server_address: ${{ secrets.SMTP_HOST }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          subject: ${{ steps.email.outputs.subject }}
-          to: ${{ secrets.MAIL_TO }}
-          from: ${{ secrets.MAIL_FROM }}
-          content_type: text/html
-          body_file: body.html
-          attachments: |
-            data/out/latest/assistant_feed.json
+          script: |
+            const fs = require('fs');
+            const title = 'Nightly Recommendations';
+            const body = fs.readFileSync('summary.md', 'utf8');
+
+            // Find an existing issue with this exact title
+            const {owner, repo} = context.repo;
+            const issues = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', per_page: 100
+            });
+            let issue = issues.data.find(i => i.title === title);
+
+            // Create the container issue once if it doesn't exist
+            if (!issue) {
+              const created = await github.rest.issues.create({
+                owner, repo, title,
+                body: 'This issue will collect nightly recommendation summaries.'
+              });
+              issue = created.data;
+            }
+
+            // Add a new comment each run — this generates a notification email
+            await github.rest.issues.createComment({
+              owner, repo,
+              issue_number: issue.number,
+              body
+            });
