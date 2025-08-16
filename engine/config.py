@@ -1,155 +1,111 @@
+# engine/config.py
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
 
-def _to_bool(val: Optional[str], default: bool = False) -> bool:
-    if val is None:
+# Map your simple slugs -> TMDB watch provider IDs (US region).
+# Source: TMDB provider list (common ones). You can add more if needed.
+_PROVIDER_MAP_US: Dict[str, int] = {
+    "netflix": 8,
+    "prime_video": 9,
+    "hulu": 15,
+    "disney_plus": 337,
+    "max": 384,             # formerly HBO Max
+    "apple_tv_plus": 350,
+    "peacock": 386,
+    "paramount_plus": 531,
+    # aliases (optional)
+    "amazon": 9,
+    "amazon_prime": 9,
+    "disney+": 337,
+    "hbomax": 384,
+    "max_hbo": 384,
+    "atv+": 350,
+}
+
+
+def _get_bool(env_name: str, default: bool) -> bool:
+    raw = os.getenv(env_name)
+    if raw is None:
         return default
-    return str(val).strip().lower() in {"1", "true", "yes", "y", "on"}
+    return raw.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
-def _to_int(val: Optional[str], default: int) -> int:
-    try:
-        return int(str(val).strip())
-    except Exception:
-        return default
-
-
-def _to_float(val: Optional[str], default: float) -> float:
-    try:
-        return float(str(val).strip())
-    except Exception:
-        return default
-
-
-def _csv_list(val: Optional[str]) -> List[str]:
-    if not val:
+def _split_csv(env_name: str) -> List[str]:
+    raw = os.getenv(env_name, "")
+    if not raw.strip():
         return []
-    return [x.strip() for x in str(val).split(",") if x.strip()]
+    return [p.strip().lower() for p in raw.split(",") if p.strip()]
 
 
+@dataclass
 class Config:
-    """
-    Config helper with:
-      - Config.from_env()
-      - .get(...)
-      - attribute access (cfg.REGION or cfg.region)
-      - item access (cfg["REGION"])
-      - .to_dict()
-    """
+    # API keys
+    tmdb_api_key: str
+    omdb_api_key: Optional[str] = None
 
-    def __init__(self, data: Dict[str, Any]):
-        self._d = dict(data)
+    # IMDB / ratings input
+    imdb_user_id: Optional[str] = None
+    imdb_ratings_csv_path: Optional[str] = None
+
+    # discovery constraints
+    region: str = "US"
+    original_langs: List[str] = field(default_factory=lambda: ["en"])
+    with_original_language: Optional[str] = None  # derived from original_langs
+    include_tv_seasons: bool = True
+
+    # providers
+    provider_slugs: List[str] = field(default_factory=list)  # from SUBS_INCLUDE
+    provider_ids: List[int] = field(default_factory=list)    # mapped via _PROVIDER_MAP_US
+
+    # pagination / limits
+    tmdb_pages_movie: int = 24
+    tmdb_pages_tv: int = 24
+    max_catalog: int = 10_000
+    skip_window_days: int = 4
+
+    # ranking weights (keep defaults; tweak later if you want)
+    critic_weight: float = 0.5
+    audience_weight: float = 0.5
 
     @staticmethod
     def from_env() -> "Config":
-        # API keys / IDs
         tmdb_key = os.getenv("TMDB_API_KEY", "")
-        omdb_key = os.getenv("OMDB_API_KEY", "")
-        imdb_user = os.getenv("IMDB_USER_ID", "")
-        ratings_csv = os.getenv("IMDB_RATINGS_CSV_PATH", "data/ratings.csv")
+        if not tmdb_key:
+            raise RuntimeError("TMDB_API_KEY is required")
 
-        # Region / language
-        region = os.getenv("REGION", "US")
-        original_langs = _csv_list(os.getenv("ORIGINAL_LANGS", "en"))
-        with_original_language = original_langs[:]  # alias many modules expect
+        # languages
+        langs = _split_csv("ORIGINAL_LANGS") or ["en"]
+        with_orig = ",".join(langs)
 
-        # Streaming providers
-        provider_names = _csv_list(
-            os.getenv(
-                "SUBS_INCLUDE",
-                "netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus",
-            )
+        # providers
+        slugs = _split_csv("SUBS_INCLUDE")
+        ids: List[int] = []
+        for s in slugs:
+            if s in _PROVIDER_MAP_US:
+                ids.append(_PROVIDER_MAP_US[s])
+            else:
+                # you can add a print if you want to see unknown slugs in logs
+                pass
+
+        return Config(
+            tmdb_api_key=tmdb_key,
+            omdb_api_key=os.getenv("OMDB_API_KEY") or None,
+            imdb_user_id=os.getenv("IMDB_USER_ID") or None,
+            imdb_ratings_csv_path=os.getenv("IMDB_RATINGS_CSV_PATH") or None,
+            region=os.getenv("REGION", "US"),
+            original_langs=langs,
+            with_original_language=with_orig,
+            include_tv_seasons=_get_bool("INCLUDE_TV_SEASONS", True),
+            provider_slugs=slugs,
+            provider_ids=ids,
+            tmdb_pages_movie=int(os.getenv("TMDB_PAGES_MOVIE", "24")),
+            tmdb_pages_tv=int(os.getenv("TMDB_PAGES_TV", "24")),
+            max_catalog=int(os.getenv("MAX_CATALOG", "10000")),
+            skip_window_days=int(os.getenv("SKIP_WINDOW_DAYS", "4")),
+            critic_weight=float(os.getenv("CRITIC_WEIGHT", "0.5")),
+            audience_weight=float(os.getenv("AUDIENCE_WEIGHT", "0.5")),
         )
-
-        # Discovery / limits
-        tmdb_pages_movie = _to_int(os.getenv("TMDB_PAGES_MOVIE"), 24)
-        tmdb_pages_tv = _to_int(os.getenv("TMDB_PAGES_TV"), 24)
-        max_catalog = _to_int(os.getenv("MAX_CATALOG"), 10000)
-        include_tv_seasons = _to_bool(os.getenv("INCLUDE_TV_SEASONS"), True)
-        skip_window_days = _to_int(os.getenv("SKIP_WINDOW_DAYS"), 4)
-
-        # Scoring weights (defaults based on prior logs)
-        critic_weight = _to_float(os.getenv("CRITIC_WEIGHT"), 0.25)
-        audience_weight = _to_float(os.getenv("AUDIENCE_WEIGHT"), 0.75)
-
-        # Optional knobs some codepaths may read (safe to keep even if unused)
-        novelty_penalty = _to_float(os.getenv("NOVELTY_PENALTY"), 0.15)  # 'np' in logs
-        cache_coeff = _to_float(os.getenv("CACHE_COEFFICIENT"), 1.0)     # 'cc' in logs
-
-        data: Dict[str, Any] = {
-            # Canonical (UPPERCASE)
-            "TMDB_API_KEY": tmdb_key,
-            "OMDB_API_KEY": omdb_key,
-            "IMDB_USER_ID": imdb_user,
-            "IMDB_RATINGS_CSV_PATH": ratings_csv,
-
-            "REGION": region,
-            "watch_region": region,  # alias
-
-            "ORIGINAL_LANGS": original_langs,
-            "with_original_language": with_original_language,
-
-            "provider_names": provider_names,
-
-            "TMDB_PAGES_MOVIE": tmdb_pages_movie,
-            "TMDB_PAGES_TV": tmdb_pages_tv,
-            "MAX_CATALOG": max_catalog,
-            "INCLUDE_TV_SEASONS": include_tv_seasons,
-            "SKIP_WINDOW_DAYS": skip_window_days,
-
-            "CRITIC_WEIGHT": critic_weight,
-            "AUDIENCE_WEIGHT": audience_weight,
-
-            "NOVELTY_PENALTY": novelty_penalty,
-            "CACHE_COEFFICIENT": cache_coeff,
-        }
-
-        # Lowercase mirrors (so cfg.foo or cfg.FOO both work)
-        data.update({
-            "tmdb_api_key": tmdb_key,
-            "omdb_api_key": omdb_key,
-            "imdb_user_id": imdb_user,
-            "imdb_ratings_csv_path": ratings_csv,
-
-            "region": region,
-            "original_langs": original_langs,
-            "with_original_language": with_original_language,
-
-            "provider_names": provider_names,
-
-            "tmdb_pages_movie": tmdb_pages_movie,
-            "tmdb_pages_tv": tmdb_pages_tv,
-            "max_catalog": max_catalog,
-            "include_tv_seasons": include_tv_seasons,
-            "skip_window_days": skip_window_days,
-
-            "critic_weight": critic_weight,
-            "audience_weight": audience_weight,
-
-            "novelty_penalty": novelty_penalty,
-            "cache_coefficient": cache_coeff,
-        })
-
-        return Config(data)
-
-    # ---- conveniences ----
-    def get(self, key: str, default: Any = None) -> Any:
-        return self._d.get(key, default)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return dict(self._d)
-
-    def __getitem__(self, key: str) -> Any:
-        return self._d[key]
-
-    def __getattr__(self, key: str) -> Any:
-        try:
-            return self._d[key]
-        except KeyError as e:
-            raise AttributeError(key) from e
-
-    def __repr__(self) -> str:
-        return f"Config({self._d!r})"
