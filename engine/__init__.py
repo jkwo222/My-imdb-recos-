@@ -1,3 +1,3 @@
-# engine/__init__.py
-# keep package clean; avoid side-effect imports
+# Minimal package init to avoid circular imports.
+# Do not import submodules here; runner uses relative imports.
 __all__ = []
