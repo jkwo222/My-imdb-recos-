@@ -1,5 +1,5 @@
-# engine/recency.py
-import os, json, time, pathlib
+# File: engine/recency.py
+import json, time, pathlib
 from typing import Iterable
 
 REC_PATH = pathlib.Path("data/recency.json")
@@ -15,15 +15,11 @@ def _save(d):
 
 def should_skip(imdb_id: str, days: int = 4) -> bool:
     if not imdb_id: return False
-    d = _load()["last_shown"]
-    ts = d.get(imdb_id)
-    if not ts: return False
-    return (time.time() - ts) < days*86400
+    ts = _load()["last_shown"].get(imdb_id)
+    return bool(ts and (time.time() - ts) < days*86400)
 
 def mark_shown(imdb_ids: Iterable[str]):
-    d = _load()
-    now = time.time()
+    d = _load(); now = time.time()
     for i in imdb_ids:
-        if not i: continue
-        d["last_shown"][i] = now
+        if i: d["last_shown"][i] = now
     _save(d)
