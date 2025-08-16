@@ -1,40 +1,46 @@
-name: nightly
+name: Nightly
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
   schedule:
-    - cron: "20 3 * * *"   # change to your preferred time
+    # 03:10 UTC daily — adjust as you like
+    - cron: "10 3 * * *"
+
+# IMPORTANT: this overrides repo defaults. Keep issues: write here.
+permissions:
+  contents: read
+  issues: write
 
 jobs:
   build:
     runs-on: ubuntu-24.04
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
-        shell: bash
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # (Optional) try to recover prior store from last run’s artifact
-      - name: Recover previous store (best effort)
-        if: always()
-        shell: bash
+      - name: Restore previous artifact (catalog_store.json if exists)
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p data/cache data/debug data/out/latest
-          ART_ID=$(gh api repos/${{ github.repository }}/actions/artifacts --jq '.artifacts[] | select(.name=="nightly-output") | .id' | head -n1 || true)
+          # Try to fetch most recent nightly-output artifact
+          ART_ID=$(gh api repos/${{ github.repository }}/actions/artifacts \
+            --jq '.artifacts[] | select(.name=="nightly-output") | .id' | head -n1 || true)
           if [[ -n "${ART_ID:-}" ]]; then
             echo "Downloading artifact id ${ART_ID}…"
             gh api -H "Accept: application/vnd.github+json" \
@@ -44,39 +50,37 @@ jobs:
             echo "No previous nightly-output artifact found; starting fresh store."
           fi
 
-      - name: Prepare dirs (and force-create a log)
-        id: prep
-        shell: bash
+      - name: Bootstrap log file
         run: |
           set -euo pipefail
           mkdir -p data/cache data/debug data/out/latest
-          # create a log file up-front so it exists even if Python crashes immediately
           echo "[bootstrap] $(date -u +"%F %T UTC") — workflow started" > data/debug/runner.log
 
-      - name: Run engine (never lose logs)
-        id: run_engine
-        shell: bash
+      - name: Run engine (capture exit, but continue so we can upload logs/artifacts)
+        id: engine
         env:
           TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
-          OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
-          IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
+          OMDB_API_KEY:  ${{ secrets.OMDB_API_KEY }}
+          IMDB_USER_ID:  ${{ secrets.IMDB_USER_ID }}
           IMDB_RATINGS_CSV_PATH: data/ratings.csv
+
+          # Tuning knobs (feel free to change)
           REGION: US
           ORIGINAL_LANGS: en
           SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
-          TMDB_PAGES_MOVIE: 24
-          TMDB_PAGES_TV: 24
-          MAX_CATALOG: 10000
+          TMDB_PAGES_MOVIE: "24"
+          TMDB_PAGES_TV: "24"
+          MAX_CATALOG: "10000"
           INCLUDE_TV_SEASONS: "true"
-          SKIP_WINDOW_DAYS: 4
+          SKIP_WINDOW_DAYS: "4"
+        shell: bash
         run: |
           set -euo pipefail
-          # run but don't fail the step yet; we want artifacts first
+          # run but don't fail this step; we want artifacts first
           set +e
           python -X dev -m engine.runner 2>&1 | tee -a data/debug/runner.log
           EXIT=$?
           set -e
-
           echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
 
           # quick file inventory into the log (helps when feed/store missing)
@@ -85,23 +89,11 @@ jobs:
             find data -maxdepth 3 -type f -printf "%p (%s bytes)\n" | sort
           } >> data/debug/runner.log || true
 
-      - name: Tail runner.log to console (for quick triage)
-        if: always()
-        shell: bash
-        run: |
-          echo "----- LAST 200 LINES OF data/debug/runner.log -----"
-          if [ -f data/debug/runner.log ]; then
-            tail -n 200 data/debug/runner.log || true
-          else
-            echo "runner.log not found (this would be unusual because we pre-create it)."
-          fi
-
       - name: Build markdown summary
-        if: always()
-        shell: bash
         run: |
+          set -euo pipefail
           FEED="data/out/latest/assistant_feed.json"
-          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           DATE_UTC="$(date -u +'%Y-%m-%d %H:%M UTC')"
 
           {
@@ -111,6 +103,7 @@ jobs:
               UNSEEN=$(jq -r '.telemetry.counts.eligible_unseen // 0' "$FEED")
               SHORT=$(jq -r '.telemetry.counts.shortlist // 0' "$FEED")
               SHOWN=$(jq -r '.telemetry.counts.shown // 0' "$FEED")
+
               echo
               echo "**Pool:** ${POOL}  •  **Unseen:** ${UNSEEN}  •  **Shortlist:** ${SHORT}  •  **Shown:** ${SHOWN}"
               echo
@@ -128,8 +121,7 @@ jobs:
             echo "_Run logs & artifacts:_ ${RUN_URL}"
           } > summary.md
 
-      - name: Upload artifacts (whole data tree + summary)
-        if: always()
+      - name: Upload nightly-output artifact
         uses: actions/upload-artifact@v4
         with:
           name: nightly-output
@@ -138,13 +130,14 @@ jobs:
             summary.md
           if-no-files-found: warn
           compression-level: 6
+          overwrite: false
 
-      # Optional: comment on the tracking issue to notify you each run
-      - name: Post/update Issue (triggers GitHub email)
-        if: always()
+      # --- Comment to Issue (Option A: use personal token if provided) ---
+      - name: Comment summary to Issue (using ISSUE_TOKEN, if present)
+        if: ${{ secrets.ISSUE_TOKEN != '' }}
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.ISSUE_TOKEN }}
           script: |
             const fs = require('fs');
             const title = 'Nightly Recommendations';
@@ -158,12 +151,31 @@ jobs:
             }
             await github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body });
 
-      # Finally, respect the engine’s real exit code, after uploads
-      - name: Fail if engine failed
+      # --- Comment to Issue (Option B: default GITHUB_TOKEN with issues:write) ---
+      - name: Comment summary to Issue (using GITHUB_TOKEN)
+        if: ${{ secrets.ISSUE_TOKEN == '' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const title = 'Nightly Recommendations';
+            const body = fs.readFileSync('summary.md', 'utf8');
+            const {owner, repo} = context.repo;
+            const issues = await github.rest.issues.listForRepo({ owner, repo, state: 'open', per_page: 100 });
+            let issue = issues.data.find(i => i.title === title);
+            if (!issue) {
+              const created = await github.rest.issues.create({ owner, repo, title, body: 'This issue will collect nightly recommendation summaries.' });
+              issue = created.data;
+            }
+            await github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body });
+
+      # Fail the job if the engine actually failed
+      - name: Finalize (honor engine exit code)
         if: always()
         shell: bash
         run: |
-          code="${{ steps.run_engine.outputs.exit_code }}"
+          code="${{ steps.engine.outputs.exit_code }}"
           if [ -z "$code" ]; then code=1; fi
           if [ "$code" != "0" ]; then
             echo "Engine exited with code $code"
