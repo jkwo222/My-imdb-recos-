@@ -1,143 +1,143 @@
 from __future__ import annotations
+import hashlib
 import math
 import random
-from typing import Dict, Any, List, Tuple
-from .config import Config
-from .cache import JsonCache
-from .tmdb import TMDB, MAX_DISCOVER_PAGES
-from .providers import any_allowed
+from typing import Any, Dict, List, Tuple
 
-def _first_date(parts: Dict[str, Any]) -> int | None:
-    for k in ("release_date", "first_air_date"):
-        v = parts.get(k)
-        if v and isinstance(v, str) and len(v) >= 4 and v[:4].isdigit():
-            return int(v[:4])
-    return None
+from .config import Config
+from .tmdb import TMDB, normalize_provider_names
+
+def _slot_number(rotate_minutes: int) -> int:
+    # 15-min rotation => same “slot” within a 15-min bucket
+    import time
+    return int(time.time() // (rotate_minutes * 60))
 
 def _choose_pages(total_pages: int, want_pages: int, seed: int) -> List[int]:
-    # Clamp total_pages to TMDB max for discover (defense in depth)
-    total_pages = max(1, min(int(total_pages or 1), MAX_DISCOVER_PAGES))
-    want_pages = max(1, int(want_pages or 1))
-    want = min(want_pages, total_pages)
+    """
+    Deterministic, widely-spaced page selection using an odd step (cycle through ring).
+    Handles tiny totals gracefully.
+    """
+    total_pages = max(1, int(total_pages))
+    want_pages = max(1, int(want_pages))
+    want_pages = min(want_pages, total_pages)
+
+    if total_pages == 1:
+        return [1]
 
     rng = random.Random(seed)
-
-    # choose a coprime step so we traverse widely
-    step = None
-    for _ in range(64):
-        candidate = rng.randrange(1, total_pages)  # 1..total-1
-        if math.gcd(candidate, total_pages) == 1:
-            step = candidate
-            break
-    if step is None:
+    # Odd step in [1, total_pages-1], ensures a full cycle
+    step = (rng.randrange(1, total_pages) * 2 + 1) % total_pages
+    if step == 0:
         step = 1
-
-    start = rng.randrange(1, total_pages + 1)
-    pages, seen = [], set()
-    x = start
-    while len(pages) < want:
-        if x not in seen:
-            pages.append(x)
-            seen.add(x)
-        x = ((x - 1 + step) % total_pages) + 1
+    start = rng.randrange(0, total_pages)
+    pages = []
+    cur = start
+    for _ in range(want_pages):
+        pages.append(cur + 1)  # TMDB pages are 1-based
+        cur = (cur + step) % total_pages
     return pages
 
-def _basic_item_from_result(kind: str, r: Dict[str, Any]) -> Dict[str, Any]:
-    title = r.get("title") or r.get("name") or "Unknown"
-    year = _first_date(r) or 0
-    tmdb_id = int(r.get("id"))
-    popularity = float(r.get("popularity", 0.0) or 0.0)
-    runtime = int(r.get("runtime") or 0)  # discover usually lacks runtime; left for future enrichers
+def _want_pages(cfg: Config) -> Tuple[int, int]:
+    return (max(1, cfg.tmdb_pages_movie), max(1, cfg.tmdb_pages_tv))
+
+def _seed_for(kind: str, cfg: Config, slot: int) -> int:
+    key = f"{kind}|{slot}|{cfg.region}|{cfg.language}|{','.join(cfg.with_original_langs)}|{','.join(cfg.subs_include)}"
+    return int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:12], 16)
+
+def _coerce_item(kind: str, raw: Dict[str, Any]) -> Dict[str, Any]:
+    # TMDB discover returns slightly different fields for tv vs movie
+    if kind == "movie":
+        title = raw.get("title") or raw.get("original_title") or ""
+        year = (raw.get("release_date") or "")[:4] or None
+    else:
+        title = raw.get("name") or raw.get("original_name") or ""
+        year = (raw.get("first_air_date") or "")[:4] or None
     return {
+        "kind": kind,
+        "tmdb_id": int(raw.get("id")),
         "title": title,
-        "year": year,
-        "type": "tvSeries" if kind == "tv" else "movie",
-        "tmdb_id": tmdb_id,
-        "popularity": popularity,
-        "runtime": runtime,
-        "imdb_id": None,
-        "_providers": [],
+        "year": int(year) if (isinstance(year, str) and year.isdigit()) else year,
+        "popularity": float(raw.get("popularity") or 0.0),
+        "vote_average": float(raw.get("vote_average") or 0.0),  # 0..10
+        "original_language": raw.get("original_language"),
     }
 
-def _enrich_ids_and_providers(api: TMDB, kind: str, item: Dict[str, Any], region: str) -> Dict[str, Any]:
-    tmdb_id = int(item["tmdb_id"])
-    try:
-        ids = api.external_ids_for(kind, tmdb_id)
-        imdb_id = ids.get("imdb_id")
-        if imdb_id:
-            item["imdb_id"] = imdb_id
-    except Exception:
-        pass
-    try:
-        provs = api.watch_providers_for(kind, tmdb_id, region=region)
-        item["_providers"] = provs
-    except Exception:
-        item["_providers"] = []
-    return item
-
 def build_pool(cfg: Config) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    cache = JsonCache(cfg.cache_dir)
-    tmdb = TMDB(cfg.tmdb_api_key, cache)
+    """
+    Collects items from TMDB discover across many pages (randomized but deterministic per slot),
+    filters by region/providers (your services only), and returns (pool, meta).
+    """
+    tmdb = TMDB(cfg.tmdb_api_key, cache=_cache(cfg))
+    rotate_minutes = 15
+    slot = _slot_number(rotate_minutes)
 
-    slot = cfg.rotation_slot()
-
+    # Determine total pages once for each kind
     total_pages_movie = tmdb.total_pages("movie", cfg.language, cfg.with_original_langs, cfg.region)
-    total_pages_tv    = tmdb.total_pages("tv",    cfg.language, cfg.with_original_langs, cfg.region)
+    total_pages_tv = tmdb.total_pages("tv", cfg.language, cfg.with_original_langs, cfg.region)
 
-    movie_pages = _choose_pages(total_pages_movie, cfg.tmdb_pages_movie, seed=slot * 1009 + 7)
-    tv_pages    = _choose_pages(total_pages_tv,    cfg.tmdb_pages_tv,    seed=slot * 1013 + 11)
+    want_movie, want_tv = _want_pages(cfg)
+    seed_m = _seed_for("movie", cfg, slot)
+    seed_t = _seed_for("tv", cfg, slot)
+
+    movie_pages_used = _choose_pages(total_pages_movie, want_movie, seed_m)
+    tv_pages_used = _choose_pages(total_pages_tv, want_tv, seed_t)
 
     pool: List[Dict[str, Any]] = []
-    per_kind_cap = max(1, cfg.max_catalog // 2)
+    def collect(kind: str, pages: List[int]) -> List[Dict[str, Any]]:
+        out = []
+        for p in pages:
+            data = tmdb.discover(kind, p, cfg.language, cfg.with_original_langs, cfg.region)
+            for raw in data.get("results", []) or []:
+                item = _coerce_item(kind, raw)
+                out.append(item)
+        return out
 
-    # Movies
-    added_movies = 0
-    for p in movie_pages:
-        if added_movies >= per_kind_cap:
-            break
-        data = tmdb.discover("movie", p, cfg.language, cfg.with_original_langs, cfg.region)
-        for r in data.get("results", []):
-            item = _basic_item_from_result("movie", r)
-            item = _enrich_ids_and_providers(tmdb, "movie", item, cfg.region)
-            if any_allowed(item.get("_providers"), cfg.subs_include):
-                pool.append(item)
-                added_movies += 1
-                if added_movies >= per_kind_cap:
-                    break
+    movie_items = collect("movie", movie_pages_used)
+    tv_items    = collect("tv", tv_pages_used)
 
-    # TV
-    added_tv = 0
-    for p in tv_pages:
-        if added_tv >= per_kind_cap:
-            break
-        data = tmdb.discover("tv", p, cfg.language, cfg.with_original_langs, cfg.region)
-        for r in data.get("results", []):
-            item = _basic_item_from_result("tv", r)
-            item = _enrich_ids_and_providers(tmdb, "tv", item, cfg.region)
-            if any_allowed(item.get("_providers"), cfg.subs_include):
-                pool.append(item)
-                added_tv += 1
-                if added_tv >= per_kind_cap:
-                    break
+    # Filter by providers (post-filter; avoids brittle provider-ID matching)
+    def enrich_and_filter(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        keep: List[Dict[str, Any]] = []
+        for it in items:
+            prov_names = tmdb.providers_for_title(it["kind"], it["tmdb_id"], cfg.region)
+            prov_slugs = normalize_provider_names(prov_names)
+            it["providers"] = prov_slugs
+            if any(s in cfg.subs_include for s in prov_slugs):
+                keep.append(it)
+        return keep
+
+    movie_items = enrich_and_filter(movie_items)
+    tv_items    = enrich_and_filter(tv_items)
+
+    # Merge, sort by popularity as a first-pass, truncate to max_catalog
+    pool = (movie_items + tv_items)
+    pool.sort(key=lambda x: x.get("popularity", 0.0), reverse=True)
+    if cfg.max_catalog > 0:
+        pool = pool[: cfg.max_catalog]
 
     meta = {
-        "movie_pages": cfg.tmdb_pages_movie,
-        "tv_pages": cfg.tmdb_pages_tv,
-        "rotate_minutes": cfg.rotate_minutes,
+        "movie_pages": want_movie,
+        "tv_pages": want_tv,
+        "rotate_minutes": rotate_minutes,
         "slot": slot,
-        "total_pages_movie": total_pages_movie,  # already capped
-        "total_pages_tv": total_pages_tv,        # already capped
-        "movie_pages_used": movie_pages,
-        "tv_pages_used": tv_pages,
+        "total_pages_movie": total_pages_movie,
+        "total_pages_tv": total_pages_tv,
+        "movie_pages_used": movie_pages_used,
+        "tv_pages_used": tv_pages_used,
         "provider_names": cfg.subs_include,
         "language": cfg.language,
         "with_original_language": ",".join(cfg.with_original_langs),
         "watch_region": cfg.region,
-        "pool_counts": {
-            "movie": sum(1 for x in pool if x["type"] == "movie"),
-            "tv": sum(1 for x in pool if x["type"] == "tvSeries"),
-        },
+        "pool_counts": {"movie": len(movie_items), "tv": len(tv_items)},
         "total_pages": [total_pages_movie, total_pages_tv],
     }
-
     return pool, meta
+
+# Cache singleton (lazy)
+__cache = None
+def _cache(cfg: Config):
+    global __cache
+    if __cache is None:
+        from .util.cache import DiskCache
+        __cache = DiskCache(cfg.cache_dir, cfg.cache_ttl_secs)
+    return __cache
