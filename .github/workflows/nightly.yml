@@ -1,23 +1,16 @@
-name: Nightly
+name: build
 
 on:
   schedule:
-    - cron: "0 2 * * *"   # 02:00 UTC daily
+    - cron: "5 2 * * *"  # daily at 02:05 UTC
   workflow_dispatch: {}
-
-permissions:
-  contents: read
-  issues: write
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -25,28 +18,22 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        shell: bash
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Prepare dirs
-        shell: bash
-        run: |
-          mkdir -p data/cache data/debug data/out/latest
+        run: mkdir -p data/cache data/debug data/out/latest
 
-      - name: Restore previous catalog store (if any)
+      # Restore previous store so the catalog keeps growing
+      - name: Restore previous nightly-output (catalog store)
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # Try to fetch the most recent 'nightly-output' artifact
-          # Note: 'gh' is available on the hosted runners.
-          ART_ID=$(gh api \
-            repos/${{ github.repository }}/actions/artifacts \
+          ART_ID=$(gh api repos/${{ github.repository }}/actions/artifacts \
             --jq '.artifacts[] | select(.name=="nightly-output") | .id' | head -n1 || true)
-
           if [[ -n "${ART_ID:-}" ]]; then
             echo "Downloading artifact id ${ART_ID}…"
             gh api -H "Accept: application/vnd.github+json" \
@@ -61,9 +48,9 @@ jobs:
           else
             echo "No previous nightly-output artifact found; starting fresh store."
           fi
+          mkdir -p data/cache data/debug data/out/latest
 
       - name: Run engine
-        shell: bash
         env:
           TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
           OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
@@ -81,32 +68,31 @@ jobs:
           set -o pipefail
           python -m engine.runner 2>&1 | tee data/debug/runner.log
 
+      - name: Upload artifacts (latest feed + logs + store)
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-output
+          path: |
+            data/out/latest/assistant_feed.json
+            data/debug/runner.log
+            data/catalog_store.json
+          if-no-files-found: ignore
+          compression-level: 6
+          overwrite: false
+
       - name: Build markdown summary
-        shell: bash
         run: |
           FEED="data/out/latest/assistant_feed.json"
-          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           DATE_UTC="$(date -u +'%Y-%m-%d %H:%M UTC')"
-
           echo "# Nightly Recommendations — ${DATE_UTC}" > summary.md
-
           if [ -f "$FEED" ]; then
             POOL=$(jq -r '.telemetry.counts.tmdb_pool // 0' "$FEED")
             UNSEEN=$(jq -r '.telemetry.counts.eligible_unseen // 0' "$FEED")
             SHORT=$(jq -r '.telemetry.counts.shortlist // 0' "$FEED")
             SHOWN=$(jq -r '.telemetry.counts.shown // 0' "$FEED")
-
             echo "" >> summary.md
             echo "**Pool:** ${POOL}  •  **Unseen:** ${UNSEEN}  •  **Shortlist:** ${SHORT}  •  **Shown:** ${SHOWN}" >> summary.md
-
-            # If cumulative store exists, show its size too (nice-to-have)
-            if [ -f "data/catalog_store.json" ]; then
-              M=$(jq -r '.movie | length' data/catalog_store.json)
-              T=$(jq -r '.tv | length' data/catalog_store.json)
-              echo "" >> summary.md
-              echo "**Catalog (cumulative):** movies=${M} • tv=${T}" >> summary.md
-            fi
-
             echo "" >> summary.md
             echo "## Top 10" >> summary.md
             echo "" >> summary.md
@@ -120,43 +106,20 @@ jobs:
             echo "> No assistant_feed.json produced this run. See logs: ${RUN_URL}" >> summary.md
           fi
 
-      - name: Upload artifacts (latest feed + logs + store)
-        uses: actions/upload-artifact@v4
-        with:
-          name: nightly-output
-          path: |
-            data/out/latest/assistant_feed.json
-            data/debug/runner.log
-            data/catalog_store.json
-          if-no-files-found: ignore
-          compression-level: 6
-          overwrite: false
-
       - name: Post/update Issue (triggers GitHub email)
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          debug: true
           script: |
             const fs = require('fs');
             const title = 'Nightly Recommendations';
             const body = fs.readFileSync('summary.md', 'utf8');
-
             const {owner, repo} = context.repo;
-            const issues = await github.rest.issues.listForRepo({
-              owner, repo, state: 'open', per_page: 100
-            });
+            const issues = await github.rest.issues.listForRepo({ owner, repo, state: 'open', per_page: 100 });
             let issue = issues.data.find(i => i.title === title);
-
             if (!issue) {
-              const created = await github.rest.issues.create({
-                owner, repo, title,
-                body: 'This issue will collect nightly recommendation summaries.'
-              });
+              const created = await github.rest.issues.create({ owner, repo, title, body: 'This issue will collect nightly recommendation summaries.' });
               issue = created.data;
             }
-
-            await github.rest.issues.createComment({
-              owner, repo,
-              issue_number: issue.number,
-              body
-            });
+            await github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body });
