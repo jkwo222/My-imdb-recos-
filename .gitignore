@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.pyc
+
+# Engine outputs
+data/out/
+data/cache/
+data/debug/
+data/recency.json
+data/weights_live.json
