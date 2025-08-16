@@ -1,8 +1,9 @@
+# FILE: .github/workflows/nightly.yml
 name: Nightly Recommendations
 
 on:
   schedule:
-    # UTC; 04:15 UTC daily (adjust if you want)
+    # UTC; adjust as you like (04:15 UTC ≈ 12:15am ET during DST)
     - cron: '15 4 * * *'
   workflow_dispatch: {}
 
@@ -39,6 +40,7 @@ jobs:
           mkdir -p data/cache data/debug data/out/latest
 
       - name: Run engine
+        id: run_engine
         env:
           TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
           OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
@@ -47,12 +49,13 @@ jobs:
           REGION: US
           ORIGINAL_LANGS: en
           SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
-          TMDB_PAGES_MOVIE: 12
-          TMDB_PAGES_TV: 12
-          MAX_CATALOG: 6000
+          TMDB_PAGES_MOVIE: 24
+          TMDB_PAGES_TV: 24
+          MAX_CATALOG: 10000
           INCLUDE_TV_SEASONS: true
           SKIP_WINDOW_DAYS: 4
         run: |
+          set -o pipefail
           python -m engine.runner 2>&1 | tee data/debug/runner.log
 
       - name: Upload artifacts (latest feed + logs)
@@ -62,4 +65,22 @@ jobs:
           path: |
             data/out/latest/assistant_feed.json
             data/debug/runner.log
-          if-no-files-found: warn
+          if-no-files-found: ignore   # avoid warning => avoid fail emails
+
+      - name: Post run summary
+        uses: actions/github-script@v7
+        env:
+          FEED_PATH: data/out/latest/assistant_feed.json
+        with:
+          script: |
+            const fs = require('fs');
+            let summary = 'Nightly engine run completed.';
+            try {
+              const p = process.env.FEED_PATH;
+              if (fs.existsSync(p)) {
+                const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+                const counts = data?.telemetry?.counts || {};
+                summary = `Pool: ${counts.tmdb_pool ?? 0}, Unseen: ${counts.eligible_unseen ?? 0}, Shortlist: ${counts.shortlist ?? 0}, Shown: ${counts.shown ?? 0}`;
+              }
+            } catch (e) {}
+            core.summary.addHeading('Nightly Recommendations').addRaw(summary).write();
