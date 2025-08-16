@@ -1,12 +1,17 @@
-# File: engine/tmdb.py
+# FILE: engine/tmdb.py
 from __future__ import annotations
 import requests
 from typing import Any, Dict, List
-from .util import DiskCache
+
+# IMPORTANT: import DiskCache directly from the module
+from .util.cache import DiskCache
 
 _TMDB_BASE = "https://api.themoviedb.org/3"
 
 class TMDB:
+    """
+    Thin TMDB client with simple on-disk response caching.
+    """
     def __init__(self, api_key: str, cache: DiskCache):
         self.api_key = api_key
         self.cache = cache
@@ -23,31 +28,44 @@ class TMDB:
         self.cache.set("http", url, full_params, data)
         return data
 
-    def discover(self, kind: str, page: int, language: str,
-                 with_original_language: List[str], watch_region: str) -> Dict[str, Any]:
+    def discover(
+        self,
+        kind: str,                 # "movie" or "tv"
+        page: int,
+        language: str,
+        with_original_language: List[str],
+        watch_region: str,
+    ) -> Dict[str, Any]:
         assert kind in ("movie", "tv")
         params = {
             "page": page,
             "language": language,
             "watch_region": watch_region,
             "sort_by": "popularity.desc",
-            "include_adult": "false",
         }
         if with_original_language:
             params["with_original_language"] = ",".join(with_original_language)
         return self._get(f"/discover/{kind}", params)
 
-    def total_pages(self, kind: str, language: str,
-                    with_original_language: List[str], watch_region: str) -> int:
+    def total_pages(
+        self,
+        kind: str,
+        language: str,
+        with_original_language: List[str],
+        watch_region: str,
+    ) -> int:
         first = self.discover(kind, 1, language, with_original_language, watch_region)
         total = int(first.get("total_pages", 1)) if isinstance(first, dict) else 1
         return max(1, min(total, 500))
 
     def providers_for_title(self, kind: str, tmdb_id: int, region: str) -> List[str]:
+        """
+        Return provider names (TMDB display names) for the given title in the region.
+        """
         data = self._get(f"/{kind}/{tmdb_id}/watch/providers", params={})
         res = data.get("results", {})
         region_block = res.get(region.upper(), {})
-        names = []
+        names: List[str] = []
         for key in ("flatrate", "ads", "free", "rent", "buy"):
             for item in region_block.get(key, []) or []:
                 n = item.get("provider_name")
@@ -55,6 +73,8 @@ class TMDB:
                     names.append(n)
         return sorted(set(names))
 
+
+# Provider normalization
 _PROVIDER_NAME_TO_SLUG = {
     "Netflix": "netflix",
     "Amazon Prime Video": "prime_video",
@@ -71,7 +91,9 @@ _PROVIDER_NAME_TO_SLUG = {
 }
 
 def normalize_provider_names(provider_names: List[str]) -> List[str]:
-    out = []
+    out: List[str] = []
     for n in provider_names:
-        out.append(_PROVIDER_NAME_TO_SLUG.get(n, n.strip().lower().replace(" ", "_").replace("+", "plus")))
+        out.append(_PROVIDER_NAME_TO_SLUG.get(
+            n, n.strip().lower().replace(" ", "_").replace("+", "plus")
+        ))
     return sorted(set(out))
