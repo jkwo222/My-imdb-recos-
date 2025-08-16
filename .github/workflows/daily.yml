@@ -1,0 +1,41 @@
+    - name: Verify ratings CSV is present and non-empty
+      run: |
+        mkdir -p data
+        if [ ! -s "data/ratings.csv" ]; then
+          echo "::error::data/ratings.csv is missing or empty. Add your IMDb CSV to data/ratings.csv"
+          ls -la data || true
+          exit 1
+        fi
+        echo "ratings.csv lines:"
+        wc -l data/ratings.csv
+        head -n 3 data/ratings.csv || true
+
+    - name: Cache API responses (TMDB/OMDb)
+      uses: actions/cache@v4
+      with:
+        path: data/cache
+        key: cache-${{ runner.os }}-${{ hashFiles('engine/**/*.py') }}-${{ github.run_id }}
+        restore-keys: |
+          cache-${{ runner.os }}-${{ hashFiles('engine/**/*.py') }}-
+          cache-${{ runner.os }}-
+
+    - name: Run recommender
+      env:
+        TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+        OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
+        IMDB_USER_ID: ${{ vars.IMDB_USER_ID }}
+        IMDB_RATINGS_CSV_PATH: data/ratings.csv
+        REGION: US
+        LANGUAGE: en-US
+        ORIGINAL_LANGS: en
+        SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
+        TMDB_PAGES_MOVIE: 200
+        TMDB_PAGES_TV: 200
+        MAX_CATALOG: 20000
+        INCLUDE_TV_SEASONS: true
+        SKIP_WINDOW_DAYS: 4
+        CACHE_DIR: data/cache
+        CACHE_TTL_SECS: 604800
+      run: |
+        mkdir -p data/debug
+        python -m engine.runner 2>&1 | tee data/debug/runner.log
