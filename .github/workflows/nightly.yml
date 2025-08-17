@@ -14,18 +14,12 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
-      # NEW: pass your IMDb user id secret (e.g. ur1234567)
       IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
-      # (Optional) comma-separated public list IDs to exclude too, e.g. ls012345678,ls098765432
-      # IMDB_LIST_IDS: ${{ secrets.IMDB_LIST_IDS }}
-
       REGION: US
       ORIGINAL_LANGS: en
       SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
-      MIN_MATCH_CUT: 58.0
-      # Control how many TMDB Discover pages to fetch each run
-      DISCOVER_PAGES: 3
-
+      MIN_MATCH_CUT: "58"
+      DISCOVER_PAGES: "3"
     steps:
       - uses: actions/checkout@v4
 
@@ -44,7 +38,12 @@ jobs:
           set -e
           python -m engine.runner
 
-      # Upload outputs + caches/state to help diagnose runs
+      - name: Create debug pack
+        if: always()
+        run: |
+          python -m engine.debug_pack
+          ls -lh data/out/latest || true
+
       - name: Upload artifacts (outputs + debug/state)
         if: always()
         uses: actions/upload-artifact@v4
@@ -53,33 +52,14 @@ jobs:
           if-no-files-found: warn
           compression-level: 6
           path: |
-            # Primary outputs
             data/out/latest
-            # Personalization state (genre weights, profile snapshots, etc.)
             data/cache/state/personal_state.json
             data/cache/state/personal_history.json
-            # Persistent item enrichment pool
             data/cache/state/persistent_pool.json
-            # Feedback memory (downvotes / skips) if present
             data/cache/feedback
-            # TMDB + IMDb request caches (for source verification / debugging)
             data/cache/tmdb
             data/cache/imdb
-
-      # Build an extra debug bundle (zip) from the data directory
-      - name: Pack debug-data.zip
-        if: always()
-        run: |
-          set -e
-          python -m engine.debug_pack || true
-
-      - name: Upload debug-data.zip
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-data
-          if-no-files-found: warn
-          path: data/out/latest/debug-data.zip
+            data/user/ratings.csv
 
       - name: Add summary to run
         if: always()
@@ -110,17 +90,14 @@ jobs:
             BODY="$(cat data/out/latest/summary.md)"
           fi
 
-          # find open issue by title
           ISSUE_NUMBER=$(gh api -X GET repos/${{ github.repository }}/issues --paginate -q \
             '.[] | select(.state=="open" and .title=="'"$TITLE"'") | .number' | head -n1)
 
-          # create if missing
           if [ -z "$ISSUE_NUMBER" ]; then
             ISSUE_NUMBER=$(gh api -X POST repos/${{ github.repository }}/issues \
               -f title="$TITLE" -f body="Tracking thread for daily recommendation digests." -q '.number')
           fi
 
-          # post comment
           gh api -X POST repos/${{ github.repository }}/issues/$ISSUE_NUMBER/comments \
             -f body="$BODY" >/dev/null
 
