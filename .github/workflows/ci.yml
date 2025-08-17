@@ -1,13 +1,12 @@
 name: ci
 
 on:
-  # manual runs only; no push/PR triggers -> no notifications
   workflow_dispatch:
 
 jobs:
   lint:
     runs-on: ubuntu-24.04
-    continue-on-error: true  # even if lint fails, do not fail the run
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
