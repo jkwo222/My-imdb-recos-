@@ -1,79 +1,68 @@
 # engine/feed.py
 from __future__ import annotations
+import json, os, time, pathlib, random
+from typing import Any, Dict, List, Tuple
+from .recency import should_skip, mark_shown
 
-import json
-import os
-from datetime import datetime
-from typing import List, Dict, Any, Tuple
+JSON = Dict[str, Any]
+OUT_LATEST = pathlib.Path("data/out/latest/assistant_feed.json")
 
+def _now_datestr() -> str:
+    import datetime as _dt
+    return _dt.datetime.utcnow().strftime("%Y-%m-%d")
 
-def _title(it: Dict[str, Any]) -> str:
-    return it.get("title") or it.get("name") or ""
+def _ensure_dirs(dst_path: pathlib.Path) -> None:
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
 
+def _diversify(rows: List[JSON], max_per_provider: int = 6, max_per_genre: int = 8) -> List[JSON]:
+    by_provider: Dict[str, int] = {}
+    by_genre: Dict[str, int] = {}
+    out: List[JSON] = []
+    for r in rows:
+        provs = r.get("providers") or []
+        genres = [g.lower() for g in (r.get("genres") or [])]
+        # pick a single canonical provider key for quota (first if multiple)
+        key = (provs[0] if provs else "unknown")
+        if by_provider.get(key, 0) >= max_per_provider:
+            continue
+        # genre quotas (apply to each genre)
+        if any(by_genre.get(g, 0) >= max_per_genre for g in genres):
+            continue
+        out.append(r)
+        by_provider[key] = by_provider.get(key, 0) + 1
+        for g in set(genres):
+            by_genre[g] = by_genre.get(g, 0) + 1
+        if len(out) >= 50:
+            break
+    return out
 
-def _year(it: Dict[str, Any]) -> int | None:
-    return it.get("release_year") or it.get("first_air_year")
+def _apply_recency(rows: List[JSON]) -> List[JSON]:
+    fresh = [r for r in rows if not should_skip(r.get("imdb_id","") or r.get("title",""))]
+    # If recency pruned too hard, fall back to originals
+    return fresh if len(fresh) >= 20 else rows
 
+def build_and_write_feed(ranked: List[JSON]) -> Tuple[List[JSON], pathlib.Path]:
+    # Remove super-low confidence
+    rows = [r for r in ranked if (r.get("match") or 0) >= 60.0]
+    rows = _apply_recency(rows)
+    rows = _diversify(rows, max_per_provider=6, max_per_genre=8)
 
-def _poster(it: Dict[str, Any]) -> str | None:
-    # keep it generic; your catalog builder likely sets poster_path
-    p = it.get("poster_path")
-    if not p:
-        return None
-    # TMDB image base is usually added on the consumer side; keep path only
-    return p
-
-
-def _as_feed_item(it: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "id": it.get("id"),
-        "media_type": it.get("media_type") or ("tv" if it.get("first_air_date") else "movie"),
-        "title": _title(it),
-        "year": _year(it),
-        "overview": it.get("overview"),
-        "genres": [g.get("name") for g in (it.get("genres") or []) if isinstance(g, dict) and g.get("name")],
-        "vote_average": it.get("vote_average"),
-        "vote_count": it.get("vote_count"),
-        "poster_path": _poster(it),
-        "providers": it.get("watch_providers"),  # if catalog injected this
-        "_score": it.get("_score"),
+    # Write latest + dated
+    _ensure_dirs(OUT_LATEST)
+    payload = {
+        "generated_at": int(time.time()),
+        "count": len(rows),
+        "items": rows,
     }
+    with OUT_LATEST.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
+    dated = pathlib.Path(f"data/out/daily/{_now_datestr()}/assistant_feed.json")
+    _ensure_dirs(dated)
+    with dated.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
-def build_feed(
-    ranked: List[Dict[str, Any]],
-    cfg,
-    catalog_meta: Dict[str, Any],
-    rank_meta: Dict[str, Any],
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Pick top N ranked as the daily feed and write artifacts to:
-      - {out_dir}/latest/assistant_feed.json
-      - {out_dir}/daily/YYYY-MM-DD/assistant_feed.json
-    """
-    n = max(1, int(cfg.show_n))
-    top = [_as_feed_item(x) for x in ranked[:n]]
+    # mark recency
+    mark_shown([r.get("imdb_id","") for r in rows])
 
-    today = datetime.utcnow().date().isoformat()
-    daily_dir = os.path.join(cfg.out_dir, "daily", today)
-    os.makedirs(daily_dir, exist_ok=True)
-
-    feed = {
-        "date": today,
-        "count": len(top),
-        "items": top,
-        "weights": {"critic": cfg.weight_critic, "audience": cfg.weight_audience},
-        "meta": {
-            "catalog": catalog_meta or {},
-            "ranking": rank_meta or {},
-        },
-    }
-
-    latest_path = os.path.join(cfg.latest_dir, "assistant_feed.json")
-    daily_path = os.path.join(daily_dir, "assistant_feed.json")
-
-    for path in [latest_path, daily_path]:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(feed, f, indent=2, ensure_ascii=False)
-
-    return top, {"latest_path": latest_path, "daily_path": daily_path}
+    return rows, dated
