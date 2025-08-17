@@ -12,22 +12,17 @@ def _fmt_services(svcs: List[str]) -> str:
 def _reason(it: Dict) -> str:
     bits = []
     if it.get("match_score") is not None:
-        bits.append(f"high match score ({round(float(it['match_score']), 1)})")
-    if it.get("imdb_rating"):
-        bits.append(f"strong IMDb ({it['imdb_rating']:.1f})")
-    if it.get("tmdb_vote"):
-        bits.append(f"good TMDB ({it['tmdb_vote']:.1f})")
-    # add anything your scorer put on the item
+        bits.append(f"{round(float(it['match_score']))}/100")
     if it.get("why"):
         bits.append(str(it["why"]))
-    return "; ".join(bits) or "fits your taste profile"
+    return " · ".join(bits) if bits else "fits your taste profile"
 
 def _row(it: Dict) -> str:
     title = it.get("title", "Untitled")
     year = it.get("year") or ""
     t = f"{title} ({year})" if year else title
     score = it.get("match_score")
-    score_s = f"{round(float(score),1)}" if score is not None else "—"
+    score_s = f"{round(float(score))}/100" if score is not None else "—"
     services = _fmt_services(it.get("providers") or [])
     imdb = it.get("imdb_rating")
     imdb_s = f"{imdb:.1f}" if isinstance(imdb, (int, float)) and imdb > 0 else "—"
@@ -37,7 +32,6 @@ def _row(it: Dict) -> str:
     return f"| {t} | {score_s} | {services} | {imdb_s} | {tmdb_s} | {why} |"
 
 def _top(items: List[Dict], typ: str, n: int = 10) -> List[Dict]:
-    # robust sort by match_score desc, then imdb/tmdb as tiebreakers
     def key(it):
         return (
             float(it.get("match_score") or 0.0),
@@ -47,7 +41,22 @@ def _top(items: List[Dict], typ: str, n: int = 10) -> List[Dict]:
     return [it for it in sorted((i for i in items if (i.get("type") or "").startswith(typ)),
                                 key=key, reverse=True)][:n]
 
-def write_summary_md(env: Dict[str, str] | None = None) -> pathlib.Path:
+def _taste_section(genre_weights: Dict[str, float]) -> List[str]:
+    if not genre_weights:
+        return []
+    items = sorted(genre_weights.items(), key=lambda kv: kv[1], reverse=True)
+    top = [g for g, _ in items[:6]]
+    bottom = [g for g, _ in sorted(items, key=lambda kv: kv[1])[:4]]
+    lines = []
+    lines.append("\n### Your taste profile (by genres)\n")
+    lines.append("_Learned from your IMDb ratings; higher = stronger preference._\n")
+    if top:
+        lines.append(f"**You lean toward:** {', '.join(top)}\n")
+    if bottom:
+        lines.append(f"**You usually avoid:** {', '.join(bottom)}\n")
+    return lines
+
+def write_summary_md(env: Dict[str, str] | None = None, *, genre_weights: Dict[str, float] | None = None) -> pathlib.Path:
     env = env or os.environ
     out_json = OUT_DIR / "assistant_feed.json"
     out_md = OUT_DIR / "summary.md"
@@ -56,13 +65,12 @@ def write_summary_md(env: Dict[str, str] | None = None) -> pathlib.Path:
         out_md.write_text("_No results produced._\n", encoding="utf-8")
         return out_md
 
-    data = json.loads(out_json.read_text(encoding="utf-8"))
-
-    items: List[Dict] = data.get("items") or data if isinstance(data, list) else []
-    telemetry: Dict = data.get("telemetry") or {}
+    payload = json.loads(out_json.read_text(encoding="utf-8"))
+    items: List[Dict] = payload.get("items") or payload if isinstance(payload, list) else []
+    telemetry: Dict = payload.get("telemetry") or {}
 
     movies = _top(items, "movie", 10)
-    series = _top(items, "tv", 10) + _top(items, "tvSeries", 10)  # be lenient with types
+    series = _top(items, "tv", 10) + _top(items, "tvSeries", 10)
     series = series[:10]
 
     subs = (env.get("SUBS_INCLUDE") or "").split(",")
@@ -80,6 +88,9 @@ def write_summary_md(env: Dict[str, str] | None = None) -> pathlib.Path:
     if subs:
         lines.append(f"_Services considered:_ {', '.join(subs)}\n")
 
+    # Taste profile section
+    lines.extend(_taste_section(genre_weights or {}))
+
     def section(title: str, rows: List[Dict]):
         lines.append(f"\n## {title}\n")
         if not rows:
@@ -93,12 +104,12 @@ def write_summary_md(env: Dict[str, str] | None = None) -> pathlib.Path:
     section("Top 10 Movies (best matches)", movies)
     section("Top 10 Series (best matches)", series)
 
-    # Basic telemetry dump at the bottom for debugging/historical record
     if telemetry:
         lines.append("\n<details>\n<summary>Telemetry</summary>\n\n")
         lines.append("```json\n" + json.dumps(telemetry, indent=2) + "\n```\n")
         lines.append("</details>\n")
 
+    OUT_DIR.write_bytes(b"")  # ensure dir exists
     content = "".join(lines).rstrip() + "\n"
     out_md.write_text(content, encoding="utf-8")
     return out_md
