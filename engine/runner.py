@@ -15,11 +15,15 @@ from .self_check import run_self_check
 
 # Optional scoring pieces (keep the import loose so runner still finishes if scoring changes)
 try:
-    from .scoring import load_seen_index, filter_unseen, score_items
-except Exception:  # pragma: no cover
+    from .scoring import score_items  # type: ignore
+except Exception:
+    score_items = None  # type: ignore
+
+try:
+    from .exclusions import load_seen_index, filter_unseen  # type: ignore
+except Exception:
+    filter_unseen = None  # type: ignore
     load_seen_index = None  # type: ignore
-    filter_unseen = None    # type: ignore
-    score_items = None      # type: ignore
 
 OUT_ROOT = Path("data/out")
 CACHE_ROOT = Path("data/cache")
@@ -49,7 +53,9 @@ def _stamp_last_run(run_dir: Path) -> None:
             shutil.rmtree(latest, ignore_errors=True)
 
     try:
-        latest.symlink_to(run_dir, target_is_directory=True)
+        from os import path as _osp
+        target_rel = _osp.relpath(run_dir.resolve(), OUT_ROOT.resolve())
+        latest.symlink_to(target_rel, target_is_directory=True)
     except Exception:
         import shutil
         shutil.copytree(run_dir, latest)
@@ -87,11 +93,23 @@ def _env_from_os() -> Env:
     else:
         subs_list = [x.strip() for x in raw_subs.split(",") if x.strip()]
 
-    # DISCOVER_PAGES
-    try:
-        pages = int(os.getenv("DISCOVER_PAGES", "12").strip())
-    except Exception:
-        pages = 12
+    # DISCOVER_PAGES (supports legacy TMDB_PAGES_MOVIE/TV)
+    pages_env = os.getenv("DISCOVER_PAGES", "").strip()
+    if not pages_env:
+        # Legacy compatibility
+        movie_pages = os.getenv("TMDB_PAGES_MOVIE", "").strip()
+        tv_pages = os.getenv("TMDB_PAGES_TV", "").strip()
+        # Choose the larger to approximate prior behavior
+        try:
+            candidates = [int(x) for x in [movie_pages, tv_pages] if x]
+            pages = max(candidates) if candidates else 12
+        except Exception:
+            pages = 12
+    else:
+        try:
+            pages = int(pages_env)
+        except Exception:
+            pages = 12
 
     # ---- permanent sanity checks ----
     if pages < 1:
@@ -167,6 +185,32 @@ def main() -> None:
     # Build Env
     env = _env_from_os()
 
+    # Validate critical environment
+    missing_hard = []
+    if not os.getenv("TMDB_API_KEY"):
+        missing_hard.append("TMDB_API_KEY")
+    if missing_hard:
+        msg = f"[env] Missing required environment: {', '.join(missing_hard)}. Set these and re-run."
+        _log(msg)
+        # Write a minimal diag detailing the problem
+        try:
+            _safe_json_dump(diag_path, {"error": msg, "missing": missing_hard})
+        except Exception:
+            pass
+        sys.exit(2)
+
+    # Soft warnings
+    soft_warnings = []
+    if not os.getenv("OMDB_API_KEY"):
+        soft_warnings.append("OMDB_API_KEY (ratings enrichment may be limited)")
+    ratings_csv_1 = Path("data/user/ratings.csv")
+    ratings_csv_2 = Path("data/ratings.csv")
+    if not os.getenv("IMDB_USER_ID") and not ratings_csv_1.exists() and not ratings_csv_2.exists():
+        soft_warnings.append("IMDB_USER_ID and ratings.csv missing (unseen filtering disabled)")
+
+    for w in soft_warnings:
+        _log(f"[env] WARN: {w}")
+
     # Discover pool
     _log(" | catalog:begin")
     try:
@@ -200,9 +244,8 @@ def main() -> None:
                 ratings_csv = Path("data/ratings.csv")
             if ratings_csv.exists():
                 try:
-                    seen_idx = load_seen_index(str(ratings_csv))  # type: ignore
                     ratings_source = str(ratings_csv)
-                    # seen_idx also carries some hidden keys; this is a hint only
+                    seen_idx = load_seen_index(ratings_csv)  # type: ignore
                     seen_count_hint = sum(1 for k, v in seen_idx.items() if isinstance(k, str) and k.startswith("tt"))
                     _log(f"[scoring] loaded ratings from {ratings_source} (~{seen_count_hint} imdb ids)")
                 except Exception as sx:
@@ -218,31 +261,17 @@ def main() -> None:
         if callable(score_items):
             ranked = score_items(env, final_list)  # type: ignore
         else:
-            # Fallback trivial ranking if scoring not wired; sort by TMDB vote_average desc
-            ranked = list(final_list)
+            ranked = final_list
 
-        # Decide cut (keep compatibility with prior format)
-        def _get_match(d: Dict[str, Any]) -> float:
-            v = d.get("match")
-            if isinstance(v, (int, float)):
-                return float(v)
-            va = d.get("vote_average")
-            try:
-                return float(va) * 10.0 if va is not None else 0.0
-            except Exception:
-                return 0.0
+        # Cutoff and counters
+        try:
+            above_cut = sum(1 for it in ranked if float(it.get("score", 0.0)) >= 58.0)
+        except Exception:
+            above_cut = 0
 
-        ranked.sort(key=_get_match, reverse=True)
-        above_cut = sum(1 for r in ranked if _get_match(r) >= 58.0)
-
-        # Persist enriched/scored lists
+        # Persist outputs
         _safe_json_dump(run_dir / "items.enriched.json", ranked)
         _safe_json_dump(run_dir / "assistant_feed.json", ranked)
-
-        # Summary
-        env["DISCOVERED_COUNT"] = discovered
-        env["ELIGIBLE_COUNT"] = eligible
-        env["ABOVE_CUT_COUNT"] = above_cut
         (run_dir / "summary.md").write_text(_summarize(ranked, env), encoding="utf-8")
 
     except Exception as ex:
@@ -269,14 +298,7 @@ def main() -> None:
                 "SUBS_INCLUDE": env.get("SUBS_INCLUDE", []),
                 "DISCOVER_PAGES": env.get("DISCOVER_PAGES", 0),
             },
-            "telemetry": {
-                "discovered": discovered,
-                "eligible": eligible,
-                "above_cut": above_cut,
-            },
-            "ratings_source": ratings_source,
-            "ratings_imdb_id_count_hint": seen_count_hint,
-            "files": {
+            "paths": {
                 "assistant_feed": str((run_dir / "assistant_feed.json").resolve()),
                 "items_discovered": str((run_dir / "items.discovered.json").resolve()),
                 "items_enriched": str((run_dir / "items.enriched.json").resolve()),
