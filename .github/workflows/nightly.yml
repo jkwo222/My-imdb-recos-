@@ -1,23 +1,19 @@
-name: Nightly Recs
+name: nightly
 
 on:
-  workflow_dispatch: {}
   schedule:
-    - cron: "32 0 * * *"  # adjust as you like
-
-# Prevent overlapping runs on the same branch/ref.
-concurrency:
-  group: imdb-recos-${{ github.ref }}
-  cancel-in-progress: true
+    - cron: "0 2 * * *"   # run nightly at 02:00 UTC (change if you like)
+  workflow_dispatch:       # allow manual runs
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -27,17 +23,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run
+      # 👇 Quick, masked sanity check so you can see in logs that secrets are present
+      - name: Sanity-check secrets in env
         env:
           TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+          OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
+        run: |
+          echo "TMDB_API_KEY present? $([ -n "${TMDB_API_KEY}" ] && echo yes || echo no)"
+          echo "OMDB_API_KEY present? $([ -n "${OMDB_API_KEY}" ] && echo yes || echo no)"
+
+      - name: Run recommender
+        env:
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+          OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
           REGION: US
           ORIGINAL_LANGS: en
           SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
         run: |
           python -m engine.runner
 
-      - name: Upload artifacts (optional)
+      - name: Upload latest output
         uses: actions/upload-artifact@v4
         with:
           name: out
           path: data/out/latest
+          if-no-files-found: warn
