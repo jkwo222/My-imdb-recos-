@@ -1,84 +1,79 @@
+# engine/feed.py
 from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Tuple
+from datetime import datetime
+from typing import List, Dict, Any, Tuple
 
 
-def _out_dir_daily(meta: Dict[str, Any]) -> str:
-    # caller can set this; otherwise default into YYYY-MM-DD under /data/out/daily
-    day = meta.get("day") or meta.get("date") or ""
-    d = os.path.join("data", "out", "daily", str(day) if day else "")
-    os.makedirs(d, exist_ok=True)
-    return d
+def _title(it: Dict[str, Any]) -> str:
+    return it.get("title") or it.get("name") or ""
 
 
-def _out_dir_latest() -> str:
-    d = os.path.join("data", "out", "latest")
-    os.makedirs(d, exist_ok=True)
-    return d
+def _year(it: Dict[str, Any]) -> int | None:
+    return it.get("release_year") or it.get("first_air_year")
 
 
-def _write_json(path: str, data: Any) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def _poster(it: Dict[str, Any]) -> str | None:
+    # keep it generic; your catalog builder likely sets poster_path
+    p = it.get("poster_path")
+    if not p:
+        return None
+    # TMDB image base is usually added on the consumer side; keep path only
+    return p
 
 
-def _write_text(path: str, text: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
-
-
-def _mk_table(top: List[Dict[str, Any]], n: int) -> str:
-    lines = ["| # | Title | Year | Type | Match |",
-             "|---:|---|---:|---|---:|"]
-    for i, it in enumerate(top[:n], 1):
-        lines.append(f"| {i} | {it.get('title','')} | {it.get('year') or ''} | {it.get('type')} | {round(float(it.get('match',0.0)),2)} |")
-    return "\n".join(lines)
-
-
-def build_feed_document(
-    ranked: List[Dict[str, Any]],
-    *,
-    shortlist_size: int,
-    shown_count: int,
-    pool_size: int,
-    unseen_count: int,
-    day_stamp: str,
-) -> Dict[str, Any]:
-    shortlist = ranked[:shortlist_size]
-    shown = shortlist[:shown_count]
-
-    md = []
-    md.append(f"# Nightly Recommendations — {day_stamp}")
-    md.append("")
-    md.append(f"**Pool:** {pool_size}  •  **Unseen:** {unseen_count}  •  **Shortlist:** {shortlist_size}  •  **Shown:** {shown_count}")
-    md.append("")
-    md.append("## Top 10")
-    md.append("")
-    md.append(_mk_table(shortlist, min(shown_count, 10)))
-    md_str = "\n".join(md)
-
+def _as_feed_item(it: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "meta": {
-            "pool": pool_size,
-            "unseen": unseen_count,
-            "shortlist": shortlist_size,
-            "shown": shown_count,
-            "day": day_stamp,
-        },
-        "shortlist": shortlist,
-        "shown": shown,
-        "top_markdown": md_str,
+        "id": it.get("id"),
+        "media_type": it.get("media_type") or ("tv" if it.get("first_air_date") else "movie"),
+        "title": _title(it),
+        "year": _year(it),
+        "overview": it.get("overview"),
+        "genres": [g.get("name") for g in (it.get("genres") or []) if isinstance(g, dict) and g.get("name")],
+        "vote_average": it.get("vote_average"),
+        "vote_count": it.get("vote_count"),
+        "poster_path": _poster(it),
+        "providers": it.get("watch_providers"),  # if catalog injected this
+        "_score": it.get("_score"),
     }
 
 
-def write_feed(feed_doc: Dict[str, Any], meta: Dict[str, Any]) -> None:
-    latest_dir = _out_dir_latest()
-    _write_json(os.path.join(latest_dir, "assistant_feed.json"), feed_doc)
-    _write_text(os.path.join(latest_dir, "assistant_feed.md"), feed_doc.get("top_markdown") or "")
+def build_feed(
+    ranked: List[Dict[str, Any]],
+    cfg,
+    catalog_meta: Dict[str, Any],
+    rank_meta: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Pick top N ranked as the daily feed and write artifacts to:
+      - {out_dir}/latest/assistant_feed.json
+      - {out_dir}/daily/YYYY-MM-DD/assistant_feed.json
+    """
+    n = max(1, int(cfg.show_n))
+    top = [_as_feed_item(x) for x in ranked[:n]]
 
-    # Optional dated output
-    daily_dir = _out_dir_daily(feed_doc.get("meta", {}))
-    _write_json(os.path.join(daily_dir, "assistant_feed.json"), feed_doc)
-    _write_text(os.path.join(daily_dir, "assistant_feed.md"), feed_doc.get("top_markdown") or "")
+    today = datetime.utcnow().date().isoformat()
+    daily_dir = os.path.join(cfg.out_dir, "daily", today)
+    os.makedirs(daily_dir, exist_ok=True)
+
+    feed = {
+        "date": today,
+        "count": len(top),
+        "items": top,
+        "weights": {"critic": cfg.weight_critic, "audience": cfg.weight_audience},
+        "meta": {
+            "catalog": catalog_meta or {},
+            "ranking": rank_meta or {},
+        },
+    }
+
+    latest_path = os.path.join(cfg.latest_dir, "assistant_feed.json")
+    daily_path = os.path.join(daily_dir, "assistant_feed.json")
+
+    for path in [latest_path, daily_path]:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(feed, f, indent=2, ensure_ascii=False)
+
+    return top, {"latest_path": latest_path, "daily_path": daily_path}
