@@ -1,191 +1,84 @@
-# engine/feed.py
 from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
-
-# ----------------------------
-# Public API
-# ----------------------------
-
-def write_feed(cfg, ranked: List[dict], meta: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Create the final feed JSONs:
-      - data/out/daily/YYYY-MM-DD/assistant_feed.json
-      - data/out/latest/assistant_feed.json
-
-    Inputs
-    ------
-    cfg:
-      - shortlist_size (int) default 50
-      - shown_size (int) default 10
-      - out_dir (str) default "data/out"
-    ranked: list as returned by rank.rank_candidates(...)
-    meta: optional metadata dict
-
-    Returns
-    -------
-    payload (dict) that was written to JSON
-    """
-    shortlist_size = int(getattr(cfg, "shortlist_size", 50))
-    shown_size = int(getattr(cfg, "shown_size", 10))
-    out_root = getattr(cfg, "out_dir", "data/out")
-
-    shortlist = ranked[:shortlist_size]
-    shown = ranked[:shown_size]
-
-    # Structure a friendly payload for UI/consumption
-    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-    payload = {
-        "generated_at": now,
-        "counts": {
-            "ranked": len(ranked),
-            "shortlist": len(shortlist),
-            "shown": len(shown),
-        },
-        "weights": _extract_weights_from_items(ranked),
-        "items": [
-            _present_item(it, rank=i + 1)
-            for i, it in enumerate(shortlist)
-        ],
-        "meta": meta or {},
-    }
-
-    # Paths
-    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    daily_dir = os.path.join(out_root, "daily", date_str)
-    latest_dir = os.path.join(out_root, "latest")
-
-    os.makedirs(daily_dir, exist_ok=True)
-    os.makedirs(latest_dir, exist_ok=True)
-
-    # Write files
-    daily_path = os.path.join(daily_dir, "assistant_feed.json")
-    latest_path = os.path.join(latest_dir, "assistant_feed.json")
-
-    _write_json(payload, daily_path)
-    _write_json(payload, latest_path)
-
-    # Convenience returns
-    return {
-        "payload": payload,
-        "paths": {"daily": daily_path, "latest": latest_path},
-    }
+from typing import Any, Dict, List, Tuple
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
+def _out_dir_daily(meta: Dict[str, Any]) -> str:
+    # caller can set this; otherwise default into YYYY-MM-DD under /data/out/daily
+    day = meta.get("day") or meta.get("date") or ""
+    d = os.path.join("data", "out", "daily", str(day) if day else "")
+    os.makedirs(d, exist_ok=True)
+    return d
 
-def _write_json(obj: dict, path: str):
+
+def _out_dir_latest() -> str:
+    d = os.path.join("data", "out", "latest")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _write_json(path: str, data: Any) -> None:
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def _extract_weights_from_items(items: List[dict]) -> Dict[str, float]:
-    # Pull any one item's feature keys as hints; not strictly necessary
-    if not items:
-        return {}
-    f = items[0].get("features") or {}
-    # We only expose keys; the actual weights live in rank.py and cfg
-    return {k: float(f.get(k, 0.0)) for k in sorted(f.keys())}
+def _write_text(path: str, text: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
 
 
-def _present_item(it: dict, rank: int) -> dict:
-    """Flatten an item into a UI-friendly record with reasons."""
-    title = it.get("title") or it.get("name") or ""
-    year = _year_of(it)
-    display_title = f"{title} ({year})" if year else title
+def _mk_table(top: List[Dict[str, Any]], n: int) -> str:
+    lines = ["| # | Title | Year | Type | Match |",
+             "|---:|---|---:|---|---:|"]
+    for i, it in enumerate(top[:n], 1):
+        lines.append(f"| {i} | {it.get('title','')} | {it.get('year') or ''} | {it.get('type')} | {round(float(it.get('match',0.0)),2)} |")
+    return "\n".join(lines)
 
-    providers = _providers_flat(it)
-    genres = _genres_flat(it)
-    media_type = it.get("media_type") or ("movie" if "release_date" in it else "tv")
+
+def build_feed_document(
+    ranked: List[Dict[str, Any]],
+    *,
+    shortlist_size: int,
+    shown_count: int,
+    pool_size: int,
+    unseen_count: int,
+    day_stamp: str,
+) -> Dict[str, Any]:
+    shortlist = ranked[:shortlist_size]
+    shown = shortlist[:shown_count]
+
+    md = []
+    md.append(f"# Nightly Recommendations — {day_stamp}")
+    md.append("")
+    md.append(f"**Pool:** {pool_size}  •  **Unseen:** {unseen_count}  •  **Shortlist:** {shortlist_size}  •  **Shown:** {shown_count}")
+    md.append("")
+    md.append("## Top 10")
+    md.append("")
+    md.append(_mk_table(shortlist, min(shown_count, 10)))
+    md_str = "\n".join(md)
 
     return {
-        "rank": rank,
-        "media_type": media_type,
-        "tmdb_id": it.get("id"),
-        "title": display_title,
-        "score": round(float(it.get("score", 0.0)), 2),
-        "features": it.get("features", {}),
-        "reasons": it.get("reasons", []),
-        "genres": genres,
-        "providers": providers,
-        "popularity": it.get("popularity"),
-        "vote_average": it.get("vote_average"),
-        "vote_count": it.get("vote_count"),
-        "original_language": it.get("original_language"),
-        "release_date": it.get("release_date") or it.get("first_air_date"),
-        "poster_path": it.get("poster_path"),
-        "backdrop_path": it.get("backdrop_path"),
-        "tmdb_url": _tmdb_url(media_type, it.get("id")),
+        "meta": {
+            "pool": pool_size,
+            "unseen": unseen_count,
+            "shortlist": shortlist_size,
+            "shown": shown_count,
+            "day": day_stamp,
+        },
+        "shortlist": shortlist,
+        "shown": shown,
+        "top_markdown": md_str,
     }
 
 
-def _tmdb_url(kind: str, idv: Any) -> Optional[str]:
-    if not idv:
-        return None
-    base = "https://www.themoviedb.org"
-    if kind == "movie":
-        return f"{base}/movie/{idv}"
-    if kind == "tv":
-        return f"{base}/tv/{idv}"
-    return None
+def write_feed(feed_doc: Dict[str, Any], meta: Dict[str, Any]) -> None:
+    latest_dir = _out_dir_latest()
+    _write_json(os.path.join(latest_dir, "assistant_feed.json"), feed_doc)
+    _write_text(os.path.join(latest_dir, "assistant_feed.md"), feed_doc.get("top_markdown") or "")
 
-
-def _year_of(it: dict) -> Optional[int]:
-    date = it.get("release_date") or it.get("first_air_date") or ""
-    if not date:
-        return None
-    try:
-        y = int(str(date)[:4])
-        return y
-    except Exception:
-        return None
-
-
-def _providers_flat(it: dict) -> List[str]:
-    names = []
-    for key in ("providers", "watch/providers", "watch_providers", "providers_flatrate", "providers_ads", "providers_free"):
-        v = it.get(key)
-        if isinstance(v, dict):
-            for bucket in ("flatrate", "ads", "free"):
-                arr = v.get(bucket)
-                if isinstance(arr, list):
-                    for p in arr:
-                        name = (p.get("provider_name") or p.get("name") or "").strip()
-                        if name:
-                            names.append(name)
-        elif isinstance(v, list):
-            for p in v:
-                name = (p.get("provider_name") or p.get("name") or "").strip()
-                if name:
-                    names.append(name)
-    # dedupe, keep order
-    seen = set()
-    out = []
-    for n in names:
-        if n and n not in seen:
-            out.append(n)
-            seen.add(n)
-    return out
-
-
-def _genres_flat(it: dict) -> List[str]:
-    names = []
-    if isinstance(it.get("genres"), list) and it["genres"] and isinstance(it["genres"][0], dict):
-        names = [str(g.get("name", "")).strip() for g in it["genres"] if g]
-    elif isinstance(it.get("genre_ids"), list):
-        # We don’t have the mapping here; leave numeric IDs as strings
-        names = [str(x) for x in it["genre_ids"]]
-    # dedupe, keep order
-    seen = set()
-    out = []
-    for n in names:
-        if n and n not in seen:
-            out.append(n)
-            seen.add(n)
-    return out
+    # Optional dated output
+    daily_dir = _out_dir_daily(feed_doc.get("meta", {}))
+    _write_json(os.path.join(daily_dir, "assistant_feed.json"), feed_doc)
+    _write_text(os.path.join(daily_dir, "assistant_feed.md"), feed_doc.get("top_markdown") or "")
