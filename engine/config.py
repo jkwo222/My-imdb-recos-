@@ -2,110 +2,148 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict
 
 
-# Map your simple slugs -> TMDB watch provider IDs (US region).
-# Source: TMDB provider list (common ones). You can add more if needed.
-_PROVIDER_MAP_US: Dict[str, int] = {
-    "netflix": 8,
-    "prime_video": 9,
-    "hulu": 15,
-    "disney_plus": 337,
-    "max": 384,             # formerly HBO Max
-    "apple_tv_plus": 350,
-    "peacock": 386,
-    "paramount_plus": 531,
-    # aliases (optional)
-    "amazon": 9,
-    "amazon_prime": 9,
-    "disney+": 337,
-    "hbomax": 384,
-    "max_hbo": 384,
-    "atv+": 350,
-}
-
-
-def _get_bool(env_name: str, default: bool) -> bool:
-    raw = os.getenv(env_name)
-    if raw is None:
+def _as_bool(v: Any, default: bool = False) -> bool:
+    if v is None:
         return default
-    return raw.strip().lower() in ("1", "true", "yes", "y", "on")
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    return s in ("1", "true", "yes", "y", "on")
 
 
-def _split_csv(env_name: str) -> List[str]:
-    raw = os.getenv(env_name, "")
-    if not raw.strip():
-        return []
-    return [p.strip().lower() for p in raw.split(",") if p.strip()]
+def _as_int(v: Any, default: int) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
 
 
-@dataclass
 class Config:
-    # API keys
-    tmdb_api_key: str
-    omdb_api_key: Optional[str] = None
+    """
+    Simple config holder that can be constructed from environment variables.
+    - Attribute access: cfg.key
+    - Mapping access:   cfg["key"], cfg.get("key", default)
+    """
 
-    # IMDB / ratings input
-    imdb_user_id: Optional[str] = None
-    imdb_ratings_csv_path: Optional[str] = None
+    # Defaults used if no environment value is present
+    _DEFAULTS: Dict[str, Any] = {
+        # discovery & region/language
+        "region": "US",
+        "original_langs": "en",
+        "subs_include": "netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus",
 
-    # discovery constraints
-    region: str = "US"
-    original_langs: List[str] = field(default_factory=lambda: ["en"])
-    with_original_language: Optional[str] = None  # derived from original_langs
-    include_tv_seasons: bool = True
+        # TMDB discovery sweep sizes
+        "tmdb_pages_movie": 24,
+        "tmdb_pages_tv": 24,
 
-    # providers
-    provider_slugs: List[str] = field(default_factory=list)  # from SUBS_INCLUDE
-    provider_ids: List[int] = field(default_factory=list)    # mapped via _PROVIDER_MAP_US
+        # Catalog / selection behavior
+        "max_catalog": 10000,
+        "include_tv_seasons": True,
+        "skip_window_days": 4,
 
-    # pagination / limits
-    tmdb_pages_movie: int = 24
-    tmdb_pages_tv: int = 24
-    max_catalog: int = 10_000
-    skip_window_days: int = 4
+        # Ranking weights (used by _rank)
+        "critic_weight": 0.5,
+        "audience_weight": 0.5,
+    }
 
-    # ranking weights (keep defaults; tweak later if you want)
-    critic_weight: float = 0.5
-    audience_weight: float = 0.5
+    # Mapping of ENV -> internal key
+    _ENV_MAP: Dict[str, str] = {
+        # region/language/providers
+        "REGION": "region",
+        "ORIGINAL_LANGS": "original_langs",
+        "SUBS_INCLUDE": "subs_include",
 
-    @staticmethod
-    def from_env() -> "Config":
-        tmdb_key = os.getenv("TMDB_API_KEY", "")
-        if not tmdb_key:
-            raise RuntimeError("TMDB_API_KEY is required")
+        # sweep sizes
+        "TMDB_PAGES_MOVIE": "tmdb_pages_movie",
+        "TMDB_PAGES_TV": "tmdb_pages_tv",
 
-        # languages
-        langs = _split_csv("ORIGINAL_LANGS") or ["en"]
-        with_orig = ",".join(langs)
+        # behavior toggles/limits
+        "MAX_CATALOG": "max_catalog",
+        "INCLUDE_TV_SEASONS": "include_tv_seasons",
+        "SKIP_WINDOW_DAYS": "skip_window_days",
 
-        # providers
-        slugs = _split_csv("SUBS_INCLUDE")
-        ids: List[int] = []
-        for s in slugs:
-            if s in _PROVIDER_MAP_US:
-                ids.append(_PROVIDER_MAP_US[s])
-            else:
-                # you can add a print if you want to see unknown slugs in logs
-                pass
+        # ranking weights
+        "CRITIC_WEIGHT": "critic_weight",
+        "AUDIENCE_WEIGHT": "audience_weight",
+    }
 
-        return Config(
-            tmdb_api_key=tmdb_key,
-            omdb_api_key=os.getenv("OMDB_API_KEY") or None,
-            imdb_user_id=os.getenv("IMDB_USER_ID") or None,
-            imdb_ratings_csv_path=os.getenv("IMDB_RATINGS_CSV_PATH") or None,
-            region=os.getenv("REGION", "US"),
-            original_langs=langs,
-            with_original_language=with_orig,
-            include_tv_seasons=_get_bool("INCLUDE_TV_SEASONS", True),
-            provider_slugs=slugs,
-            provider_ids=ids,
-            tmdb_pages_movie=int(os.getenv("TMDB_PAGES_MOVIE", "24")),
-            tmdb_pages_tv=int(os.getenv("TMDB_PAGES_TV", "24")),
-            max_catalog=int(os.getenv("MAX_CATALOG", "10000")),
-            skip_window_days=int(os.getenv("SKIP_WINDOW_DAYS", "4")),
-            critic_weight=float(os.getenv("CRITIC_WEIGHT", "0.5")),
-            audience_weight=float(os.getenv("AUDIENCE_WEIGHT", "0.5")),
-        )
+    # Which keys should be cast to which types
+    _CASTERS: Dict[str, Any] = {
+        "tmdb_pages_movie": _as_int,
+        "tmdb_pages_tv": _as_int,
+        "max_catalog": _as_int,
+        "skip_window_days": _as_int,
+        "include_tv_seasons": _as_bool,
+        # weights can arrive as str or float; coerce to float if possible
+        "critic_weight": float,
+        "audience_weight": float,
+    }
+
+    def __init__(self, data: Dict[str, Any]):
+        # merge defaults with provided data
+        merged = dict(self._DEFAULTS)
+        merged.update(data or {})
+        # final type normalization
+        for k, caster in self._CASTERS.items():
+            if k in merged:
+                try:
+                    if caster is float:
+                        merged[k] = float(merged[k])
+                    else:
+                        # custom caster like _as_int/_as_bool
+                        merged[k] = caster(merged[k], self._DEFAULTS.get(k))  # type: ignore
+                except Exception:
+                    # fall back to default if cast fails
+                    merged[k] = self._DEFAULTS.get(k)
+        self._d = merged
+
+    # --- construction helpers ---
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        """
+        Build Config from process environment (plus defaults).
+        Only whitelisted env vars are read via _ENV_MAP.
+        """
+        data: Dict[str, Any] = {}
+        for env_key, cfg_key in cls._ENV_MAP.items():
+            if env_key in os.environ:
+                data[cfg_key] = os.environ[env_key]
+
+        # Also accept already-normalized keys present in env (advanced use)
+        # e.g., export tmdb_pages_movie=12
+        for k in list(os.environ.keys()):
+            kk = k.strip().lower()
+            if kk in cls._DEFAULTS and kk not in data:
+                data[kk] = os.environ[k]
+
+        return cls(data)
+
+    # --- dict-like API ---
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dict(self._d)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._d.get(key, default)
+
+    def __getitem__(self, key: str) -> Any:
+        return self._d[key]
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._d
+
+    # --- attribute API ---
+
+    def __getattr__(self, key: str) -> Any:
+        try:
+            return self._d[key]
+        except KeyError as e:
+            # surface the real missing attribute name
+            raise AttributeError(key) from e
+
+    def __repr__(self) -> str:
+        return f"Config({self._d!r})"
