@@ -15,10 +15,10 @@ jobs:
     env:
       PYTHONUTF8: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
-      REGION: "US"
+      REGION: US
       ORIGINAL_LANGS: '["en"]'
       DISCOVER_PAGES: "12"
-      SUBS_INCLUDE: "netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus"
+      SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
       IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
       TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
 
@@ -50,38 +50,32 @@ jobs:
           if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
 
       - name: Run engine
-        id: run
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p data/out data/cache
-          echo "PYTHON_VERSION=$(python -V 2>&1)" >> "$GITHUB_ENV"
+          echo "PYTHON_VERSION=$(python -V 2>&1)"
           python -m engine.runner
           echo "RUN_DONE=1" >> "$GITHUB_OUTPUT"
-          if [[ -f data/out/last_run_dir.txt ]]; then
-            run_dir="$(< data/out/last_run_dir.txt)"
-            echo "RUN_DIR=${run_dir}" >> "$GITHUB_OUTPUT"
-          else
-            echo "RUN_DIR=" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Stamp last run marker (fallback)
-        if: steps.run.outputs.RUN_DIR == ''
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p data/out
-          if compgen -G "data/out/run_*" > /dev/null; then
-            latest_dir="$(ls -dt data/out/run_* | head -n1)"
-            printf '%s\n' "$latest_dir" > data/out/last_run_dir.txt
-            rm -rf data/out/latest || true
-            ln -s "$latest_dir" data/out/latest 2>/dev/null || cp -r "$latest_dir" data/out/latest
-            echo "Stamped last_run_dir.txt with: $latest_dir"
-          else
-            echo "WARNING: no run_* dirs found; nothing to stamp"
+          if [ ! -f data/out/last_run_dir.txt ]; then
+            if compgen -G "data/out/run_*" > /dev/null; then
+              latest_dir="$(ls -dt data/out/run_* | head -n1)"
+              printf '%s\n' "$latest_dir" > data/out/last_run_dir.txt
+              echo "Stamped last_run_dir.txt with: $latest_dir"
+            else
+              echo "WARNING: no run_* dirs found; nothing to stamp"
+            fi
           fi
 
+      # *** IMPORTANT CHANGE: copy to a real directory instead of using a symlink ***
       - name: Prepare latest dir for upload
+        id: prep_upload
         shell: bash
         run: |
           set -euo pipefail
@@ -94,16 +88,31 @@ jobs:
             echo "No run_* directories found under data/out"
             exit 0
           fi
-          rm -rf data/out/latest || true
-          ln -s "$latest_dir" data/out/latest 2>/dev/null || cp -r "$latest_dir" data/out/latest
+
+          # Make a real directory with the contents
+          upload_dir="data/out/_latest_upload"
+          rm -rf "$upload_dir"
+          mkdir -p "$upload_dir"
+          # Copy contents (including dotfiles) without nesting an extra folder level
+          shopt -s dotglob nullglob
+          cp -a "${latest_dir}/"* "$upload_dir/" 2>/dev/null || true
+          shopt -u dotglob nullglob
+
           echo "Latest run directory: $latest_dir"
-          ls -al "data/out/latest" || true
+          echo "Upload directory: $upload_dir"
+          echo "upload_dir=$upload_dir" >> "$GITHUB_OUTPUT"
+
+          echo "Listing upload dir:"
+          ls -al "$upload_dir" || true
+          echo "File count:"
+          find "$upload_dir" -type f | wc -l || true
 
       - name: Upload site artifact
+        if: steps.prep_upload.outputs.upload_dir
         uses: actions/upload-artifact@v4
         with:
           name: site-out
-          path: data/out/latest
+          path: ${{ steps.prep_upload.outputs.upload_dir }}
           if-no-files-found: warn
           retention-days: 7
 
@@ -115,20 +124,24 @@ jobs:
           rm -rf debug-bundle
           mkdir -p debug-bundle
 
-          # 1) Copy primary outputs if present
-          if [ -d "data/out/latest" ]; then
-            cp -f data/out/latest/runner.log            debug-bundle/ 2>/dev/null || true
-            cp -f data/out/latest/assistant_feed.json   debug-bundle/ 2>/dev/null || true
-            cp -f data/out/latest/items.discovered.json debug-bundle/ 2>/dev/null || true
-            cp -f data/out/latest/items.enriched.json   debug-bundle/ 2>/dev/null || true
-            cp -f data/out/latest/summary.md            debug-bundle/ 2>/dev/null || true
-            cp -f data/out/latest/diag.json             debug-bundle/ 2>/dev/null || true
-            if [ -f data/out/latest/runner.log ]; then
-              tail -n 200 data/out/latest/runner.log > debug-bundle/runner-tail.txt || true
+          # Prefer the real upload directory; fall back to symlink if present
+          src_dir="data/out/_latest_upload"
+          if [ ! -d "$src_dir" ]; then
+            src_dir="data/out/latest"
+          fi
+
+          if [ -d "$src_dir" ]; then
+            cp -f "$src_dir/runner.log"            debug-bundle/ 2>/dev/null || true
+            cp -f "$src_dir/assistant_feed.json"   debug-bundle/ 2>/dev/null || true
+            cp -f "$src_dir/items.discovered.json" debug-bundle/ 2>/dev/null || true
+            cp -f "$src_dir/items.enriched.json"   debug-bundle/ 2>/dev/null || true
+            cp -f "$src_dir/summary.md"            debug-bundle/ 2>/dev/null || true
+            cp -f "$src_dir/diag.json"             debug-bundle/ 2>/dev/null || true
+            if [ -f "$src_dir/runner.log" ]; then
+              tail -n 200 "$src_dir/runner.log" > debug-bundle/runner-tail.txt || true
             fi
           fi
 
-          # 2) Minimal env snapshot
           {
             echo "REGION=${REGION}"
             echo "SUBS_INCLUDE=${SUBS_INCLUDE}"
@@ -136,7 +149,6 @@ jobs:
             echo "DISCOVER_PAGES=${DISCOVER_PAGES}"
           } > debug-bundle/env.txt
 
-          # 3) Sanitized full env
           {
             printenv | sort | sed \
               -e 's/\(AUTH\|TOKEN\|SECRET\|PASSWORD\|KEY\)=.*/\1=***REDACTED***/I' \
@@ -153,7 +165,6 @@ jobs:
             fi
           } > debug-bundle/env-sanitized.txt
 
-          # 4) Repo tree + detailed listing (GNU find is available on ubuntu runners)
           {
             echo "# REPO TREE (find .)"
             find . -mindepth 1 -maxdepth 6 -printf "%y %M %u %g %9s %TY-%Tm-%Td %TT %p\n" 2>/dev/null | sort || true
@@ -162,7 +173,6 @@ jobs:
             ls -alR || true
           } > debug-bundle/tree.txt
 
-          # 5) Symlink targets
           {
             echo "# SYMLINK TARGETS"
             echo "data/out/latest -> $(readlink -f data/out/latest 2>/dev/null || echo '<not a symlink or missing>')"
@@ -173,7 +183,6 @@ jobs:
             fi
           } > debug-bundle/links.txt
 
-          # 6) Git context
           {
             echo "# git rev"
             git log -1 --oneline || true
@@ -185,7 +194,6 @@ jobs:
             git remote -v || true
           } > debug-bundle/git.txt
 
-          # 7) Python environment
           {
             echo "# Python info"
             which python || true
@@ -195,7 +203,6 @@ jobs:
             pip freeze || true
           } > debug-bundle/python.txt
 
-          # 8) Directory sizes & free space
           {
             echo "# sizes"
             du -sh . 2>/dev/null || true
@@ -206,10 +213,12 @@ jobs:
             df -h . || true
           } > debug-bundle/dirs.txt
 
-          # 9) Focus listings
           {
             echo "# data/out (top)"
             ls -al data/out 2>/dev/null || true
+            echo
+            echo "# data/out/_latest_upload (top)"
+            ls -al data/out/_latest_upload 2>/dev/null || true
             echo
             echo "# data/out/latest (top)"
             ls -al data/out/latest 2>/dev/null || true
@@ -221,12 +230,10 @@ jobs:
             ls -al data/cache/tmdb 2>/dev/null || true
           } > debug-bundle/listings.txt
 
-          # 10) Zip up
           (cd debug-bundle && zip -q -r ../debug-data.zip .) || true
           ls -lh debug-data.zip || true
 
       - name: Upload debug artifact
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: debug-data
