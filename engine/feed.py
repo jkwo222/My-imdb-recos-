@@ -30,7 +30,6 @@ def _providers_set(item) -> set:
     return { _slugify(p) for p in prov }
 
 def filter_by_providers(pool: List[Dict], allowed: List[str]) -> List[Dict]:
-    """Keep items available on at least one of the allowed provider slugs."""
     if not allowed: return []
     allowed_set = { _slugify(s) for s in allowed }
     out = []
@@ -40,58 +39,44 @@ def filter_by_providers(pool: List[Dict], allowed: List[str]) -> List[Dict]:
     return out
 
 def _pick_critic(item: Dict) -> float:
-    """
-    Return critic score in 0..1 if available, else fall back to tmdb_vote.
-    Accepts any of: rt_rating (0..100), critic (0..1), tmdb_vote (0..10)
-    """
     if isinstance(item.get("rt_rating"), (int, float)) and item["rt_rating"] > 0:
         return float(item["rt_rating"]) / 100.0
-    if isinstance(item.get("critic"), (int, float)) and item["critic"] > 0 and item["critic"] <= 1.0:
+    if isinstance(item.get("critic"), (int, float)) and 0 < item["critic"] <= 1.0:
         return float(item["critic"])
     if isinstance(item.get("tmdb_vote"), (int, float)) and item["tmdb_vote"] > 0:
         return float(item["tmdb_vote"]) / 10.0
     return 0.0
 
 def _pick_audience(item: Dict) -> float:
-    """
-    Return audience score in 0..1 if available, else fall back to tmdb_vote.
-    Accepts any of: imdb_rating (0..10), audience (0..1), tmdb_vote (0..10)
-    """
     if isinstance(item.get("imdb_rating"), (int, float)) and item["imdb_rating"] > 0:
         return float(item["imdb_rating"]) / 10.0
-    if isinstance(item.get("audience"), (int, float)) and item["audience"] > 0 and item["audience"] <= 1.0:
+    if isinstance(item.get("audience"), (int, float)) and 0 < item["audience"] <= 1.0:
         return float(item["audience"])
     if isinstance(item.get("tmdb_vote"), (int, float)) and item["tmdb_vote"] > 0:
         return float(item["tmdb_vote"]) / 10.0
     return 0.0
 
 def _commitment_penalty(item: Dict, scale: float) -> float:
-    """Light penalty for multi-season series to reflect time commitment."""
     t = (item.get("type") or "").strip()
     if t != "tvSeries": 
         return 0.0
     seasons = int(item.get("seasons") or 1)
-    if seasons >= 3:
-        return 0.09 * scale   # ~9 points
-    if seasons == 2:
-        return 0.04 * scale   # ~4 points
+    if seasons >= 3: return 0.09 * scale
+    if seasons == 2: return 0.04 * scale
     return 0.0
 
 def score_items(items: List[Dict], weights: Dict[str, float]) -> List[Dict]:
-    """
-    Compute a 55..98 'match' score using critic/audience and a commitment penalty.
-    """
     cw = float(weights.get("critic_weight", 0.35))
     aw = float(weights.get("audience_weight", 0.65))
     cc = float(weights.get("commitment_cost_scale", 1.0))
-    base_anchor = 0.60  # anchor around 60 points baseline
+    base_anchor = 0.60
     out = []
     for it in items:
         critic = _pick_critic(it)
         audience = _pick_audience(it)
         raw = cw * critic + aw * audience
         penalty = _commitment_penalty(it, cc)
-        s = base_anchor + 0.20 * max(0.0, raw - penalty)  # → 0.60..0.80, then scale to 60..80
+        s = base_anchor + 0.20 * max(0.0, raw - penalty)
         match = round(max(55.0, min(98.0, s * 100.0)), 1)
         x = dict(it)
         x["match"] = match
@@ -103,7 +88,6 @@ def score_items(items: List[Dict], weights: Dict[str, float]) -> List[Dict]:
 def _why(item: Dict) -> str:
     sp = item.get("_score_parts") or {}
     prov = ", ".join(sorted(_providers_set(item))) or "—"
-    # format ratings in human-friendly units
     critic_pct = int(round(100.0 * float(sp.get("critic", 0.0))))
     audience_10 = round(10.0 * float(sp.get("audience", 0.0)), 1)
     bits = []
@@ -122,25 +106,17 @@ def top10_by_type(scored: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
 
 def to_markdown(movies: List[Dict], series: List[Dict], weights: Dict[str, float], meta: Dict) -> str:
     def rowfmt(r: Dict) -> str:
-        why = _why(r)
         yr = f" ({r.get('year')})" if r.get("year") else ""
-        return f"- **{r.get('title','?')}{yr}** — {r.get('match',0)}\n  - {why}"
+        return f"- **{r.get('title','?')}{yr}** — {r.get('match',0)}\n  - {_why(r)}"
     lines = []
     lines.append("# Daily Recommendations")
     lines.append("")
     lines.append("## Top 10 Movies")
-    if movies:
-        lines.extend([rowfmt(r) for r in movies])
-    else:
-        lines.append("_No movie picks today._")
+    lines.extend([rowfmt(r) for r in movies] or ["_No movie picks today._"])
     lines.append("")
     lines.append("## Top 10 Series")
-    if series:
-        lines.extend([rowfmt(r) for r in series])
-    else:
-        lines.append("_No series picks today._")
+    lines.extend([rowfmt(r) for r in series] or ["_No series picks today._"])
     lines.append("")
-    # Telemetry
     lines.append("## Telemetry")
     lines.append(f"- Pool sizes: {meta.get('pool_sizes')}")
     lines.append(f"- Weights: {weights}")
