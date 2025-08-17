@@ -19,8 +19,6 @@ jobs:
       ORIGINAL_LANGS: '["en"]'
       DISCOVER_PAGES: "12"
       SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
-      # Tell the engine where your ratings live (your repo layout)
-      RATINGS_CSV_PATH: data/user/ratings.csv
       IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
       TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
 
@@ -56,11 +54,10 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p data/out data/cache
-          echo "PYTHON_VERSION=$(python -V 2>&1)" >> "$GITHUB_ENV"
+          echo "PYTHON_VERSION=$(python -V 2>&1)" >> $GITHUB_ENV
           python -m engine.runner
           echo "RUN_DONE=1" >> "$GITHUB_OUTPUT"
 
-      # Make sure we have a last_run_dir marker and a *copy* in data/out/latest
       - name: Stamp last run marker (fallback)
         shell: bash
         run: |
@@ -70,13 +67,15 @@ jobs:
             if compgen -G "data/out/run_*" > /dev/null; then
               latest_dir="$(ls -dt data/out/run_* | head -n1)"
               printf '%s\n' "$latest_dir" > data/out/last_run_dir.txt
+              rm -rf data/out/latest
+              ln -s "$latest_dir" data/out/latest 2>/dev/null || cp -r "$latest_dir" data/out/latest
               echo "Stamped last_run_dir.txt with: $latest_dir"
             else
               echo "WARNING: no run_* dirs found; nothing to stamp"
             fi
           fi
 
-      - name: Prepare latest dir for upload (copy, not symlink)
+      - name: Prepare latest dir for upload
         shell: bash
         run: |
           set -euo pipefail
@@ -90,9 +89,8 @@ jobs:
             exit 0
           fi
           rm -rf data/out/latest
-          # Copy to avoid symlink upload issues
-          cp -r "$latest_dir" "data/out/latest"
-          echo "Latest run directory (copied): $latest_dir"
+          ln -s "$latest_dir" data/out/latest 2>/dev/null || cp -r "$latest_dir" data/out/latest
+          echo "Latest run directory: $latest_dir"
           ls -al "data/out/latest" || true
 
       - name: Upload site artifact
@@ -103,37 +101,33 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Bundle debug data (as directory, not zip)
+      - name: Bundle debug data
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf debug-data
-          mkdir -p debug-data
+          rm -f debug-data.zip
+          rm -rf debug-bundle
+          mkdir -p debug-bundle
 
-          # 1) Copy primary outputs if present
           if [ -d "data/out/latest" ]; then
-            cp -f data/out/latest/runner.log            debug-data/ 2>/dev/null || true
-            cp -f data/out/latest/assistant_feed.json   debug-data/ 2>/dev/null || true
-            cp -f data/out/latest/items.discovered.json debug-data/ 2>/dev/null || true
-            cp -f data/out/latest/items.enriched.json   debug-data/ 2>/dev/null || true
-            cp -f data/out/latest/summary.md            debug-data/ 2>/dev/null || true
-            cp -f data/out/latest/diag.json             debug-data/ 2>/dev/null || true
-            # Tail of runner.log for quick view
+            cp -f data/out/latest/runner.log            debug-bundle/ 2>/dev/null || true
+            cp -f data/out/latest/assistant_feed.json   debug-bundle/ 2>/dev/null || true
+            cp -f data/out/latest/items.discovered.json debug-bundle/ 2>/dev/null || true
+            cp -f data/out/latest/items.enriched.json   debug-bundle/ 2>/dev/null || true
+            cp -f data/out/latest/summary.md            debug-bundle/ 2>/dev/null || true
+            cp -f data/out/latest/diag.json             debug-bundle/ 2>/dev/null || true
             if [ -f data/out/latest/runner.log ]; then
-              tail -n 200 data/out/latest/runner.log > debug-data/runner-tail.txt || true
+              tail -n 200 data/out/latest/runner.log > debug-bundle/runner-tail.txt || true
             fi
           fi
 
-          # 2) Minimal env snapshot
           {
             echo "REGION=${REGION}"
             echo "SUBS_INCLUDE=${SUBS_INCLUDE}"
             echo "ORIGINAL_LANGS=${ORIGINAL_LANGS}"
             echo "DISCOVER_PAGES=${DISCOVER_PAGES}"
-            echo "RATINGS_CSV_PATH=${RATINGS_CSV_PATH}"
-          } > debug-data/env.txt
+          } > debug-bundle/env.txt
 
-          # 3) Sanitized full env
           {
             printenv | sort | sed \
               -e 's/\(AUTH\|TOKEN\|SECRET\|PASSWORD\|KEY\)=.*/\1=***REDACTED***/I' \
@@ -148,33 +142,26 @@ jobs:
             else
               echo "HINT_IMDB_USER_ID_SET=0"
             fi
-          } > debug-data/env-sanitized.txt
+          } > debug-bundle/env-sanitized.txt
 
-          # 4) Repo tree + detailed listing
           {
             echo "# REPO TREE (find .)"
             find . -mindepth 1 -maxdepth 6 -printf "%y %M %u %g %9s %TY-%Tm-%Td %TT %p\n" 2>/dev/null | sort || true
             echo
             echo "# DETAILED LISTING (ls -lR)"
             ls -alR || true
-          } > debug-data/tree.txt
+          } > debug-bundle/tree.txt
 
-          # 5) Symlink targets (should be copies now, but record anyway)
           {
             echo "# SYMLINK TARGETS"
-            if [ -L data/out/latest ]; then
-              echo "data/out/latest is a symlink to -> $(readlink -f data/out/latest 2>/dev/null || echo '<unresolvable>')"
-            else
-              echo "data/out/latest is a directory (copied)"
-            fi
+            echo "data/out/latest -> $(readlink -f data/out/latest 2>/dev/null || echo '<not a symlink or missing>')"
             if [ -f data/out/last_run_dir.txt ]; then
               echo "last_run_dir: $(cat data/out/last_run_dir.txt)"
             else
               echo "last_run_dir: <missing>"
             fi
-          } > debug-data/links.txt
+          } > debug-bundle/links.txt
 
-          # 6) Git context
           {
             echo "# git rev"
             git log -1 --oneline || true
@@ -184,9 +171,8 @@ jobs:
             echo
             echo "# git remotes"
             git remote -v || true
-          } > debug-data/git.txt
+          } > debug-bundle/git.txt
 
-          # 7) Python environment
           {
             echo "# Python info"
             which python || true
@@ -194,9 +180,8 @@ jobs:
             echo
             echo "# pip freeze"
             pip freeze || true
-          } > debug-data/python.txt
+          } > debug-bundle/python.txt
 
-          # 8) Directory sizes & free space
           {
             echo "# sizes"
             du -sh . 2>/dev/null || true
@@ -205,9 +190,8 @@ jobs:
             echo
             echo "# df (filesystem free space)"
             df -h . || true
-          } > debug-data/dirs.txt
+          } > debug-bundle/dirs.txt
 
-          # 9) Focus listings
           {
             echo "# data/out (top)"
             ls -al data/out 2>/dev/null || true
@@ -220,12 +204,43 @@ jobs:
             echo
             echo "# data/cache/tmdb (top)"
             ls -al data/cache/tmdb 2>/dev/null || true
-          } > debug-data/listings.txt
+          } > debug-bundle/listings.txt
+
+          (cd debug-bundle && zip -q -r ../debug-data.zip .) || true
+          ls -lh debug-data.zip || true
 
       - name: Upload debug artifact
         uses: actions/upload-artifact@v4
         with:
           name: debug-data
-          path: debug-data
+          path: debug-data.zip
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Bundle full repo snapshot
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          SNAP_DIR="repo-snapshot"
+          rm -rf "$SNAP_DIR" repo-snapshot.zip
+          mkdir -p "$SNAP_DIR"
+          rsync -a \
+            --exclude '.git/' \
+            --exclude '__pycache__/' \
+            --exclude '.mypy_cache/' \
+            --exclude 'debug-bundle/' \
+            --exclude 'repo-snapshot/' \
+            --exclude '*.zip' \
+            ./ "$SNAP_DIR/"
+          (cd "$SNAP_DIR" && zip -q -r ../repo-snapshot.zip .)
+          ls -lh repo-snapshot.zip || true
+
+      - name: Upload repo snapshot artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo-snapshot
+          path: repo-snapshot.zip
           if-no-files-found: warn
           retention-days: 14
