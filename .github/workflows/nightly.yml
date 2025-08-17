@@ -1,125 +1,126 @@
 name: nightly
 
 on:
-  schedule:
-    - cron: "17 9 * * *"
   workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * *" # run daily at 04:17 UTC (adjust as you like)
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Engine configuration
+  REGION: US
+  ORIGINAL_LANGS: '["en"]'   # keep quotes so YAML passes a JSON array string
+  DISCOVER_PAGES: 12         # adjust if you want more/less discovery pages
+  SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
+
+  # Python quality of life
+  PYTHONUTF8: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        attempt: [1, 2, 3, 4, 5, 6, 7]
-    env:
-      PYTHONUTF8: "1"
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
-      REGION: US
-      ORIGINAL_LANGS: '["en"]'
-      # Expand # of TMDB pages searched each run
-      DISCOVER_PAGES: "12"
-      SUBS_INCLUDE: "netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus"
-      IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
-      TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
-
+    name: build
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          check-latest: false
 
-      - name: Cache pip
+      - name: pip cache
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: "pip-${{ runner.os }}-py311-${{ hashFiles('**/requirements*.txt') }}"
+          key: pip-${{ runner.os }}-py311-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
           restore-keys: |
             pip-${{ runner.os }}-py311-
 
-      - name: Install deps
+      - name: Install dependencies
+        shell: bash
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
 
-      - name: Run pipeline (attempt ${{ matrix.attempt }})
-        id: run
+      - name: Run engine
         shell: bash
+        env:
+          TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
+          IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }} # optional; can be unset
         run: |
           set -euxo pipefail
           mkdir -p data/out data/cache
           python -m engine.runner
-          echo "RUN_DONE=1" >> "$GITHUB_OUTPUT"
+          # keep only last 5 run_* directories to avoid repo bloat
+          if compgen -G "data/out/run_*" > /dev/null; then
+            ls -dt data/out/run_* | tail -n +6 | xargs -r rm -rf --
+          fi
 
-      - name: Prepare 'latest' folder
-        if: always()
+      # ---------- B) Marker-based latest copy (robust & simple) ----------
+      - name: Pin latest run folder (marker-based)
         shell: bash
         run: |
           set -euo pipefail
-          if compgen -G "data/out/run_*" > /dev/null; then
-            latest_dir="$(ls -dt data/out/run_* | head -n1)"
+          if [[ -f data/out/last_run_dir.txt ]]; then
+            run_dir="$(< data/out/last_run_dir.txt)"
+            echo "Last run: ${run_dir}"
             rm -rf data/out/latest
-            mkdir -p data/out
-            cp -r "$latest_dir" "data/out/latest"
-            echo "Latest run directory: $latest_dir"
-            ls -al "data/out/latest" || true
+            cp -r "${run_dir}" data/out/latest
+            echo "data/out/latest contents:"
+            ls -al data/out/latest || true
           else
-            echo "No run_* directories found under data/out"
+            echo "ERROR: Marker data/out/last_run_dir.txt not found."
+            echo "Existing data/out layout:"
+            find data/out -maxdepth 2 -type d -print || true
+            exit 1
           fi
 
-      - name: Build compact debug artifact
-        if: always()
+      # Upload the “site” output (whatever your publisher expects to consume)
+      - name: Upload site artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: site-out-${{ github.run_number }}
+          path: data/out/latest
+          if-no-files-found: error
+          retention-days: 7
+
+      # Small but useful debug bundle
+      - name: Build debug bundle
         shell: bash
         run: |
           set -euo pipefail
           rm -f debug-data.zip
           mkdir -p debug-bundle
-          if [ -d "data/out/latest" ]; then
-            cp -f data/out/latest/runner.log debug-bundle/ 2>/dev/null || true
-            cp -f data/out/latest/assistant_feed.json debug-bundle/ 2>/dev/null || true
-            cp -f data/out/latest/items.discovered.json debug-bundle/ 2>/dev/null || true
-            cp -f data/out/latest/items.enriched.json debug-bundle/ 2>/dev/null || true
-            cp -f data/out/latest/summary.md debug-bundle/ 2>/dev/null || true
-          fi
+          cp -f data/out/latest/runner.log                 debug-bundle/ || true
+          cp -f data/out/latest/assistant_feed.json        debug-bundle/ || true
+          cp -f data/out/latest/items.discovered.json      debug-bundle/ || true
+          cp -f data/out/latest/items.enriched.json        debug-bundle/ || true
+          cp -f data/out/latest/summary.md                 debug-bundle/ || true
+          cp -f data/out/last_run_dir.txt                  debug-bundle/ || true
+          # capture env snapshot for debugging
           {
             echo "REGION=${REGION}"
             echo "SUBS_INCLUDE=${SUBS_INCLUDE}"
             echo "ORIGINAL_LANGS=${ORIGINAL_LANGS}"
             echo "DISCOVER_PAGES=${DISCOVER_PAGES}"
           } > debug-bundle/env.txt
-          (cd debug-bundle && zip -q -r ../debug-data.zip .) || true
+          (cd debug-bundle && zip -q -r ../debug-data.zip .)
           ls -lh debug-data.zip || true
 
-      - name: Upload debug artifact (small)
-        if: always()
+      - name: Upload debug bundle
         uses: actions/upload-artifact@v4
         with:
-          name: debug-data-attempt-${{ matrix.attempt }}
+          name: debug-data-${{ github.run_number }}
           path: debug-data.zip
-          if-no-files-found: warn
           retention-days: 14
-
-      - name: Upload latest results (human-readable)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: site-out-attempt-${{ matrix.attempt }}
-          path: data/out/latest
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Cleanup old run folders
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          if compgen -G "data/out/run_*" > /dev/null; then
-            ls -dt data/out/run_* | tail -n +6 | xargs -r rm -rf --
-          fi
