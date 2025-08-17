@@ -36,13 +36,27 @@ jobs:
           set -e
           python -m engine.runner
 
-      - name: Upload artifacts
+      # ⬇️ Upload both outputs and key caches/state so we can diagnose runs
+      - name: Upload artifacts (outputs + debug/state)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: out
-          path: data/out/latest
           if-no-files-found: warn
+          compression-level: 6
+          path: |
+            # Primary outputs
+            data/out/latest
+            # Personalization state (genre weights, profile snapshots, etc.)
+            data/cache/state/personal_state.json
+            data/cache/state/personal_history.json
+            # Persistent item enrichment pool
+            data/cache/state/persistent_pool.json
+            # Feedback memory (downvotes / skips) if present
+            data/cache/feedback
+            # TMDB + IMDb request caches (for source verification / debugging)
+            data/cache/tmdb
+            data/cache/imdb
 
       - name: Add summary to run
         if: always()
