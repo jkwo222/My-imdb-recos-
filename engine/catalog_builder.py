@@ -1,82 +1,92 @@
 # engine/catalog_builder.py
 from __future__ import annotations
 from typing import Any, Dict, List, Tuple
-
 from .env import Env
-from .tmdb import (
-    providers_from_env,
-    discover_movie_page,
-    discover_tv_page,
-)
-from .rotation import plan_pages
+from . import tmdb
+from . import pool as pool_mod
 
-def _discover_pool(env: Env) -> Dict[str, Any]:
-    """
-    Build the raw discovery pool (movies + tv) from TMDB according to env.
-    Uses deterministic page rotation so you see a different slice over time.
-    """
-    # Support both attribute and dict-like access
-    region = getattr(env, "REGION", None) or env.get("REGION", "US")
-    langs = getattr(env, "ORIGINAL_LANGS", None) or env.get("ORIGINAL_LANGS", ["en"])
-    subs = getattr(env, "SUBS_INCLUDE", None) or env.get("SUBS_INCLUDE", [])
-    pages_req = int(getattr(env, "DISCOVER_PAGES", None) or env.get("DISCOVER_PAGES", 3))
-
-    # Optional rotation knobs
-    rotate_minutes = int(getattr(env, "ROTATE_MINUTES", None) or env.get("ROTATE_MINUTES", 180))
-    page_cap = int(getattr(env, "DISCOVER_PAGE_CAP", None) or env.get("DISCOVER_PAGE_CAP", 200))
-    step = int(getattr(env, "ROTATE_STEP", None) or env.get("ROTATE_STEP", 17))  # prime-ish step for spread
-
-    # Provider filter (accept list or CSV)
-    provider_ids = providers_from_env(subs, region) if subs else []
-
-    # Pages to hit this run (1-based)
-    pages = plan_pages(
-        pages_requested=pages_req,
-        step=step,
-        rotate_minutes=rotate_minutes,
-        cap=page_cap,
-    )
-
-    items: List[Dict[str, Any]] = []
-    errors: List[str] = []
-
-    for p in pages:
+def _attach_imdb_ids(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for it in items:
+        kind = it.get("media_type")
+        tid = int(it.get("tmdb_id") or 0)
+        if not tid or kind not in ("movie", "tv"):
+            out.append(it)
+            continue
         try:
-            movies, _ = discover_movie_page(
-                p,
-                region=region,
-                provider_ids=provider_ids,
-                original_langs=",".join(langs),
-            )
-            items.extend(movies)
-        except Exception as ex:
-            errors.append(f"discover_movie_page(p={p}): {ex!r}")
-
-        try:
-            shows, _ = discover_tv_page(
-                p,
-                region=region,
-                provider_ids=provider_ids,
-                original_langs=",".join(langs),
-            )
-            items.extend(shows)
-        except Exception as ex:
-            errors.append(f"discover_tv_page(p={p}): {ex!r}")
-
-    return {
-        "items": items,
-        "errors": errors,
-        "region": region,
-        "langs": langs,
-        "subs": subs,
-        "pages": pages,
-        "provider_ids": provider_ids,
-    }
+            ids = tmdb.get_external_ids(kind, tid)
+            imdb_id = ids.get("imdb_id")
+            if imdb_id:
+                it = dict(it)
+                it["imdb_id"] = imdb_id
+        except Exception:
+            pass
+        out.append(it)
+    return out
 
 
 def build_catalog(env: Env) -> List[Dict[str, Any]]:
     """
-    Public API used by runner.main(). Returns a flat list of items.
+    Build the candidate set *for this run*:
+      1) Discover pages for movie+tv with provider filters and langs.
+      2) Add trending (day+week).
+      3) Attach imdb_ids to support unseen filtering.
+      4) Persist to pool; then return (pool ∪ fresh) de-duped, newest-first.
+
+    NOTE: Filtering for "unseen" occurs later in runner via engine.exclusions.
     """
-    raw = _discover_pool(env)
-    return list(raw["items"])
+    region = env.get("REGION", "US")
+    langs = env.get("ORIGINAL_LANGS", ["en"])
+    subs = env.get("SUBS_INCLUDE", [])
+    pages = int(env.get("DISCOVER_PAGES", 12))
+
+    provider_ids, used_map = tmdb.providers_from_env(subs, region)
+    all_items: List[Dict[str, Any]] = []
+    diag_pages: List[Dict[str, Any]] = []
+
+    # Discover movie / tv
+    for kind in ("movie", "tv"):
+        for p in range(1, max(1, pages) + 1):
+            if kind == "movie":
+                items, d = tmdb.discover_movie_page(p, region, langs, provider_ids, slot=p % 3)
+            else:
+                items, d = tmdb.discover_tv_page(p, region, langs, provider_ids, slot=p % 3)
+            all_items.extend(items)
+            d["kind"] = kind
+            diag_pages.append(d)
+
+    # Trending
+    for period in ("day", "week"):
+        all_items.extend(tmdb.trending("movie", period))
+        all_items.extend(tmdb.trending("tv", period))
+
+    # De-dupe by (media_type, tmdb_id)
+    seen = set()
+    uniq: List[Dict[str, Any]] = []
+    for it in all_items:
+        key = (it.get("media_type"), int(it.get("tmdb_id") or 0))
+        if not key[1] or key in seen:
+            continue
+        uniq.append(it)
+        seen.add(key)
+
+    # Attach imdb_ids for unseen filtering
+    with_ids = _attach_imdb_ids(uniq)
+
+    # Persist to pool and return pool ∪ fresh (newest-first)
+    pool_mod.append_candidates(with_ids)
+    pool = pool_mod.load_pool(max_items=5000)
+
+    # Make newest-first by added_at, then tmdb vote
+    def _key_sort(it: Dict[str, Any]):
+        return (float(it.get("added_at") or 0.0), float(it.get("tmdb_vote") or 0.0))
+
+    combined = sorted(pool + with_ids, key=_key_sort, reverse=True)
+
+    # Attach basic diag to env so runner can summarize
+    env["DISCOVERED_COUNT"] = len(all_items)
+    env["ELIGIBLE_COUNT"] = len(combined)  # pre-exclusions
+    env["PROVIDER_MAP"] = used_map
+    env["DISCOVER_PAGE_TELEMETRY"] = diag_pages[:]
+
+    return combined
