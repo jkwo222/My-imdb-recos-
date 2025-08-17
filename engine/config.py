@@ -21,46 +21,63 @@ def _as_int(v: Any, default: int) -> int:
         return default
 
 
+def _as_float(v: Any, default: float) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 class Config:
     """
-    Simple config holder that can be constructed from environment variables.
-    - Attribute access: cfg.key
-    - Mapping access:   cfg["key"], cfg.get("key", default)
+    Config built from process environment with safe defaults, type casting,
+    alias handling, and both dict- & attribute-style access.
     """
 
-    # Defaults used if no environment value is present
+    # Sensible defaults
     _DEFAULTS: Dict[str, Any] = {
-        # discovery & region/language
+        # Region / language
         "region": "US",
+        "watch_region": None,            # will fall back to region
         "original_langs": "en",
+        "language": "en-US",
+        "with_original_language": None,  # will fall back to original_langs
+
+        # Providers / subscriptions
         "subs_include": "netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus",
 
         # TMDB discovery sweep sizes
         "tmdb_pages_movie": 24,
         "tmdb_pages_tv": 24,
 
-        # Catalog / selection behavior
+        # Catalog / behavior
         "max_catalog": 10000,
         "include_tv_seasons": True,
         "skip_window_days": 4,
 
-        # Ranking weights (used by _rank)
+        # Ranking weights
         "critic_weight": 0.5,
         "audience_weight": 0.5,
     }
 
-    # Mapping of ENV -> internal key
+    # Primary ENV → internal key mappings
     _ENV_MAP: Dict[str, str] = {
-        # region/language/providers
+        # region / language
         "REGION": "region",
+        "WATCH_REGION": "watch_region",
         "ORIGINAL_LANGS": "original_langs",
+        "LANGUAGE": "language",
+        "WITH_ORIGINAL_LANGUAGE": "with_original_language",
+
+        # providers
         "SUBS_INCLUDE": "subs_include",
+        "PROVIDER_NAMES": "subs_include",  # alias we accept
 
         # sweep sizes
         "TMDB_PAGES_MOVIE": "tmdb_pages_movie",
         "TMDB_PAGES_TV": "tmdb_pages_tv",
 
-        # behavior toggles/limits
+        # behavior
         "MAX_CATALOG": "max_catalog",
         "INCLUDE_TV_SEASONS": "include_tv_seasons",
         "SKIP_WINDOW_DAYS": "skip_window_days",
@@ -70,60 +87,68 @@ class Config:
         "AUDIENCE_WEIGHT": "audience_weight",
     }
 
-    # Which keys should be cast to which types
+    # Type casters
     _CASTERS: Dict[str, Any] = {
         "tmdb_pages_movie": _as_int,
         "tmdb_pages_tv": _as_int,
         "max_catalog": _as_int,
         "skip_window_days": _as_int,
         "include_tv_seasons": _as_bool,
-        # weights can arrive as str or float; coerce to float if possible
-        "critic_weight": float,
-        "audience_weight": float,
+        "critic_weight": _as_float,
+        "audience_weight": _as_float,
     }
 
     def __init__(self, data: Dict[str, Any]):
-        # merge defaults with provided data
         merged = dict(self._DEFAULTS)
         merged.update(data or {})
-        # final type normalization
+
+        # Backfills/aliases computed from other values
+        # watch_region defaults to region if unset
+        if not merged.get("watch_region"):
+            merged["watch_region"] = merged.get("region") or self._DEFAULTS["region"]
+
+        # with_original_language defaults to original_langs if unset
+        if not merged.get("with_original_language"):
+            merged["with_original_language"] = merged.get("original_langs") or self._DEFAULTS["original_langs"]
+
+        # Normalize types
         for k, caster in self._CASTERS.items():
-            if k in merged:
-                try:
-                    if caster is float:
-                        merged[k] = float(merged[k])
-                    else:
-                        # custom caster like _as_int/_as_bool
-                        merged[k] = caster(merged[k], self._DEFAULTS.get(k))  # type: ignore
-                except Exception:
-                    # fall back to default if cast fails
-                    merged[k] = self._DEFAULTS.get(k)
+            merged[k] = caster(merged.get(k), self._DEFAULTS.get(k))  # type: ignore[arg-type]
+
         self._d = merged
 
-    # --- construction helpers ---
+    # ---- construction helpers ----
 
     @classmethod
     def from_env(cls) -> "Config":
         """
-        Build Config from process environment (plus defaults).
-        Only whitelisted env vars are read via _ENV_MAP.
+        Build Config from whitelisted env vars and reasonable aliases.
+        Also accepts already-normalized snake_case keys in env (advanced use).
         """
         data: Dict[str, Any] = {}
+
+        # Primary mapping
         for env_key, cfg_key in cls._ENV_MAP.items():
             if env_key in os.environ:
                 data[cfg_key] = os.environ[env_key]
 
-        # Also accept already-normalized keys present in env (advanced use)
-        # e.g., export tmdb_pages_movie=12
-        for k in list(os.environ.keys()):
+        # Accept snake_case directly, e.g. export subs_include=...
+        for k, v in os.environ.items():
             kk = k.strip().lower()
             if kk in cls._DEFAULTS and kk not in data:
-                data[kk] = os.environ[k]
+                data[kk] = v
+
+        # Ensure REGION influences watch_region if WATCH_REGION missing
+        if "watch_region" not in data and "region" in data:
+            data["watch_region"] = data["region"]
+
+        # Ensure ORIGINAL_LANGS influences with_original_language if missing
+        if "with_original_language" not in data and "original_langs" in data:
+            data["with_original_language"] = data["original_langs"]
 
         return cls(data)
 
-    # --- dict-like API ---
-
+    # ---- mapping-like API ----
     def to_dict(self) -> Dict[str, Any]:
         return dict(self._d)
 
@@ -136,13 +161,11 @@ class Config:
     def __contains__(self, key: str) -> bool:
         return key in self._d
 
-    # --- attribute API ---
-
+    # ---- attribute API ----
     def __getattr__(self, key: str) -> Any:
         try:
             return self._d[key]
         except KeyError as e:
-            # surface the real missing attribute name
             raise AttributeError(key) from e
 
     def __repr__(self) -> str:
