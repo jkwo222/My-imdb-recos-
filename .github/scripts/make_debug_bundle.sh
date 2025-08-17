@@ -20,7 +20,7 @@ if [[ -d "data/out/latest" ]]; then
   cp -f data/out/latest/diag.json             "$BUNDLE_DIR/" 2>/dev/null || true
 fi
 
-# 2) Environment capture (minimal + sanitized full)
+# 2) Environment capture (minimal + sanitized presence of secrets)
 {
   echo "REGION=${REGION:-}"
   echo "SUBS_INCLUDE=${SUBS_INCLUDE:-}"
@@ -29,8 +29,7 @@ fi
 } > "$BUNDLE_DIR/env.txt"
 
 {
-  # redact secrets but show presence
-  for k in TMDB_API_KEY OMDB_API_KEY IMDB_USER_ID IMDB_RATINGS_CSV_PATH; do
+  for k in TMDB_API_KEY TMDB_BEARER OMDB_API_KEY IMDB_USER_ID IMDB_RATINGS_CSV_PATH; do
     v="${!k:-}"
     if [[ -n "${v}" ]]; then
       echo "$k=<set>"
@@ -38,7 +37,6 @@ fi
       echo "$k=<missing>"
     fi
   done
-  # dump a few useful vars verbatim
   echo "REGION=${REGION:-}"
   echo "SUBS_INCLUDE=${SUBS_INCLUDE:-}"
   echo "ORIGINAL_LANGS=${ORIGINAL_LANGS:-}"
