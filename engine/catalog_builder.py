@@ -1,6 +1,6 @@
 # engine/catalog_builder.py
 from __future__ import annotations
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from .env import Env
 from .tmdb import (
@@ -8,60 +8,60 @@ from .tmdb import (
     discover_movie_page,
     discover_tv_page,
 )
+from .rotation import plan_pages
 
 def _discover_pool(env: Env) -> Dict[str, Any]:
     """
     Build the raw discovery pool (movies + tv) from TMDB according to env.
+    Uses deterministic page rotation so you see a different slice over time.
     """
-    # Accept attribute-style and dict-style access
+    # Support both attribute and dict-like access
     region = getattr(env, "REGION", None) or env.get("REGION", "US")
     langs = getattr(env, "ORIGINAL_LANGS", None) or env.get("ORIGINAL_LANGS", ["en"])
     subs = getattr(env, "SUBS_INCLUDE", None) or env.get("SUBS_INCLUDE", [])
-    pages = int(getattr(env, "DISCOVER_PAGES", None) or env.get("DISCOVER_PAGES", 9))  # expanded pages per run
+    pages_req = int(getattr(env, "DISCOVER_PAGES", None) or env.get("DISCOVER_PAGES", 3))
 
-    provider_ids: List[int] = []
-    if subs:
-        try:
-            provider_ids = providers_from_env(subs, region)
-        except Exception as ex:
-            print(f"[catalog] providers_from_env({subs}, {region}) failed: {ex!r}", flush=True)
-            provider_ids = []
+    # Optional rotation knobs
+    rotate_minutes = int(getattr(env, "ROTATE_MINUTES", None) or env.get("ROTATE_MINUTES", 180))
+    page_cap = int(getattr(env, "DISCOVER_PAGE_CAP", None) or env.get("DISCOVER_PAGE_CAP", 200))
+    step = int(getattr(env, "ROTATE_STEP", None) or env.get("ROTATE_STEP", 17))  # prime-ish step for spread
 
-    use_provider_filter = len(provider_ids) > 0
-    if not use_provider_filter and subs:
-        print(f"[catalog] No provider IDs resolved for SUBS_INCLUDE={subs} in region={region}; "
-              f"falling back to unfiltered discovery.", flush=True)
+    # Provider filter (accept list or CSV)
+    provider_ids = providers_from_env(subs, region) if subs else []
+
+    # Pages to hit this run (1-based)
+    pages = plan_pages(
+        pages_requested=pages_req,
+        step=step,
+        rotate_minutes=rotate_minutes,
+        cap=page_cap,
+    )
 
     items: List[Dict[str, Any]] = []
     errors: List[str] = []
 
-    for p in range(1, pages + 1):
-        # Movies
+    for p in pages:
         try:
             movies, _ = discover_movie_page(
                 p,
                 region=region,
-                provider_ids=(provider_ids if use_provider_filter else None),
-                original_langs=langs,
+                provider_ids=provider_ids,
+                original_langs=",".join(langs),
             )
             items.extend(movies)
         except Exception as ex:
             errors.append(f"discover_movie_page(p={p}): {ex!r}")
 
-        # TV
         try:
             shows, _ = discover_tv_page(
                 p,
                 region=region,
-                provider_ids=(provider_ids if use_provider_filter else None),
-                original_langs=langs,
+                provider_ids=provider_ids,
+                original_langs=",".join(langs),
             )
             items.extend(shows)
         except Exception as ex:
             errors.append(f"discover_tv_page(p={p}): {ex!r}")
-
-    if errors:
-        print("[catalog] Discovery errors:\n  - " + "\n  - ".join(errors), flush=True)
 
     return {
         "items": items,
@@ -71,8 +71,8 @@ def _discover_pool(env: Env) -> Dict[str, Any]:
         "subs": subs,
         "pages": pages,
         "provider_ids": provider_ids,
-        "provider_filter": use_provider_filter,
     }
+
 
 def build_catalog(env: Env) -> List[Dict[str, Any]]:
     """
