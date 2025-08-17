@@ -1,67 +1,58 @@
 # engine/weights.py
-from __future__ import annotations
 import json, os
-from typing import Dict, List
 
 WEIGHTS = "data/weights_live.json"
 
-def _default() -> Dict[str, float]:
-    # Audience-first by default; novelty is small but present.
+def _default():
+    # audience-first, and the rest with sensible defaults
     return {
-        "critic_weight": 0.30,
+        "critic_weight": 0.35,
         "audience_weight": 0.65,
-        "novelty_weight": 0.05,
         "commitment_cost_scale": 1.0,
+        "novelty_weight": 0.15,
     }
 
-def load_weights() -> Dict[str, float]:
+def load_weights():
     if os.path.exists(WEIGHTS):
         try:
-            w = json.load(open(WEIGHTS, "r"))
-            # backfill any missing keys
-            for k, v in _default().items():
-                w.setdefault(k, v)
+            w = json.load(open(WEIGHTS, "r", encoding="utf-8"))
+            # guardrails: always audience >= critic
+            aw = float(w.get("audience_weight", 0.65))
+            cw = float(w.get("critic_weight", 0.35))
+            if aw < cw:
+                aw, cw = 0.65, 0.35
+            w["audience_weight"] = aw
+            w["critic_weight"] = cw
+            w.setdefault("commitment_cost_scale", 1.0)
+            w.setdefault("novelty_weight", 0.15)
             return w
         except Exception:
             pass
     return _default()
 
-def save_weights(w: Dict[str, float]) -> None:
+def save_weights(w):
     os.makedirs("data", exist_ok=True)
-    json.dump(w, open(WEIGHTS, "w"), indent=2)
+    json.dump(w, open(WEIGHTS, "w", encoding="utf-8"), indent=2)
 
-def update_from_ratings(rows: List[dict]) -> Dict[str, float]:
+def update_from_ratings(rows):
     """
-    Nudge critic/audience weights based on your ratings:
-    - More 8–10s than 1–5s => slightly increase audience weight.
-    - Keep audience > critic by design.
+    Nudge weights based on your ratings:
+      - count 8–10 as positive, 1–5 as negative, 5.5–6.5 ≈ neutral.
+      - keeps audience >= critic.
     """
-    pos = sum(1 for r in rows if float(r.get("your_rating", 0) or 0) >= 8)
-    neg = sum(1 for r in rows if 0 < float(r.get("your_rating", 0) or 0) <= 5)
+    pos = sum(1 for r in rows if float(r.get("your_rating", 0)) >= 8)
+    neg = sum(1 for r in rows if 0 < float(r.get("your_rating", 0)) <= 5)
     total = max(1, len(rows))
-    delta = (pos - neg) / total  # -1..+1-ish
+    delta = (pos - neg) / total  # -1..+1 typically small
+
     w = load_weights()
-
-    # Start from current / default
-    aw = float(w.get("audience_weight", 0.65))
-    cw = float(w.get("critic_weight", 0.30))
-    nw = float(w.get("novelty_weight", 0.05))
-
-    # Gentle nudge: ±0.04 max per run
-    aw = aw + 0.04 * delta
-    cw = cw - 0.04 * delta * 0.6  # smaller counter-nudge on critic
-    nw = max(0.0, min(0.12, nw))  # clamp novelty
-
-    # Hard constraints: audience stays > critic
-    aw = max(0.55, min(0.80, aw))
-    cw = max(0.15, min(0.40, cw))
-
-    # Normalize trio
-    s = aw + cw + nw
-    aw, cw, nw = aw / s, cw / s, nw / s
-
-    w["audience_weight"], w["critic_weight"], w["novelty_weight"] = aw, cw, nw
-    # keep commitment scale as-is (user-tunable)
-    w["commitment_cost_scale"] = float(w.get("commitment_cost_scale", 1.0))
+    # move a little toward audience if you skew higher, away if you skew lower
+    aw = float(w.get("audience_weight", 0.65)) + 0.05 * delta
+    cw = 1.0 - aw
+    # clamp and ensure audience >= critic
+    aw = max(0.55, min(0.75, aw))
+    cw = round(1.0 - aw, 3)
+    w["audience_weight"] = round(aw, 3)
+    w["critic_weight"] = cw
     save_weights(w)
     return w
