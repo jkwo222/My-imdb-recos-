@@ -2,12 +2,24 @@ name: nightly
 
 on:
   schedule:
-    - cron: "25 2 * * *"   # daily at ~02:25 UTC (adjust as you like)
+    - cron: "25 2 * * *"   # daily ~02:25 UTC
   workflow_dispatch: {}
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
+    env:
+      TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+      OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}        # <- you said this exists
+      REGION: US
+      ORIGINAL_LANGS: en
+      # keep these in the simple slugs you’ve been using
+      SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
+      # optional: if you have your CSV in repo
+      IMDB_RATINGS_CSV_PATH: data/ratings.csv
+      # optional: if you want delta-scrape of your public ratings page
+      IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,58 +34,50 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ---- OMDb smoke test proves the secret & HTTPS path work ----
-      - name: OMDb smoke test (masked)
-        env:
-          OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
-        run: |
-          set -e
-          echo "OMDB_API_KEY present? $([ -n "${OMDB_API_KEY}" ] && echo yes || echo no)"
-          RESP="$(curl -s -G 'https://www.omdbapi.com/' \
-            --data-urlencode "apikey=${OMDB_API_KEY}" \
-            --data-urlencode "t=Alien" \
-            --data-urlencode "y=1979")"
-          echo "$RESP" | python - <<'PY'
-import sys, json
-try:
-  d=json.load(sys.stdin)
-except Exception:
-  print("[OMDb smoke] Non-JSON response")
-  sys.exit(2)
-ok = d.get("Response")=="True"
-rt = [r['Value'] for r in d.get('Ratings',[]) if r.get('Source')=='Rotten Tomatoes']
-print(f"[OMDb smoke] Response={ok} Title={d.get('Title')} IMDb={d.get('imdbRating')} RT={rt}")
-sys.exit(0 if ok else 2)
-PY
-
-      # ---- Optional one-time cache clear to refresh old OMDb misses ----
-      - name: One-time clear OMDb cache (safe if folder missing)
-        run: rm -rf data/cache/omdb || true
-
-      - name: Run recommender
-        env:
-          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
-          OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}   # ← now passed to the job
-          REGION: US
-          ORIGINAL_LANGS: en
-          SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
-          # Consider throttling the first fetch to avoid OMDb rate limits:
-          TMDB_PAGES_MOVIE: 6
-          TMDB_PAGES_TV: 6
+      - name: Run engine
         run: |
           python -m engine.runner
 
-      - name: Show export heads (debug)
-        run: |
-          echo "== latest json =="
-          jq '.count, .meta.weights, .items[0]?' data/out/latest/assistant_feed.json || true
-          echo "== latest csv head =="
-          head -n 5 data/out/latest/assistant_feed.csv || true
-
-      - name: Upload latest bundle
+      - name: Upload artifact (latest outputs)
         uses: actions/upload-artifact@v4
         with:
           name: out
-          path: |
-            data/out/latest
+          path: data/out/latest
           if-no-files-found: warn
+
+      # >>> THIS is the GitHub notification you want: the Job Summary
+      - name: Post Top 10s to run summary
+        if: always()
+        shell: bash
+        run: |
+          echo "# Your Daily Recommendations" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "data/out/latest/assistant_feed.md" ]; then
+            cat "data/out/latest/assistant_feed.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_No details file found (engine produced no feed?)._" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Artifacts: **out** (assistant_feed.json/csv/md, telemetry.json)" >> "$GITHUB_STEP_SUMMARY"
+
+      # Optional: also update a standing Issue to trigger GitHub notifications
+      # Create the issue once manually named "Daily Recommendations" and copy its number:
+      #   Settings -> Issues -> create issue; take the number (e.g. 1) into a secret RECS_ISSUE_NUMBER
+      - name: Update pinned issue with latest picks
+        if: ${{ secrets.RECS_ISSUE_NUMBER != '' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'data/out/latest/assistant_feed.md';
+            const body = fs.existsSync(path)
+              ? fs.readFileSync(path, 'utf8')
+              : 'No feed produced.';
+            const issue_number = parseInt(process.env.RECS_ISSUE_NUMBER, 10);
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              body: `### ${new Date().toISOString()} \n\n` + body
+            });
+        env:
+          RECS_ISSUE_NUMBER: ${{ secrets.RECS_ISSUE_NUMBER }}
