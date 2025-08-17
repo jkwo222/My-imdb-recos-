@@ -1,127 +1,107 @@
-# engine/scoring.py
 from __future__ import annotations
-import csv, os, re, math, datetime
-from typing import Any, Dict, Iterable, List, Tuple, Optional
+import os, re
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from rapidfuzz import fuzz
+from datetime import date
+from .util import normalize_title, parse_year, parse_date, clamp01
 
-try:
-    from .imdb_ingest import scrape_imdb_ratings  # optional
-except Exception:  # pragma: no cover
-    scrape_imdb_ratings = None  # type: ignore
-
-_ROMAN = {
-    " i ": " 1 ", " ii ": " 2 ", " iii ": " 3 ", " iv ": " 4 ", " v ": " 5 ",
-    " vi ": " 6 ", " vii ": " 7 ", " viii ": " 8 ", " ix ": " 9 ", " x ": " 10 ",
-}
-
-def _norm_title(s: str) -> str:
-    if not s: return ""
-    s = s.lower().strip()
-    out, depth = [], 0
-    for ch in s:
-        if ch == '(': depth += 1
-        elif ch == ')': depth = max(0, depth-1)
-        elif depth == 0: out.append(ch)
-    s = ''.join(out)
-    s = s.replace("&", " and ")
-    s = re.sub(r"[-—–_:/,.'!?;]", " ", s)
-    s = f" {s} "
-    for k, v in _ROMAN.items():
-        s = s.replace(k, v)
-    s = re.sub(r"^\s*the\s+", "", s)
-    s = " ".join(t for t in s.split() if t)
-    return s
-
-def _fuzzy_sim(a: str, b: str) -> float:
-    if not a or not b: return 0.0
+def _fuzzy(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
     return fuzz.token_set_ratio(a, b) / 100.0
 
-def _best_path_for_ratings() -> Optional[str]:
-    for p in ("data/user/ratings.csv", "data/ratings.csv"):
-        if os.path.exists(p): return p
+def _extract_titles(row: Dict[str, str]) -> Tuple[str, Optional[int]]:
+    t = (row.get("Title") or row.get("title") or row.get("originalTitle") or row.get("Original Title") or "").strip()
+    y_raw = (row.get("Year") or row.get("year") or row.get("startYear") or row.get("Release Year") or "").strip()
+    y = parse_year(y_raw)
+    return normalize_title(t), y
+
+def _extract_imdb_id(row: Dict[str, str]) -> Optional[str]:
+    lower_keys = {k.lower(): k for k in row.keys()}
+    for cand in ("const", "tconst", "imdb title id", "imdb_id", "id"):
+        if cand in lower_keys:
+            v = (row.get(lower_keys[cand]) or "").strip()
+            if v.startswith("tt") and v[2:].isdigit():
+                return v
+    url = (row.get("URL") or row.get("url") or "").strip()
+    m = re.search(r"(tt\d+)", url)
+    if m:
+        return m.group(1)
     return None
 
-def _parse_csv_seen(csv_path: str) -> Tuple[set[str], List[Tuple[str, Optional[int]]], Dict[str, float]]:
+def _read_ratings_csv(path: str) -> Tuple[set[str], List[Tuple[str, Optional[int]]]]:
     ids: set[str] = set()
     titles: List[Tuple[str, Optional[int]]] = []
-    rated_norm: Dict[str, float] = {}
-    if not os.path.exists(csv_path):
-        return ids, titles, rated_norm
-    with open(csv_path, "r", encoding="utf-8") as f:
-        rdr = csv.DictReader(f)
-        lower = [h.lower().strip() for h in (rdr.fieldnames or [])]
-        id_key = None
-        for cand in ("const","tconst","imdb title id","imdb_id","id"):
-            if cand in lower:
-                id_key = (rdr.fieldnames or [])[lower.index(cand)]
-                break
-        title_keys = [k for k in (rdr.fieldnames or []) if k and k.lower() in {"title","originaltitle","original title","primarytitle"}]
-        year_keys = [k for k in (rdr.fieldnames or []) if k and k.lower() in {"year","startyear","release year"}]
-        rating_keys = [k for k in (rdr.fieldnames or []) if k and k.lower() in {"your rating","rating","user rating"}]
-        for row in rdr:
-            if id_key:
-                v = (row.get(id_key) or "").strip()
-                if v.startswith("tt"): ids.add(v)
-            t = ""
-            for k in title_keys:
-                if (row.get(k) or "").strip():
-                    t = (row.get(k) or "").strip()
-                    break
-            y_raw = ""
-            for k in year_keys:
-                if (row.get(k) or "").strip():
-                    y_raw = (row.get(k) or "").strip()
-                    break
-            y = int(y_raw) if (y_raw.isdigit()) else None
-            if t:
-                titles.append((_norm_title(t), y))
-            if t and rating_keys:
-                try:
-                    r = float((row.get(rating_keys[0]) or "").strip())
-                    if r > 0:
-                        rated_norm[_norm_title(t)] = max(0.0, min(1.0, r / 10.0))
-                except Exception:
-                    pass
-    return ids, titles, rated_norm
+    try:
+        import csv
+        import io
+        with open(path, "r", encoding="utf-8") as f:
+            rdr = csv.DictReader(f)
+            for row in rdr:
+                iid = _extract_imdb_id(row)
+                if iid:
+                    ids.add(iid)
+                t_norm, y = _extract_titles(row)
+                if t_norm:
+                    titles.append((t_norm, y))
+    except UnicodeDecodeError:
+        import csv
+        with open(path, "r", encoding="latin-1") as f:
+            rdr = csv.DictReader(f)
+            for row in rdr:
+                iid = _extract_imdb_id(row)
+                if iid:
+                    ids.add(iid)
+                t_norm, y = _extract_titles(row)
+                if t_norm:
+                    titles.append((t_norm, y))
+    except Exception:
+        pass
+    return ids, titles
 
 def _scrape_public_seen_from_env() -> Tuple[set[str], List[Tuple[str, Optional[int]]]]:
-    user_id = os.environ.get("IMDB_USER_ID","").strip()
-    if not user_id or not scrape_imdb_ratings:
+    try:
+        from .imdb_ingest import scrape_imdb_ratings  # optional module
+    except Exception:
+        return set(), []
+    user_id = os.getenv("IMDB_USER_ID", "").strip()
+    if not user_id:
         return set(), []
     url = f"https://www.imdb.com/user/{user_id}/ratings?sort=ratings_date:desc&mode=detail"
     try:
-        items = scrape_imdb_ratings(url, max_pages=50)  # type: ignore[misc]
+        items = scrape_imdb_ratings(url, max_pages=50)
     except Exception:
         return set(), []
     ids: set[str] = set()
     titles: List[Tuple[str, Optional[int]]] = []
     for i in items:
         iid = getattr(i, "imdb_id", "")
-        if iid: ids.add(iid)
-        t = getattr(i, "title", "") or ""
+        if isinstance(iid, str) and iid.startswith("tt"):
+            ids.add(iid)
+        t = getattr(i, "title", "")
         y = getattr(i, "year", None)
-        titles.append((_norm_title(t), y if isinstance(y, int) else None))
+        titles.append((normalize_title(t), y if isinstance(y, int) else None))
     return ids, titles
 
-def load_seen_index(csv_path: Optional[str] = None) -> Dict[str, Any]:
-    if csv_path is None:
-        csv_path = _best_path_for_ratings() or ""
-    ids_csv, titles_csv, rated_norm = _parse_csv_seen(csv_path) if csv_path else (set(), [], {})
+def load_seen_index(csv_path: str) -> Dict[str, Any]:
+    ids_csv: set[str] = set()
+    titles_csv: List[Tuple[str, Optional[int]]] = []
+    if csv_path and os.path.exists(csv_path):
+        ids_csv, titles_csv = _read_ratings_csv(csv_path)
     ids_web, titles_web = _scrape_public_seen_from_env()
     ids = set(ids_csv) | set(ids_web)
     titles = titles_csv + titles_web
     idx: Dict[str, Any] = {tid: True for tid in ids}
     idx["_titles_norm_pairs"] = titles
-    idx["_ratings_norm"] = rated_norm
     return idx
 
 def _matches_seen_by_title(pool_title: str, pool_year: Optional[int], seen_pairs: List[Tuple[str, Optional[int]]]) -> bool:
-    nt = _norm_title(pool_title)
+    nt = normalize_title(pool_title)
     for st, sy in seen_pairs:
         if nt == st:
             if sy is None or pool_year is None or abs(int(pool_year) - int(sy)) <= 1:
                 return True
-        if _fuzzy_sim(nt, st) >= 0.93:
+        if _fuzzy(nt, st) >= 0.93:
             if sy is None or pool_year is None or abs(int(pool_year) - int(sy)) <= 1:
                 return True
     return False
@@ -131,68 +111,72 @@ def filter_unseen(pool: List[Dict[str, Any]], seen_idx: Dict[str, Any]) -> List[
     out: List[Dict[str, Any]] = []
     for it in pool:
         title = it.get("title") or it.get("name") or ""
-        year = it.get("year")
-        iid = (it.get("imdb_id") or "").strip()
+        if not title:
+            out.append(it)
+            continue
+        year = None
+        d = it.get("release_date") or it.get("first_air_date") or ""
+        if d:
+            y = parse_year(d[:4])
+            if y:
+                year = y
+        iid = (it.get("imdb_id") or "").strip() if isinstance(it.get("imdb_id"), str) else ""
         if iid and iid in seen_idx:
             continue
-        if title and _matches_seen_by_title(title, year, seen_pairs):
+        if _matches_seen_by_title(title, year, seen_pairs):
             continue
         out.append(it)
     return out
 
-def _parse_year(d: Dict[str, Any]) -> Optional[int]:
-    for k in ("release_date", "first_air_date"):
-        v = (d.get(k) or "").strip()
-        if len(v) >= 4 and v[:4].isdigit():
-            try: return int(v[:4])
-            except Exception: pass
-    y = d.get("year")
-    try: return int(y) if y is not None else None
-    except Exception: return None
+def _recency_bonus(date_str: str) -> float:
+    if not date_str:
+        return 0.0
+    d = parse_date(date_str)
+    if not d:
+        return 0.0
+    days = (date.today() - d).days
+    if days <= 14:
+        return 8.0
+    if days <= 30:
+        return 6.0
+    if days <= 90:
+        return 4.0
+    if days <= 180:
+        return 2.0
+    return 0.0
 
-def score_items(cfg: Any, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    cw = float(getattr(cfg, "critic_weight", 0.25) or 0.25)
-    aw = float(getattr(cfg, "audience_weight", 0.75) or 0.75)
-    cc = float(getattr(cfg, "commitment_cost_scale", 1.0) or 1.0)
+def _year_of(it: Dict[str, Any]) -> Optional[int]:
+    s = it.get("release_date") or it.get("first_air_date") or ""
+    return parse_year(s[:4]) if s else None
 
-    csv_path = _best_path_for_ratings()
-    _, title_pairs, rated_norm = _parse_csv_seen(csv_path) if csv_path else (set(), [], {})
-    liked_titles = {t for (t, _y) in title_pairs if rated_norm.get(t, 0) >= 0.8}
-
-    today = datetime.date.today()
+def score_items(env: Dict[str, Any], items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ranked: List[Dict[str, Any]] = []
     for it in items:
-        aud = max(0.0, min(1.0, (it.get("vote_average", 0.0) or 0.0) / 10.0))
+        va = it.get("vote_average", 0.0) or 0.0
+        aud = clamp01(float(va) / 10.0)
         cri = 0.0
-        base = aw * aud + cw * cri
-
-        penalty = 0.0
-        if it.get("kind") == "tv":
-            penalty = 0.02 * cc
-
-        year = _parse_year(it)
-        recency_bonus = 0.0
-        if year:
-            age = max(0, today.year - int(year))
-            recency_bonus = max(0.0, (5.0 - min(5.0, age)) * 0.005)  # up to +2.5 pts
-
-        t = (it.get("title") or it.get("name") or "").strip()
-        taste_bonus = 0.0
-        if t and liked_titles:
-            nt = _norm_title(t)
-            sim = max((_fuzzy_sim(nt, lt) for lt in liked_titles), default=0.0)
-            taste_bonus = 0.05 * sim  # up to +5 pts
-
-        match = round(100.0 * max(0.0, base - penalty + recency_bonus + taste_bonus), 1)
-
+        base = aud * 100.0
+        penalty = 2.0 if (it.get("media_type") == "tv") else 0.0
+        pre_hint = 0.0
+        try:
+            pre_hint = float(it.get("pre_match_hint", 0.0) or 0.0)
+        except Exception:
+            pre_hint = 0.0
+        bonus = _recency_bonus(it.get("release_date") or it.get("first_air_date") or "")
+        match = max(0.0, min(100.0, base - penalty + bonus + pre_hint))
         ranked.append({
-            "title": it.get("title") or it.get("name"),
-            "year": year,
-            "type": "tvSeries" if it.get("kind") == "tv" else "movie",
-            "audience": round(aud * 100, 1),
-            "critic": round(cri * 100, 1),
-            "match": match,
+            "media_type": "tv" if it.get("media_type") == "tv" else "movie",
+            "tmdb_id": it.get("tmdb_id"),
+            "title": it.get("title"),
+            "year": _year_of(it),
+            "audience": round(aud * 100.0, 1),
+            "critic": round(cri * 100.0, 1),
+            "match": round(match, 1),
+            "vote_average": it.get("vote_average"),
+            "release_date": it.get("release_date"),
+            "first_air_date": it.get("first_air_date"),
             "providers": it.get("providers", []),
+            "genres": it.get("genres", []),
         })
     ranked.sort(key=lambda r: r["match"], reverse=True)
     return ranked
