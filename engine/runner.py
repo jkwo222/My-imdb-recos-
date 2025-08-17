@@ -116,6 +116,7 @@ def _markdown_summary(items: List[Dict[str, Any]], env: Env, top_n: int = 25) ->
     region = env.get("REGION", "US")
     pages = env.get("DISCOVER_PAGES", 1)
     prov_map = env.get("PROVIDER_MAP", {})
+    unmatched = env.get("PROVIDER_UNMATCHED", [])
 
     lines = []
     lines.append("# Daily recommendations\n")
@@ -123,6 +124,8 @@ def _markdown_summary(items: List[Dict[str, Any]], env: Env, top_n: int = 25) ->
     lines.append(f"- Region: **{region}**")
     lines.append(f"- SUBS_INCLUDE: `{','.join(subs)}`" if subs else "- SUBS_INCLUDE: _none_")
     lines.append(f"- Provider map: `{json.dumps(prov_map, ensure_ascii=False)}`")
+    if unmatched:
+        lines.append(f"- Provider slugs not matched this region: `{unmatched}`")
     lines.append(f"- Discover pages: **{pages}**")
     lines.append(f"- Discovered (raw): **{discovered}**")
     lines.append(f"- Eligible after exclusions: **{eligible}**\n")
@@ -140,10 +143,16 @@ def _markdown_summary(items: List[Dict[str, Any]], env: Env, top_n: int = 25) ->
         title = it.get("title") or it.get("name") or "—"
         match = it.get("score", it.get("match", 0.0))
         aud = it.get("audience", it.get("tmdb_vote", 0.0))
+        # normalize audience display to 0..100
+        try:
+            audv = float(aud)
+            if audv <= 10.0: audv *= 10.0
+        except Exception:
+            audv = 0.0
         year = it.get("year") or ""
         provs = it.get("providers") or it.get("providers_slugs") or []
         why = it.get("why") or ""
-        lines.append(f"| {idx} | {title} | {match:.1f} | {aud:.1f} | {year} | {_fmt_providers(provs)} | {why} |")
+        lines.append(f"| {idx} | {title} | {match:.1f} | {audv:.1f} | {year} | {_fmt_providers(provs)} | {why} |")
 
     lines.append("\n<details><summary>Raw top items (JSON)</summary>\n\n")
     lines.append("```json")
@@ -232,7 +241,7 @@ def main() -> None:
         _log(f"[exclusions] FAILED: {ex!r}")
         traceback.print_exc()
 
-    # Add providers to the visible top before scoring (enough for email table)
+    # Add providers to the visible top before scoring (helps email table)
     _enrich_top_providers(items, env, top_n=40)
 
     # Scoring
@@ -262,13 +271,19 @@ def main() -> None:
             w = csv.writer(fh)
             w.writerow(["rank","title","year","media_type","match","audience","tmdb_vote","imdb_id","tmdb_id","providers","why"])
             for i, it in enumerate(ranked[:100], start=1):
+                # normalize audience for export
+                try:
+                    aud = float(it.get("audience", it.get("tmdb_vote", 0.0)))
+                    if aud <= 10.0: aud *= 10.0
+                except Exception:
+                    aud = ""
                 w.writerow([
                     i,
                     it.get("title") or it.get("name") or "",
                     it.get("year") or "",
                     it.get("media_type") or "",
                     _score_of(it),
-                    it.get("audience", ""),
+                    aud,
                     it.get("tmdb_vote", ""),
                     it.get("imdb_id", ""),
                     it.get("tmdb_id", ""),
@@ -278,7 +293,7 @@ def main() -> None:
     except Exception as ex:
         _log(f"[export] CSV failed: {ex!r}")
 
-    # Summary for the Issue
+    # Summary for the Issue (email)
     try:
         (run_dir / "summary.md").write_text(_markdown_summary(ranked, env, top_n=25), encoding="utf-8")
     except Exception as ex:
@@ -300,6 +315,7 @@ def main() -> None:
                 "SUBS_INCLUDE": env.get("SUBS_INCLUDE", []),
                 "DISCOVER_PAGES": env.get("DISCOVER_PAGES", 0),
                 "PROVIDER_MAP": env.get("PROVIDER_MAP", {}),
+                "PROVIDER_UNMATCHED": env.get("PROVIDER_UNMATCHED", []),
             },
             "discover_pages": env.get("DISCOVER_PAGE_TELEMETRY", []),
             "paths": {
