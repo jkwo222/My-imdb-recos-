@@ -2,18 +2,17 @@ name: nightly
 
 on:
   schedule:
-    - cron: "0 2 * * *"   # run nightly at 02:00 UTC (change if you like)
-  workflow_dispatch:       # allow manual runs
+    - cron: "25 2 * * *"   # daily at ~02:25 UTC (adjust as you like)
+  workflow_dispatch: {}
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -23,28 +22,58 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 👇 Quick, masked sanity check so you can see in logs that secrets are present
-      - name: Sanity-check secrets in env
+      # ---- OMDb smoke test proves the secret & HTTPS path work ----
+      - name: OMDb smoke test (masked)
         env:
-          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
           OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
         run: |
-          echo "TMDB_API_KEY present? $([ -n "${TMDB_API_KEY}" ] && echo yes || echo no)"
+          set -e
           echo "OMDB_API_KEY present? $([ -n "${OMDB_API_KEY}" ] && echo yes || echo no)"
+          RESP="$(curl -s -G 'https://www.omdbapi.com/' \
+            --data-urlencode "apikey=${OMDB_API_KEY}" \
+            --data-urlencode "t=Alien" \
+            --data-urlencode "y=1979")"
+          echo "$RESP" | python - <<'PY'
+import sys, json
+try:
+  d=json.load(sys.stdin)
+except Exception:
+  print("[OMDb smoke] Non-JSON response")
+  sys.exit(2)
+ok = d.get("Response")=="True"
+rt = [r['Value'] for r in d.get('Ratings',[]) if r.get('Source')=='Rotten Tomatoes']
+print(f"[OMDb smoke] Response={ok} Title={d.get('Title')} IMDb={d.get('imdbRating')} RT={rt}")
+sys.exit(0 if ok else 2)
+PY
+
+      # ---- Optional one-time cache clear to refresh old OMDb misses ----
+      - name: One-time clear OMDb cache (safe if folder missing)
+        run: rm -rf data/cache/omdb || true
 
       - name: Run recommender
         env:
           TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
-          OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
+          OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}   # ← now passed to the job
           REGION: US
           ORIGINAL_LANGS: en
           SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
+          # Consider throttling the first fetch to avoid OMDb rate limits:
+          TMDB_PAGES_MOVIE: 6
+          TMDB_PAGES_TV: 6
         run: |
           python -m engine.runner
 
-      - name: Upload latest output
+      - name: Show export heads (debug)
+        run: |
+          echo "== latest json =="
+          jq '.count, .meta.weights, .items[0]?' data/out/latest/assistant_feed.json || true
+          echo "== latest csv head =="
+          head -n 5 data/out/latest/assistant_feed.csv || true
+
+      - name: Upload latest bundle
         uses: actions/upload-artifact@v4
         with:
           name: out
-          path: data/out/latest
+          path: |
+            data/out/latest
           if-no-files-found: warn
