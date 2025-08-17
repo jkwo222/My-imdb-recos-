@@ -1,0 +1,88 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGION: US
+  ORIGINAL_LANGS: '["en"]'
+  DISCOVER_PAGES: 3
+  SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
+  PYTHONUTF8: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: pip cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-py311-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-py311-
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+
+      - name: Run engine (quick)
+        shell: bash
+        env:
+          TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
+          IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
+        run: |
+          set -euxo pipefail
+          mkdir -p data/out data/cache
+          python -m engine.runner
+          if [[ -f data/out/last_run_dir.txt ]]; then
+            run_dir="$(< data/out/last_run_dir.txt)"
+            rm -rf data/out/latest
+            cp -r "${run_dir}" data/out/latest
+          fi
+
+      - name: Upload debug (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-debug-${{ github.run_number }}
+          path: |
+            data/out/latest/runner.log
+            data/out/latest/assistant_feed.json
+            data/out/latest/items.discovered.json
+            data/out/latest/items.enriched.json
+            data/out/latest/summary.md
+            data/out/last_run_dir.txt
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload site (default branch only)
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-site-${{ github.run_number }}
+          path: data/out/latest
+          if-no-files-found: warn
+          retention-days: 3
