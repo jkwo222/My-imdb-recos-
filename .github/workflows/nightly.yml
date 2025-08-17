@@ -3,23 +3,22 @@ name: nightly
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 4 * * *" # run daily at 04:17 UTC (adjust as you like)
+    - cron: "17 4 * * *" # daily 04:17 UTC
 
 permissions:
   contents: read
+  pages: write          # for deploy
+  id-token: write       # for deploy
 
 concurrency:
   group: nightly-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  # Engine configuration
   REGION: US
-  ORIGINAL_LANGS: '["en"]'   # keep quotes so YAML passes a JSON array string
-  DISCOVER_PAGES: 12         # adjust if you want more/less discovery pages
+  ORIGINAL_LANGS: '["en"]'
+  DISCOVER_PAGES: 12
   SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
-
-  # Python quality of life
   PYTHONUTF8: "1"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
@@ -27,6 +26,8 @@ jobs:
   build:
     name: build
     runs-on: ubuntu-24.04
+    outputs:
+      site_path: data/out/latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,7 +36,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          check-latest: false
 
       - name: pip cache
         uses: actions/cache@v4
@@ -57,17 +57,16 @@ jobs:
         shell: bash
         env:
           TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
-          IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }} # optional; can be unset
+          IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
         run: |
           set -euxo pipefail
           mkdir -p data/out data/cache
           python -m engine.runner
-          # keep only last 5 run_* directories to avoid repo bloat
+          # keep last 5 runs
           if compgen -G "data/out/run_*" > /dev/null; then
             ls -dt data/out/run_* | tail -n +6 | xargs -r rm -rf --
           fi
 
-      # ---------- B) Marker-based latest copy (robust & simple) ----------
       - name: Pin latest run folder (marker-based)
         shell: bash
         run: |
@@ -77,16 +76,13 @@ jobs:
             echo "Last run: ${run_dir}"
             rm -rf data/out/latest
             cp -r "${run_dir}" data/out/latest
-            echo "data/out/latest contents:"
             ls -al data/out/latest || true
           else
-            echo "ERROR: Marker data/out/last_run_dir.txt not found."
-            echo "Existing data/out layout:"
+            echo "ERROR: data/out/last_run_dir.txt not found."
             find data/out -maxdepth 2 -type d -print || true
             exit 1
           fi
 
-      # Upload the “site” output (whatever your publisher expects to consume)
       - name: Upload site artifact
         uses: actions/upload-artifact@v4
         with:
@@ -95,7 +91,6 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # Small but useful debug bundle
       - name: Build debug bundle
         shell: bash
         run: |
@@ -108,7 +103,6 @@ jobs:
           cp -f data/out/latest/items.enriched.json        debug-bundle/ || true
           cp -f data/out/latest/summary.md                 debug-bundle/ || true
           cp -f data/out/last_run_dir.txt                  debug-bundle/ || true
-          # capture env snapshot for debugging
           {
             echo "REGION=${REGION}"
             echo "SUBS_INCLUDE=${SUBS_INCLUDE}"
@@ -124,3 +118,21 @@ jobs:
           name: debug-data-${{ github.run_number }}
           path: debug-data.zip
           retention-days: 14
+
+      # Prepare Pages artifact from site output
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: data/out/latest
+
+  deploy:
+    name: deploy
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
