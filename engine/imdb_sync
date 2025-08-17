@@ -1,0 +1,89 @@
+# engine/imdb_sync.py
+from __future__ import annotations
+import csv, io, re
+from typing import Dict, List, Tuple, Set
+import requests
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+USER_DIR = ROOT / "data" / "user"
+CACHE_DIR = ROOT / "data" / "cache" / "imdb"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def load_ratings_csv() -> List[Dict[str,str]]:
+    """Read local ratings at data/user/ratings.csv (IMDb export format)."""
+    p = USER_DIR / "ratings.csv"
+    if not p.exists():
+        return []
+    out: List[Dict[str,str]] = []
+    with p.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            out.append(row)
+    return out
+
+LIST_URL_RE = re.compile(r"^https?://www\.imdb\.com/user/(ur\d+)/ratings.*", re.I)
+
+def fetch_user_ratings_web(imdb_user_id: str) -> List[Dict[str,str]]:
+    """
+    Fallback: pull user's public ratings CSV via IMDb export endpoint.
+    (IMDb sometimes requires cookies; if 403, we gracefully return [])
+    """
+    # Public CSV export is at: /user/<id>/ratings?ref_=nv_usr_rt_0&view=compact&sort=ratings_date,desc&csv=1
+    url = f"https://www.imdb.com/user/{imdb_user_id}/ratings?view=compact&sort=ratings_date,desc&csv=1"
+    try:
+        r = requests.get(url, timeout=15, headers={"Accept":"text/csv"})
+        if r.status_code != 200 or "text/csv" not in r.headers.get("Content-Type",""):
+            return []
+        buf = io.StringIO(r.text)
+        reader = csv.DictReader(buf)
+        return list(reader)
+    except Exception:
+        return []
+
+def merge_user_sources(local: List[Dict[str,str]], remote: List[Dict[str,str]]) -> List[Dict[str,str]]:
+    """Combine by tconst + most recent rating date."""
+    def key(row): return row.get("const") or row.get("tconst") or row.get("IMDb ID")
+    best: Dict[str, Dict[str,str]] = {}
+    for src in (local, remote):
+        for row in src:
+            k = key(row)
+            if not k: 
+                continue
+            prev = best.get(k)
+            if not prev:
+                best[k] = row
+            else:
+                # prefer the one with a newer Date Rated if present
+                d_new = row.get("Date Rated") or row.get("rated_at") or ""
+                d_old = prev.get("Date Rated") or prev.get("rated_at") or ""
+                if d_new > d_old:
+                    best[k] = row
+    return list(best.values())
+
+def to_user_profile(ratings_rows: List[Dict[str,str]]) -> Dict[str, Dict]:
+    """
+    Convert IMDb ratings rows to a compact dict keyed by tconst.
+    Expected fields in IMDb CSV: const, Your Rating, Title, Title Type, Year, Genres (sometimes)
+    """
+    prof: Dict[str, Dict] = {}
+    for r in ratings_rows:
+        t = (r.get("const") or r.get("tconst") or "").strip()
+        if not t: 
+            continue
+        yr = (r.get("Year") or "").strip()
+        title_type = (r.get("Title Type") or r.get("type") or "").strip()
+        rating = r.get("Your Rating") or r.get("rating") or ""
+        try:
+            my_rating = float(rating)
+        except Exception:
+            my_rating = None
+        prof[t] = {
+            "title": r.get("Title") or r.get("title"),
+            "type": title_type,
+            "year": int(yr) if yr.isdigit() else None,
+            "my_rating": my_rating,
+            "rated_at": r.get("Date Rated") or r.get("rated_at"),
+            "genres_hint": r.get("Genres") or r.get("genres"),
+        }
+    return prof
