@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 import math
 import datetime
 
-# Optional personalization (persona/taste)
+# Optional personalization (persona/taste). If missing, we skip gracefully.
 try:
     from .personalize import apply_personalization  # type: ignore
 except Exception:
@@ -46,44 +46,51 @@ def _provider_bonus(item: Dict[str, Any], subs_include: List[str]) -> float:
     return min(6.0, 3.0 + 1.5 * (len(isect) - 1))
 
 
-def _base_audience(item: Dict[str, Any]) -> float:
+def _normalize_audience(item: Dict[str, Any]) -> float:
     """
-    Normalize a base popularity/audience signal to 0..100.
+    Normalize a base popularity/audience signal to 0..100 and return it.
     Prefer 'audience' (already 0..100), else tmdb_vote (0..10 -> *10).
+    If nothing present, fall back to a neutral 50.0.
     """
     aud = item.get("audience")
     try:
         a = float(aud)
-        if 0.0 <= a <= 100.0:
-            return a
+        if a <= 10.0:
+            a *= 10.0
+        # clamp to 0..100
+        return max(0.0, min(100.0, a))
     except Exception:
         pass
+
     vote = item.get("tmdb_vote")
     try:
         v = float(vote)
-        if 0.0 <= v <= 10.0:
-            return v * 10.0
+        if v <= 10.0:
+            v *= 10.0
+        return max(0.0, min(100.0, v))
     except Exception:
         pass
+
     return 50.0
 
 
 def _why_reasons(item: Dict[str, Any], parts: List[str]) -> str:
-    title = item.get("title") or item.get("name") or ""
+    # (title not used in formatting; kept for possible future templating)
+    # title = item.get("title") or item.get("name") or ""
     return "; ".join(p for p in parts if p)
 
 
 def score_items(env: Dict[str, Any], items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Produce a 'match' score (0..100) and a brief 'why' for each item.
+    Produce a 'match' score (0..100), a normalized 'audience' (0..100), and a brief 'why' for each item.
     If available, applies an optional personalization pass from engine.personalize.
     """
     subs_include = env.get("SUBS_INCLUDE", []) or []
 
     ranked: List[Dict[str, Any]] = []
     for it in items:
-        # base audience signal
-        base = _base_audience(it)  # 0..100
+        # Normalized audience (0..100) used as the base popularity signal
+        aud_norm = _normalize_audience(it)
 
         # components
         y = it.get("year")
@@ -91,24 +98,36 @@ def score_items(env: Dict[str, Any], items: List[Dict[str, Any]]) -> List[Dict[s
         pb = _provider_bonus(it, subs_include)
 
         # simple composite
-        match = 0.60 * base + yb + pb
+        # (weighting: popularity carries most weight, with light recency/providers bonuses)
+        match = 0.60 * aud_norm + yb + pb
+        match = max(0.0, min(100.0, match))  # clamp
 
-        # clamp
-        match = max(0.0, min(100.0, match))
-
-        # why reasons
+        # reasons
         reasons: List[str] = []
-        if base >= 75: reasons.append("high audience rating")
-        if yb >= 6:    reasons.append("very recent")
-        elif yb >= 4:  reasons.append("recent")
-        if pb >= 5.5:  reasons.append("on multiple of your services")
-        elif pb >= 3.0: reasons.append("on your service")
+        if aud_norm >= 75: reasons.append("high audience rating")
+        if yb >= 6:        reasons.append("very recent")
+        elif yb >= 4:      reasons.append("recent")
+        if pb >= 5.5:      reasons.append("on multiple of your services")
+        elif pb >= 3.0:    reasons.append("on your service")
+
+        # Guaranteed fallback reason if none matched thresholds
+        if not reasons:
+            if (it.get("media_type") or "").lower() == "tv":
+                reasons.append("strong interest among similar viewers")
+            else:
+                reasons.append("popular among audiences like yours")
 
         new_it = dict(it)
+        # persist normalized audience for downstream consumers
+        new_it["audience"] = float(f"{aud_norm:.1f}")
+
+        # store scores; runner also accepts 'score' for compatibility
         new_it["match"] = float(f"{match:.3f}")
-        new_it.setdefault("score", new_it["match"])  # keep runner happy if it looks for 'score'
-        if reasons and not new_it.get("why"):
+        new_it.setdefault("score", new_it["match"])
+
+        if not new_it.get("why"):
             new_it["why"] = _why_reasons(new_it, reasons)
+
         ranked.append(new_it)
 
     # Optional personalization hook (profile DNA)
