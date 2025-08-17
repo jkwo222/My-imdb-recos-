@@ -7,7 +7,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -39,19 +39,34 @@ UA = "my-imdb-recos/1.0 (+github actions)"
 
 IMDB_BASE = "https://www.imdb.com"
 
-# -------- Helpers --------
+# -------- Helpers (time, json, parsing) --------
 
 _TCONST_RE = re.compile(r"(tt\d{7,9})")
 
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
 def _now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    # ISO 8601 Zulu, second precision
+    return _now_utc().replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 def _is_stale(ts_iso: str, ttl_days: int) -> bool:
+    """
+    Compare a cached-at ISO string (which may be Z or offset-aware/naive)
+    against the current UTC time, using timezone-aware datetimes.
+    """
+    if not ts_iso:
+        return True
     try:
+        # Accept "....Z" or any ISO offset; normalize to aware UTC
         ts = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        else:
+            ts = ts.astimezone(timezone.utc)
     except Exception:
         return True
-    return datetime.utcnow() - ts > timedelta(days=ttl_days)
+    return _now_utc() - ts > timedelta(days=ttl_days)
 
 def _atomic_write_json(path: Path, obj: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -198,7 +213,6 @@ def _parse_ratings_list_html(html: str) -> Tuple[List[Dict[str, Any]], Optional[
 
     # Find next page link
     next_url = None
-    # New UI pagination buttons often have aria-label or rel attributes; try both
     nxt = soup.find("a", attrs={"aria-label": re.compile("Next", re.I)}) or soup.find("a", rel="next")
     if nxt and nxt.get("href"):
         href = nxt["href"]
@@ -207,8 +221,6 @@ def _parse_ratings_list_html(html: str) -> Tuple[List[Dict[str, Any]], Optional[
     return out, next_url
 
 def _ratings_url_for_user(user_id: str, page: int = 1) -> str:
-    # Modern ratings page supports pagination via "start" offset; simpler to use "sort=userRating,desc"
-    # but we can just follow "Next" links we find. For initial page:
     return f"{IMDB_BASE}/user/{user_id}/ratings/"
 
 def fetch_user_ratings_web(user_id: str, ttl_days: int = DEFAULT_TTL_DAYS, max_pages: int = 10) -> List[Dict[str, Any]]:
