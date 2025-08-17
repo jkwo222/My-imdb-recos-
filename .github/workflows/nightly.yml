@@ -1,8 +1,13 @@
 name: nightly
+
 on:
   schedule:
     - cron: '30 7 * * *'   # 07:30 UTC (3:30am ET)
   workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
 
 jobs:
   build:
@@ -21,7 +26,8 @@ jobs:
       IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -41,8 +47,40 @@ jobs:
       - name: Make debug bundle
         run: bash ./.github/scripts/make_debug_bundle.sh
 
-      - name: Make debug bundle
-        run: bash ./.github/scripts/make_debug_bundle.sh
+      # ⬇️ Enhanced Issue step: includes debug-bundle/analysis.md
+      - name: Post/update Daily Recommendations issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const title = 'Daily Recommendations';
+
+            let body = '';
+            try { body = fs.readFileSync('data/out/latest/summary.md', 'utf8'); }
+            catch { body = 'No summary.md found. Check debug bundle.'; }
+
+            let extra = '';
+            try { extra = fs.readFileSync('debug-bundle/analysis.md', 'utf8'); } catch {}
+
+            const fullBody = body + '\n\n---\n\n' + (extra || '_No diagnostics available_');
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: 'daily-recos', per_page: 100
+            });
+            let issue = issues.find(i => i.title === title);
+
+            if (!issue) {
+              issue = (await github.rest.issues.create({
+                owner, repo, title, body: fullBody, labels: ['daily-recos']
+              })).data;
+            } else {
+              await github.rest.issues.update({
+                owner, repo, issue_number: issue.number, body: fullBody
+              });
+            }
+            core.info(`Issue #${issue.number} updated`);
 
       - name: Upload debug bundle
         uses: actions/upload-artifact@v4
@@ -58,13 +96,6 @@ jobs:
           path: repo-snapshot.zip
           if-no-files-found: warn
 
-      - name: Upload debug bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-data
-          path: debug-data.zip
-          if-no-files-found: warn
-
       - name: Upload latest outputs
         if: always()
         uses: actions/upload-artifact@v4
@@ -78,36 +109,3 @@ jobs:
             data/out/latest/items.enriched.json
             data/out/latest/summary.md
             data/out/latest/diag.json
-
-      - name: Post/update Daily Recommendations issue
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const title = 'Daily Recommendations';
-            let body = '';
-            try {
-              body = fs.readFileSync('data/out/latest/summary.md', 'utf8');
-            } catch (e) {
-              body = 'No summary.md found. Check debug bundle.';
-            }
-
-            // Find existing open issue with this title (labeled daily-recos)
-            const { data: issues } = await github.rest.issues.listForRepo({
-              owner, repo, state: 'open', labels: 'daily-recos', per_page: 100
-            });
-            let issue = issues.find(i => i.title === title);
-
-            if (!issue) {
-              const res = await github.rest.issues.create({
-                owner, repo, title, body, labels: ['daily-recos']
-              });
-              issue = res.data;
-            } else {
-              await github.rest.issues.update({
-                owner, repo, issue_number: issue.number, body
-              });
-            }
-            core.info(`Issue #${issue.number} updated`);
