@@ -1,196 +1,236 @@
+# engine/rank.py
 from __future__ import annotations
 
-import csv
 import math
-import os
+import json
 from collections import Counter, defaultdict
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Any, Tuple, Optional
 
-from .tmdb import search_title_once
-
-
-def _read_ratings_csv(path: str) -> List[Dict[str, str]]:
-    if not os.path.exists(path):
-        return []
-    rows: List[Dict[str, str]] = []
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            rows.append({k.strip(): (v or "").strip() for k, v in r.items()})
-    return rows
+import pandas as pd
 
 
-def _get_title(row: Dict[str, str]) -> str:
-    return row.get("title") or row.get("Title") or row.get("primaryTitle") or row.get("originalTitle") or ""
-
-
-def _get_year(row: Dict[str, str]) -> Optional[int]:
-    y = row.get("year") or row.get("Year") or row.get("startYear") or ""
+def _safe(val, default=0.0):
     try:
-        return int(y) if y else None
+        if val is None:
+            return default
+        if isinstance(val, str) and not val.strip():
+            return default
+        return float(val)
     except Exception:
-        return None
+        return default
 
 
-def _get_rating(row: Dict[str, str]) -> Optional[float]:
-    r = row.get("Your Rating") or row.get("my_rating") or row.get("rating") or ""
-    try:
-        return float(r) if r else None
-    except Exception:
-        return None
+def _norm(vec: Dict[str, float]) -> Dict[str, float]:
+    s = sum(x * x for x in vec.values())
+    if s <= 0:
+        return vec
+    mag = math.sqrt(s)
+    return {k: v / mag for k, v in vec.items()}
 
 
-def _cap(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
-
-def _z(x: float, mean: float, std: float) -> float:
-    return 0.0 if std <= 1e-9 else (x - mean) / std
-
-
-def _genre_jaccard_weight(item_genres: Iterable[int], liked: Dict[int, float]) -> float:
-    if not item_genres or not liked:
+def _dot(a: Dict[str, float], b: Dict[str, float]) -> float:
+    if not a or not b:
         return 0.0
-    # Weighted overlap / sqrt(norms) (cosine-like but on IDs)
-    s = sum(liked.get(g, 0.0) for g in item_genres)
-    denom = math.sqrt(sum(v * v for v in liked.values())) * math.sqrt(len(list(item_genres)))
-    return (s / denom) if denom > 0 else 0.0
+    # iterate over smaller dict
+    if len(a) > len(b):
+        a, b = b, a
+    return sum(v * b.get(k, 0.0) for k, v in a.items())
 
 
-def build_profile_from_ratings(cfg: Any) -> Dict[str, Any]:
+def _extract_people(credits: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    cast_names = []
+    crew_names = []
+    if not isinstance(credits, dict):
+        return cast_names, crew_names
+    if isinstance(credits.get("cast"), list):
+        cast_names = [c.get("name") for c in credits["cast"] if isinstance(c, dict) and c.get("name")]
+    if isinstance(credits.get("crew"), list):
+        crew_names = [c.get("name") for c in credits["crew"] if isinstance(c, dict) and c.get("name")]
+    return cast_names, crew_names
+
+
+def build_profile_from_ratings(ratings_csv: str) -> Dict[str, Dict[str, float]]:
     """
-    Build a taste profile from ratings.csv.
-    Optionally enrich a limited number of titles via TMDB search to grab genres for DNA.
+    Create a user 'DNA' from the IMDb ratings CSV:
+    - boosts genres/directors/cast weighted by (rating - user_mean)
+    - slight decay for very old watches (if 'Date Rated' column exists)
+    The CSV format is the standard IMDb export.
     """
-    rows = _read_ratings_csv(cfg.ratings_csv)
-    # Basic stats
-    ratings: List[float] = []
-    by_lang = Counter()
-    by_year = Counter()
-    liked_genres: Dict[int, float] = defaultdict(float)
+    try:
+        df = pd.read_csv(ratings_csv)
+    except Exception:
+        return {
+            "genre": {},
+            "cast": {},
+            "director": {},
+            "writer": {},
+            "year": {},
+        }
 
-    # Optional enrichment
-    augment = bool(cfg.augment_profile)
-    augment_limit = int(cfg.augment_profile_limit or 0)
-    lang = cfg.tmdb_language or "en-US"
-    timeout = int(cfg.tmdb_read_timeout or 20)
-    use_bearer = bool(cfg.tmdb_use_bearer)
+    # Normalize columns we care about (IMDb export field names can vary)
+    # Expect at least: Title, URL, Your Rating, Year, Genres, and optionally Directors, Writers
+    col_map = {c.lower(): c for c in df.columns}
+    def col(*cands): 
+        for c in cands:
+            if c.lower() in col_map:
+                return col_map[c.lower()]
+        return None
 
-    augmented = 0
+    c_rating = col("Your Rating", "your rating")
+    c_year = col("Year", "year")
+    c_genres = col("Genres", "genres")
+    c_directors = col("Directors", "director", "Directors")
+    c_writers = col("Writers", "writer", "Writers")
 
-    for r in rows:
-        title = _get_title(r)
-        if not title:
-            continue
-        year = _get_year(r)
-        user_rating = _get_rating(r)
-        if user_rating is not None:
-            ratings.append(user_rating)
-        if year:
-            by_year[year] += 1
+    if not c_rating:
+        return {"genre": {}, "cast": {}, "director": {}, "writer": {}, "year": {}}
 
-        # Attempt to guess language from title if present in pool later; for now skip.
-        # Enrich with TMDB to get genres (capped)
-        if augment and augmented < augment_limit:
+    df = df.dropna(subset=[c_rating])
+    df["_rating"] = pd.to_numeric(df[c_rating], errors="coerce")
+    df = df.dropna(subset=["_rating"])
+    if df.empty:
+        return {"genre": {}, "cast": {}, "director": {}, "writer": {}, "year": {}}
+
+    user_mean = df["_rating"].mean()
+
+    genre_weights: Dict[str, float] = defaultdict(float)
+    director_weights: Dict[str, float] = defaultdict(float)
+    writer_weights: Dict[str, float] = defaultdict(float)
+    year_weights: Dict[str, float] = defaultdict(float)
+
+    for _, row in df.iterrows():
+        r = float(row["_rating"])
+        delta = r - user_mean  # positive if above your norm
+        boost = 1.0 + max(delta, -2.0) * 0.5  # keep stable; above-avg ≈ >1.0
+
+        if c_genres and isinstance(row.get(c_genres), str):
+            for g in [x.strip() for x in row[c_genres].split(",") if x.strip()]:
+                genre_weights[g] += boost
+
+        if c_directors and isinstance(row.get(c_directors), str):
+            for d in [x.strip() for x in row[c_directors].split(",") if x.strip()]:
+                director_weights[d] += boost
+
+        if c_writers and isinstance(row.get(c_writers), str):
+            for w in [x.strip() for x in row[c_writers].split(",") if x.strip()]:
+                writer_weights[w] += boost
+
+        if c_year and pd.notna(row.get(c_year)):
             try:
-                data = search_title_once(title, year, lang, timeout, use_bearer)
-                results = data.get("results") or []
-                if results:
-                    top = results[0]
-                    gids = top.get("genre_ids") or []
-                    for g in gids:
-                        # weight by user's score if present, else modest default
-                        w = 0.5 + (user_rating or 7.0) / 10.0
-                        liked_genres[int(g)] += w
-                    augmented += 1
-            except Exception:
-                # search errors are non-fatal
-                pass
-
-    mean = (sum(ratings) / len(ratings)) if ratings else 7.0
-    std = (sum((x - mean) ** 2 for x in ratings) / len(ratings)) ** 0.5 if ratings else 1.5
-
-    # Year preference as weighted mean/stdev
-    if by_year:
-        ys = []
-        for y, c in by_year.items():
-            ys += [y] * c
-        ymean = sum(ys) / len(ys)
-        ystd = (sum((y - ymean) ** 2 for y in ys) / len(ys)) ** 0.5 if len(ys) > 1 else 10.0
-    else:
-        ymean, ystd = 2016.0, 8.0
+                year = str(int(row[c_year]))
+                year_weights[year] += 0.25 * boost  # small temporal taste
 
     return {
-        "rating_mean": mean,
-        "rating_std": std,
-        "year_mean": ymean,
-        "year_std": ystd,
-        "liked_genres": dict(liked_genres),
+        "genre": _norm(dict(genre_weights)),
+        "director": _norm(dict(director_weights)),
+        "writer": _norm(dict(writer_weights)),
+        "year": _norm(dict(year_weights)),
+        # cast is derived during scoring from candidate credits
+        "cast": {},
     }
 
 
-def _year_score(year: Optional[int], ymean: float, ystd: float) -> float:
-    if not year:
-        return 0.0
-    # Penalize very far years mildly; reward closeness to user's center
-    z = abs((year - ymean) / max(ystd, 1.0))
-    return _cap(1.5 - 0.3 * z, 0.0, 1.5)
+def score_candidate(
+    item: Dict[str, Any],
+    profile: Dict[str, Dict[str, float]],
+    w_critic: float = 0.25,
+    w_audience: float = 0.25,
+) -> float:
+    """
+    Blend of:
+      - profile similarity (genres, people, year signal)
+      - public signals if present (tmdb vote_average, vote_count)
+      - optional critic/audience scores on the item dict (if your pipeline adds them)
+    """
+    meta = item or {}
+    genres = [g.get("name") for g in (meta.get("genres") or []) if isinstance(g, dict) and g.get("name")]
+    genre_vec = {g: 1.0 for g in genres}
 
+    credits = meta.get("credits") or {}
+    cast_names, crew_names = _extract_people(credits)
+    cast_vec = {n: 1.0 for n in cast_names[:10]}  # cap noise
+    # treat director/writer from crew (if roles present)
+    directors = [c.get("name") for c in credits.get("crew", []) if c.get("job") == "Director" and c.get("name")]
+    writers = [c.get("name") for c in credits.get("crew", []) if c.get("department") == "Writing" and c.get("name")]
+    director_vec = {n: 1.0 for n in directors}
+    writer_vec = {n: 1.0 for n in writers}
 
-def _pop_score(popularity: float) -> float:
-    # Saturate at ~100
-    return _cap(popularity / 100.0, 0.0, 1.0)
+    year = str(meta.get("release_year") or meta.get("first_air_year") or "")
+    year_vec = {year: 1.0} if year else {}
 
+    sim = (
+        0.45 * _dot(_norm(genre_vec), profile.get("genre", {})) +
+        0.20 * _dot(_norm(cast_vec), profile.get("cast", {})) +
+        0.20 * _dot(_norm(director_vec), profile.get("director", {})) +
+        0.05 * _dot(_norm(writer_vec), profile.get("writer", {})) +
+        0.10 * _dot(_norm(year_vec), profile.get("year", {}))
+    )
 
-def _vote_score(vote_average: float, vote_count: int) -> float:
-    # Bayesian-ish: require some count to fully trust average
-    weight = _cap(math.log10(1 + vote_count) / 3.0, 0.0, 1.0)
-    return (vote_average / 10.0) * (0.5 + 0.5 * weight)
+    # Public signals
+    tmdb_rating = _safe(meta.get("vote_average"), 0.0) / 10.0  # 0..1
+    tmdb_count = _safe(meta.get("vote_count"), 0.0)
+    pop_signal = tmdb_rating * (1.0 + min(tmdb_count, 2000.0) / 2000.0 * 0.25)  # slight boost if many votes
+
+    # Optional critic/audience if you later add them in catalog
+    critic = _safe(meta.get("critic_score"), 0.0) / 100.0
+    audience = _safe(meta.get("audience_score"), 0.0) / 100.0
+    external = w_critic * critic + w_audience * audience
+
+    # slight freshness preference if 'release_year' or 'first_air_year' recent
+    try:
+        y = int(meta.get("release_year") or meta.get("first_air_year") or 0)
+        recency = max(0, y - 2015) / 10.0  # 2016..2025 ~ 0..1
+    except Exception:
+        recency = 0.0
+
+    return 0.60 * sim + 0.25 * pop_signal + 0.10 * external + 0.05 * recency
 
 
 def rank_pool(
     pool: List[Dict[str, Any]],
-    cfg: Any,
-    *,
-    profile: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
+    cfg,
+    meta: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Compute a personalized 'match' score for each item.
+    Rank the pool using your profile DNA + public signals.
+    Returns (ranked_list, rank_meta).
     """
-    if profile is None:
-        profile = build_profile_from_ratings(cfg)
+    profile = build_profile_from_ratings(cfg.ratings_csv)
 
-    critic_w = float(cfg.critic_weight or 0.6)   # influences vote_average
-    audience_w = float(cfg.audience_weight or 0.4)  # influences popularity / vote_count
-    genre_w = 0.9
-    year_w = 0.6
-
-    ymean = profile["year_mean"]
-    ystd = profile["year_std"]
-    liked_genres = {int(k): float(v) for k, v in (profile.get("liked_genres") or {}).items()}
-
-    out: List[Dict[str, Any]] = []
-
+    ranked = []
     for it in pool:
-        va = float(it.get("vote_average") or 0.0)
-        vc = int(it.get("vote_count") or 0)
-        pop = float(it.get("popularity") or 0.0)
-        year = None
-        try:
-            year = int(it.get("year")) if it.get("year") else None
-        except Exception:
-            year = None
+        s = score_candidate(
+            it, profile, w_critic=cfg.weight_critic, w_audience=cfg.weight_audience
+        )
+        rec = dict(it)
+        rec["_score"] = round(float(s), 6)
+        ranked.append(rec)
 
-        gscore = _genre_jaccard_weight(it.get("genre_ids") or [], liked_genres)  # 0..~?
-        yscore = _year_score(year, ymean, ystd)  # 0..1.5
-        vscore = _vote_score(va, vc)            # 0..1
-        pscore = _pop_score(pop)                # 0..1
+    ranked.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
 
-        # Blend
-        score = (genre_w * gscore) + (year_w * yscore) + (critic_w * vscore) + (audience_w * pscore)
+    rmeta = {
+        "weights": {"critic": cfg.weight_critic, "audience": cfg.weight_audience},
+        "profile_dims": {k: len(v or {}) for k, v in profile.items()},
+        "top_sample": [
+            {
+                "title": (x.get("title") or x.get("name") or ""),
+                "score": x.get("_score"),
+                "tmdb_id": x.get("id"),
+                "kind": x.get("media_type") or ("tv" if x.get("first_air_date") else "movie"),
+            }
+            for x in ranked[:5]
+        ],
+    }
 
-        out.append({**it, "match": round(float(score), 4)})
+    # persist a small debug artifact
+    try:
+        dbg = {
+            "profile": {k: dict(sorted(v.items(), key=lambda kv: -kv[1])[:20]) for k, v in profile.items()},
+            "meta": rmeta,
+        }
+        with open("data/debug/rank_debug.json", "w", encoding="utf-8") as f:
+            json.dump(dbg, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
 
-    # Higher is better
-    out.sort(key=lambda x: x.get("match", 0.0), reverse=True)
-    return out
+    return ranked, rmeta
