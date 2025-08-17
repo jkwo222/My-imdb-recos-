@@ -41,6 +41,8 @@ def build_catalog(env: Env) -> List[Dict[str, Any]]:
     pages = int(env.get("DISCOVER_PAGES", 12))
 
     provider_ids, used_map = tmdb.providers_from_env(subs, region)
+    unmatched = [k for k, v in (used_map or {}).items() if not v]
+
     all_items: List[Dict[str, Any]] = []
     diag_pages: List[Dict[str, Any]] = []
 
@@ -77,16 +79,16 @@ def build_catalog(env: Env) -> List[Dict[str, Any]]:
     pool_mod.append_candidates(with_ids)
     pool = pool_mod.load_pool(max_items=5000)
 
-    # Make newest-first by added_at, then tmdb vote
     def _key_sort(it: Dict[str, Any]):
         return (float(it.get("added_at") or 0.0), float(it.get("tmdb_vote") or 0.0))
 
     combined = sorted(pool + with_ids, key=_key_sort, reverse=True)
 
-    # Attach basic diag to env so runner can summarize
+    # Telemetry for runner summary/diag
     env["DISCOVERED_COUNT"] = len(all_items)
     env["ELIGIBLE_COUNT"] = len(combined)  # pre-exclusions
     env["PROVIDER_MAP"] = used_map
+    env["PROVIDER_UNMATCHED"] = unmatched
     env["DISCOVER_PAGE_TELEMETRY"] = diag_pages[:]
 
     return combined
