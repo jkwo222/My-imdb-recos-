@@ -1,11 +1,14 @@
-# File: engine/provider_filter.py
+# engine/provider_filter.py
 from __future__ import annotations
 from typing import Dict, List, Tuple
 
+# Canonical slugs we use across the project
 _CANON = {
     "netflix": "netflix",
     "amazon prime video": "prime_video",
     "prime video": "prime_video",
+    "prime video channel": "prime_video",
+    "prime video channels": "prime_video",
     "amazon video": "prime_video",
     "hulu": "hulu",
     "max": "max",
@@ -20,8 +23,41 @@ _CANON = {
     "paramount+": "paramount_plus",
 }
 
+# Allowed baseline services even if user whitelist is empty
+_ALLOWED_BASE = set(_CANON.values())
+
+def _norm_name(name: str) -> str:
+    return (name or "").strip().lower().replace("_", " ").replace("+", " plus")
+
 def _slugify(name: str) -> str:
-    return _CANON.get(name.strip().lower(), name.strip().lower().replace(" ", "_"))
+    n = _norm_name(name)
+    return _CANON.get(n, n.replace(" ", "_"))
+
+def normalize_user_whitelist(user_whitelist: List[str]) -> set[str]:
+    """Return canonical slugs for a user-supplied whitelist."""
+    out: set[str] = set()
+    for x in user_whitelist or []:
+        out.add(_slugify(x))
+    return out
+
+def is_allowed_provider(name: str, user_whitelist: List[str]) -> bool:
+    """True if a single provider is allowed by whitelist or baseline."""
+    slug = _slugify(name)
+    wl = normalize_user_whitelist(user_whitelist)
+    return (slug in wl) or (slug in _ALLOWED_BASE)
+
+def any_allowed(providers: List[str] | None, user_whitelist: List[str]) -> bool:
+    """True if ANY provider on the title matches the whitelist/baseline."""
+    if not providers:
+        return False
+    wl = normalize_user_whitelist(user_whitelist)
+    for p in providers:
+        slug = _slugify(p)
+        if (slug in wl) or (slug in _ALLOWED_BASE):
+            return True
+    return False
+
+# --- TMDB providers JSON helpers (when using TMDB watch/providers blobs) ---
 
 def pick_region_data(providers_json: dict, region: str) -> dict:
     if not providers_json or "results" not in providers_json:
@@ -35,10 +71,11 @@ def title_has_allowed_provider(
 ) -> Tuple[bool, List[str]]:
     rd = pick_region_data(providers_json, region)
     hits: List[str] = []
+    wl = set(allowed_slugs)
     for bucket in ("flatrate", "ads", "free"):
         for entry in rd.get(bucket, []) or []:
             slug = _slugify(entry.get("provider_name", ""))
-            if slug in allowed_slugs:
+            if (slug in wl) or (slug in _ALLOWED_BASE):
                 hits.append(slug)
     return (len(hits) > 0), sorted(set(hits))
 
