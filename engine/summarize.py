@@ -1,117 +1,99 @@
-# engine/summarize.py
 from __future__ import annotations
-
-import json
-import math
-import os
-from datetime import datetime
+from typing import Dict, Any, List
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+import json
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT_DIR = ROOT / "data" / "out" / "latest"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+OUT = ROOT / "data" / "out" / "latest"
+STATE = ROOT / "data" / "cache" / "state"
 
-def _fmt_score(x: Optional[float]) -> str:
-    if x is None:
-        return "—"
+def _safe_read_json(path: Path, default):
     try:
-        return f"{float(x):.0f}"
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return "—"
+        return default
 
-def _table(rows: List[List[str]]) -> str:
-    if not rows:
-        return ""
-    # Very small markdown helper
-    header = rows[0]
-    out = ["|" + "|".join(header) + "|", "|" + "|".join("---" for _ in header) + "|"]
-    for r in rows[1:]:
-        out.append("|" + "|".join(r) + "|")
-    return "\n".join(out)
+def _tab(rows: List[tuple[str,str]]) -> str:
+    if not rows: return "_—_"
+    lines = ["| Metric | Value |", "|---|---:|"]
+    for k,v in rows:
+        lines.append(f"| {k} | {v} |")
+    return "\n".join(lines)
 
-def _top_n(items: List[Dict[str, Any]], n: int = 15) -> List[Dict[str, Any]]:
-    return sorted(items, key=lambda x: (x.get("match_score") or 0), reverse=True)[:n]
+def write_summary_md(env: Dict[str,str], *, genre_weights: Dict[str,float] | None = None) -> None:
+    ranked = _safe_read_json(OUT / "assistant_ranked.json", {"items":[],"telemetry":{}})
+    meta = _safe_read_json(OUT / "run_meta.json", {})
+    state = _safe_read_json(STATE / "personal_state.json", {})
+    items = ranked.get("items", [])
+    kept = ranked.get("telemetry", {}).get("kept", len(items))
 
-def write_summary_md(
-    env: Dict[str, str],
-    *,
-    items_ranked: List[Dict[str, Any]],
-    genre_weights: Optional[Dict[str, float]],
-    director_weights: Optional[Dict[str, float]],
-    telemetry: Dict[str, Any],
-) -> None:
-    region = telemetry.get("region") or env.get("REGION") or "US"
-    langs = telemetry.get("original_langs") or env.get("ORIGINAL_LANGS") or "en"
-    subs = telemetry.get("subs_include") or [s.strip() for s in (env.get("SUBS_INCLUDE") or "").split(",") if s.strip()]
+    # Top N for email
+    N = min(30, len(items))
+    head = items[:N]
 
-    # Read affinity keys (genre/director names only) from telemetry; weights are used implicitly in scoring
-    gnames = telemetry.get("affinity", {}).get("genres_learned") or []
-    dnames = telemetry.get("affinity", {}).get("directors_learned") or []
-
-    # Telemetry details block
-    tele_lines = [
-        f"*Region*: **{region}**  •  *Original langs*: **{langs}**",
-        f"*Subscriptions filtered*: **{', '.join(subs)}**",
-        f"*Profile size*: **{telemetry.get('profile_size', 0)}**",
-        f"*Inputs*: **{telemetry.get('total_input', 0)}**  •  *Excluded (seen/rated)*: **{telemetry.get('excluded_already_seen', 0)}**",
-        f"*Scored*: **{telemetry.get('scored_total', 0)}**  •  *Score cut*: **{_fmt_score(telemetry.get('score_cut'))}**  •  *Kept*: **{telemetry.get('kept', 0)}**",
+    # Telemetry block (source health)
+    tel_rows = [
+        ("Region", meta.get("region","")),
+        ("Original langs", meta.get("original_langs","")),
+        ("Subs filtered", ", ".join(meta.get("subs_include",[])) or "—"),
+        ("Discover calls", meta.get("discover",{}).get("discover_calls",0)),
+        ("Discover pages (movies)", meta.get("discover",{}).get("discover_movies",0)),
+        ("Discover pages (tv)", meta.get("discover",{}).get("discover_tv",0)),
+        ("Excluded by IMDb id", meta.get("exclusions",{}).get("excluded_imdb",0)),
+        ("Excluded by title+year", meta.get("exclusions",{}).get("excluded_titleyear",0)),
+        ("Profile titles", meta.get("profile_size",0)),
+        ("Non-zero genre weights", meta.get("genre_weights_nonzero",0)),
+        ("Candidates after filtering", meta.get("candidates_after_filtering",0)),
+        ("Score cut", ranked.get("telemetry",{}).get("score_cut","")),
+        ("Shortlist size", kept),
     ]
 
-    # Taste snapshot tables (names only; weights are baked into match_score)
-    genre_rows = [["Genre", "Seen-basis"]]
-    if gnames:
-        for g in sorted(gnames)[:16]:
-            genre_rows.append([g, "✓"])
+    # Genre weights table (top 12)
+    gw = (genre_weights or state.get("genre_weights") or {})
+    gw_sorted = sorted(gw.items(), key=lambda x: (-x[1], x[0]))[:12]
+    gw_lines = ["| Genre | Weight |", "|---|---:|"] if gw_sorted else ["_—_"]
+    for g, w in gw_sorted:
+        gw_lines.append(f"| {g} | {w:.2f} |")
+
+    # Render picks
+    lines = []
+    lines.append(f"# Daily Recommendations — {env.get('RUN_DATE') or ''}".strip(" —"))
+    lines.append("")
+    lines.append(f"*Region*: **{meta.get('region','')}**  •  *Original langs*: **{meta.get('original_langs','')}**")
+    subs = ", ".join(meta.get("subs_include",[])) or "—"
+    lines.append(f"*Subscriptions filtered*: **{subs}**")
+    lines.append(f"*Candidates after filtering*: **{meta.get('candidates_after_filtering', 0)}**")
+    lines.append("")
+    lines.append("## System telemetry")
+    lines.append(_tab(tel_rows))
+    lines.append("")
+    lines.append("## Your taste snapshot")
+    lines.append("\n".join(gw_lines))
+    lines.append("")
+    lines.append("## Today’s top picks")
+    if not head:
+        lines.append("_None met the score threshold today._")
     else:
-        genre_rows.append(["—", "—"])
+        for i, it in enumerate(head, start=1):
+            title = it.get("title") or "Untitled"
+            year = it.get("year") or ""
+            kind = it.get("type") or it.get("tmdb_media_type") or ""
+            score = it.get("match_score")
+            imdb = it.get("imdb_rating")
+            tmdb = it.get("tmdb_vote")
+            prov = ", ".join(it.get("providers") or [])
+            # short “why”
+            why_bits = []
+            if imdb: why_bits.append(f"IMDb {imdb}")
+            if tmdb: why_bits.append(f"TMDB {tmdb}")
+            if year: why_bits.append(str(year))
+            why = "; ".join(why_bits)
+            lines.append(f"{i}. **{title}** ({year}) — {kind}")
+            lines.append(f"   *score {score:.2f}  •  " +
+                         (f"IMDb {imdb}" if imdb else "") +
+                         (f"  •  TMDB {tmdb}" if tmdb else "") +
+                         (f"  •  {prov}" if prov else ""))
+            lines.append(f"   > {why}")
 
-    director_rows = [["Director", "Seen-basis"]]
-    if dnames:
-        for d in sorted(dnames)[:10]:
-            director_rows.append([d, "✓"])
-    else:
-        director_rows.append(["—", "—"])
-
-    # Top picks rows
-    picks = _top_n(items_ranked, 15)
-    pick_lines: List[str] = []
-    idx = 1
-    for it in picks:
-        t = it.get("title") or "(unknown)"
-        year = it.get("year") or "—"
-        mtype = it.get("type") or it.get("tmdb_media_type") or "title"
-        imdb = it.get("imdb_rating")
-        provs = it.get("providers") or []
-        score = _fmt_score(it.get("match_score"))
-        why = it.get("why") or ""
-        prov_txt = ", ".join(sorted(set(provs))) if provs else "—"
-        pick_lines.append(
-            f"{idx}. **{t}** ({year}) — {mtype}\n"
-            f"   *score {score}*  •  IMDb {imdb if imdb is not None else '—'}  •  {prov_txt}\n"
-            f"   > {why}"
-        )
-        idx += 1
-
-    md = []
-    md.append(f"# Daily Recommendations — {datetime.utcnow().date().isoformat()}")
-    md.append("")
-    md.extend(tele_lines)
-    md.append("")
-    md.append("## Your taste snapshot")
-    md.append("")
-    md.append(_table(genre_rows))
-    md.append("")
-    md.append("### Director affinities")
-    md.append(_table(director_rows))
-    md.append("")
-    md.append("## Today’s top picks")
-    md.append("")
-    if pick_lines:
-        md.extend(pick_lines)
-    else:
-        md.append("_None above the score cut today._")
-    md.append("")
-    md.append(f"---\n_Generated from {telemetry.get('scored_total', 0)} candidate titles (after filtering & exclusions)._")
-
-    (OUT_DIR / "summary.md").write_text("\n".join(md), encoding="utf-8")
+    OUT.write_text("\n".join(lines), encoding="utf-8")
+    (OUT / "summary.md").write_text("\n".join(lines), encoding="utf-8")
