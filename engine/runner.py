@@ -187,8 +187,8 @@ def main() -> None:
 
     # Validate critical environment
     missing_hard = []
-    if not os.getenv("TMDB_API_KEY"):
-        missing_hard.append("TMDB_API_KEY")
+    if not os.getenv("TMDB_API_KEY") and not os.getenv("TMDB_BEARER"):
+        missing_hard.append("TMDB_API_KEY or TMDB_BEARER")
     if missing_hard:
         msg = f"[env] Missing required environment: {', '.join(missing_hard)}. Set these and re-run."
         _log(msg)
@@ -199,17 +199,15 @@ def main() -> None:
             pass
         sys.exit(2)
 
-    # Soft warnings
-    soft_warnings = []
-    if not os.getenv("OMDB_API_KEY"):
-        soft_warnings.append("OMDB_API_KEY (ratings enrichment may be limited)")
+    # Soft warnings (none needed if you are not using OMDb)
+    # If you want a reminder, uncomment below:
+    # if not os.getenv("OMDB_API_KEY"):
+    #     _log("[env] WARN: OMDB_API_KEY not set (OMDb enrichment disabled)")
+
     ratings_csv_1 = Path("data/user/ratings.csv")
     ratings_csv_2 = Path("data/ratings.csv")
     if not os.getenv("IMDB_USER_ID") and not ratings_csv_1.exists() and not ratings_csv_2.exists():
-        soft_warnings.append("IMDB_USER_ID and ratings.csv missing (unseen filtering disabled)")
-
-    for w in soft_warnings:
-        _log(f"[env] WARN: {w}")
+        _log("[env] WARN: IMDB_USER_ID and ratings.csv missing (unseen filtering disabled)")
 
     # Discover pool
     _log(" | catalog:begin")
