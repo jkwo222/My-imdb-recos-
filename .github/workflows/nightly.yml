@@ -25,6 +25,9 @@ jobs:
       # IMDb (optional; CSV expected at data/user/ratings.csv)
       IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
 
+      # Optional @mention for notifications (set in repo Variables)
+      NOTIFY_USER: ${{ vars.NOTIFY_USER }}
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -44,10 +47,20 @@ jobs:
           mkdir -p data/out data/cache
           python -m engine.runner
 
+      # Build a compact digest to overwrite the summary.md
+      - name: Build digest summary
+        run: |
+          python -m engine.summarize \
+            --in "data/out/latest/items.enriched.json" \
+            --diag "data/out/latest/diag.json" \
+            --ratings "data/user/ratings.csv" \
+            --out "data/out/latest/summary.md" \
+            --top 10
+
       - name: Make debug bundle
         run: bash ./.github/scripts/make_debug_bundle.sh
 
-      - name: Post/update Daily Recommendations issue
+      - name: Post/update Daily Recommendations issue + comment
         uses: actions/github-script@v7
         with:
           script: |
@@ -60,26 +73,30 @@ jobs:
             try { body = fs.readFileSync('data/out/latest/summary.md', 'utf8'); }
             catch { body = 'No summary.md found. Check debug bundle.'; }
 
-            let extra = '';
-            try { extra = fs.readFileSync('debug-bundle/analysis.md', 'utf8'); } catch {}
-
-            const fullBody = body + '\n\n---\n\n' + (extra || '_No diagnostics available_');
-
+            // Find existing open issue with this title (labeled daily-recos)
             const { data: issues } = await github.rest.issues.listForRepo({
               owner, repo, state: 'open', labels: 'daily-recos', per_page: 100
             });
             let issue = issues.find(i => i.title === title);
 
             if (!issue) {
-              issue = (await github.rest.issues.create({
-                owner, repo, title, body: fullBody, labels: ['daily-recos']
-              })).data;
+              const res = await github.rest.issues.create({
+                owner, repo, title, body, labels: ['daily-recos']
+              });
+              issue = res.data;
             } else {
               await github.rest.issues.update({
-                owner, repo, issue_number: issue.number, body: fullBody
+                owner, repo, issue_number: issue.number, body
               });
             }
-            core.info(`Issue #${issue.number} updated`);
+
+            // Add a comment with the same digest to trigger a notification
+            const mention = process.env.NOTIFY_USER ? ` cc @${process.env.NOTIFY_USER}` : '';
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: issue.number,
+              body: `Daily digest posted.${mention}\n\n` + body
+            });
+            core.info(`Issue #${issue.number} updated and commented`);
 
       - name: Upload debug bundle
         uses: actions/upload-artifact@v4
