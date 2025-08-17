@@ -1,214 +1,218 @@
 from __future__ import annotations
+
 import json
 import os
-import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional
 
-import pandas as pd
-
-from .env import from_os_env, Env
+# --- Local imports
 from .catalog_builder import build_catalog
+from .self_check import run_self_check
+from .scoring import (
+    load_seen_index_from_paths,
+    filter_unseen,
+    add_match_scores,
+    apply_match_cut,
+    summarize_selection,
+)
 
-STEP_SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY")  # GH Actions sets this
-OUT_DIR = Path("data/out/latest")
-CACHE_DIR = Path("data/cache")
-RATINGS_PATHS = [
-    Path("data/ratings.csv"),
-    Path("data/user/ratings.csv"),
-]  # we’ll try these in order
-
-
-# ---------- ratings loader (flexible) ----------
-
-_TCONST_RE = re.compile(r"(tt\d+)")
-_URL_TCONST_RE = re.compile(r"tt\d+")
-
-def _extract_tt_from_url(s: str) -> Optional[str]:
-    if not isinstance(s, str):
-        return None
-    m = _URL_TCONST_RE.search(s)
-    return m.group(0) if m else None
-
-def _normalize_imdb_id(x: Any) -> Optional[str]:
-    if pd.isna(x):
-        return None
-    s = str(x).strip()
-    if not s:
-        return None
-    m = _TCONST_RE.search(s)
-    return m.group(1) if m else None
-
-POSSIBLE_TCONST_COLUMNS = [
-    "const", "tconst", "imdb_id", "IMDbID", "imdbId", "titleId", "TitleId",
-    "url", "URL", "IMDb URL",
-]
-
-def load_local_ratings() -> Tuple[Set[str], Dict[str, Any]]:
-    """
-    Return: (seen_imdb_ids, diagnostics)
-    - supports many column names
-    - logs helpful diagnostics for GH summary
-    """
-    diags: Dict[str, Any] = {"path_checked": [], "found": False}
-    for p in RATINGS_PATHS:
-        diags["path_checked"].append(str(p))
-        if p.exists() and p.is_file():
-            try:
-                df = pd.read_csv(p)
-            except Exception as ex:
-                diags["error"] = f"Failed to read {p}: {ex!r}"
-                continue
-
-            diags["found"] = True
-            diags["columns"] = list(df.columns)
-            diags["n_rows"] = int(len(df))
-
-            # Try to find a tconst column
-            col: Optional[str] = None
-            for c in POSSIBLE_TCONST_COLUMNS:
-                if c in df.columns:
-                    col = c
-                    break
-
-            ids: Set[str] = set()
-            if col:
-                diags["chosen_column"] = col
-                series = df[col].astype(str)
-                # If the chosen column looks like a URL, extract tt
-                if col.lower() in {"url", "imdb url"}:
-                    series = series.map(_extract_tt_from_url)
-                else:
-                    series = series.map(_normalize_imdb_id)
-                ids = {s for s in series.dropna().astype(str) if s.startswith("tt")}
-            else:
-                # last-ditch: scan all columns, pick tt-like tokens
-                diags["chosen_column"] = None
-                for c in df.columns:
-                    cand = df[c].astype(str).map(_normalize_imdb_id)
-                    ids.update(s for s in cand.dropna().astype(str) if s.startswith("tt"))
-
-            diags["seen_count"] = len(ids)
-            diags["sample_first_5"] = sorted(list(ids))[:5]
-            diags["sample_last_5"] = sorted(list(ids))[-5:]
-            return ids, diags
-
-    # Not found anywhere
-    diags["seen_count"] = 0
-    return set(), diags
+# Optional: rotation is used inside catalog_builder in many setups,
+# but we import it here to keep parity with the existing repo layout.
+# from .rotation import plan_pages
 
 
-# ---------- summary & debug helpers ----------
+# ============================================================
+# Files / IO helpers
+# ============================================================
 
-def _write_json(path: Path, obj: Any) -> None:
+ROOT = Path(os.getcwd())
+OUT_DIR = ROOT / "out"
+DEBUG_DIR = OUT_DIR / "debug"
+DATA_DIR = ROOT / "data"
+
+def _ensure_dirs() -> None:
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
+def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
-def _append_step_summary(md: str) -> None:
-    if not STEP_SUMMARY:
-        return
-    with open(STEP_SUMMARY, "a", encoding="utf-8") as f:
-        f.write(md.rstrip() + "\n")
-
-def _int(v: Any, default: int) -> int:
-    try:
-        return int(v)
-    except Exception:
-        return default
+def _write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
 
 
-# ---------- main ----------
+# ============================================================
+# Env
+# ============================================================
+
+@dataclass
+class Cfg:
+    region: str
+    subs_include: List[str]
+    discover_pages: int
+    rotate_minutes: int
+    min_match_cut: float
+
+def _parse_env_list(val: str) -> List[str]:
+    return [p.strip() for p in val.split(",") if p.strip()]
+
+def _load_env() -> Dict[str, Any]:
+    """
+    Return a plain dict so downstream code can call env.get(...).
+    """
+    env: Dict[str, Any] = {}
+    # Basics
+    env["REGION"] = os.environ.get("REGION", "US").strip() or "US"
+    env["SUBS_INCLUDE"] = os.environ.get(
+        "SUBS_INCLUDE",
+        "netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus",
+    )
+    env["DISCOVER_PAGES"] = int(os.environ.get("DISCOVER_PAGES", "3") or "3")
+    env["ROTATE_MINUTES"] = int(os.environ.get("ROTATE_MINUTES", "60") or "60")
+    env["MIN_MATCH_CUT"] = float(os.environ.get("MIN_MATCH_CUT", "58") or "58")
+
+    # Allow an alternate ratings path (optional)
+    env["RATINGS_PATH"] = os.environ.get("RATINGS_PATH", "").strip()
+
+    # Surface other knobs untouched (providers, langs, etc.) if present
+    # so catalog_builder can look them up.
+    passthrough_keys = [
+        "TMDB_ACCESS_TOKEN",
+        "TMDB_REGION",
+        "WITH_ORIGINAL_LANGS",
+        "WITH_WATCH_PROVIDERS",
+        "PROVIDER_REGION",
+        "PAGE_CAP",
+        "STEP",
+    ]
+    for k in passthrough_keys:
+        v = os.environ.get(k)
+        if v is not None:
+            env[k] = v
+    return env
+
+def _cfg_from_env(env: Dict[str, Any]) -> Cfg:
+    return Cfg(
+        region=str(env.get("REGION", "US")),
+        subs_include=_parse_env_list(str(env.get("SUBS_INCLUDE", ""))),
+        discover_pages=int(env.get("DISCOVER_PAGES", 3)),
+        rotate_minutes=int(env.get("ROTATE_MINUTES", 60)),
+        min_match_cut=float(env.get("MIN_MATCH_CUT", 58.0)),
+    )
+
+
+# ============================================================
+# Telemetry helpers
+# ============================================================
+
+def _telemetry_markdown(cfg: Cfg, discovered: int, enriched: int, kept_after_exclusions: int,
+                        above_cut: int, errors: int, excl_seen: int, excl_list_sz: int) -> str:
+    sublist = ",".join(cfg.subs_include)
+    return f"""# Daily recommendations
+
+## Telemetry
+
+- Region: **{cfg.region}**
+- SUBS_INCLUDE: `{sublist}`
+- Discover pages: **{cfg.discover_pages}**
+- Discovered (raw): **{discovered}**
+- Enriched (details fetched): **{enriched}**; errors: **{errors}**
+- Exclusion list size (ratings + IMDb web): **{excl_list_sz}**
+- Excluded for being seen: **{excl_seen}**
+- Eligible after exclusions: **{kept_after_exclusions}**
+- Above match cut (≥ {cfg.min_match_cut}): **{above_cut}**
+"""
+
+# ============================================================
+# Main pipeline
+# ============================================================
 
 def main() -> None:
-    print(" | catalog:begin")
-    env: Env = from_os_env()
+    run_self_check()  # fail early if essential symbols are missing
+    _ensure_dirs()
 
-    # build discovery pool (raw list of items)
+    env = _load_env()                # plain dict (has .get)
+    cfg = _cfg_from_env(env)
+
+    print(" | catalog:begin", flush=True)
+    # Build your catalog using the env dict. We assume build_catalog returns a list of dict items.
+    # Items are expected to already include fields like: title, year, media_type/kind/type, tmdb_vote/vote_average, providers/watch_available, possibly imdb_id.
     items: List[Dict[str, Any]] = build_catalog(env)
-    print(f" | catalog:end kept={len(items)}")
+    print(f" | catalog:end kept={len(items)}", flush=True)
 
-    # exclusions – local ratings first
-    seen_local, ratings_diag = load_local_ratings()
+    # ---------- Load ratings / seen ----------
+    # Accept explicit RATINGS_PATH, else try typical defaults
+    ratings_candidates: List[Path] = []
+    if env.get("RATINGS_PATH"):
+        ratings_candidates.append(Path(str(env["RATINGS_PATH"])))
+    ratings_candidates.extend([DATA_DIR / "ratings.csv", ROOT / "ratings.csv"])
 
-    # (Optional) extend with imdb web history if you have a fetcher; left as no-op.
-    seen_all = set(seen_local)
+    seen_ids, seen_pairs, ratings_diag = load_seen_index_from_paths(ratings_candidates)
 
-    # Apply exclusions by imdb_id if available, otherwise by tmdb_id as fallback
-    def _is_seen(it: Dict[str, Any]) -> bool:
-        imdb_id = it.get("imdb_id")
-        if imdb_id and imdb_id in seen_all:
-            return True
-        # no imdb_id? treat as unseen
-        return False
+    # ---------- Exclusions (seen) ----------
+    before_seen = len(items)
+    eligible = filter_unseen(items, seen_ids=seen_ids, seen_pairs=seen_pairs)
+    excluded_seen = before_seen - len(eligible)
 
-    eligible = [it for it in items if not _is_seen(it)]
+    # ---------- Scoring + cut ----------
+    add_match_scores(eligible, tv_penalty_points=2.0)
+    winners = apply_match_cut(eligible, cfg.min_match_cut)
 
-    # Score / match-cut gate — assume a precomputed `match` if your pipeline adds it,
-    # else neutral 0. We don’t invent a model here—just pass-through.
-    # (If you do have a scorer elsewhere, this will still preserve the threshold.)
-    min_cut = float(getattr(env, "MIN_MATCH_CUT", 58.0) or 58.0)
-    above_cut = [it for it in eligible if float(it.get("match", 0)) >= min_cut]
+    # ---------- Outputs ----------
+    # 1) assistant_feed.json (your recommendation payload)
+    feed_path = OUT_DIR / "assistant_feed.json"
+    _write_json(feed_path, winners)
 
-    # telemetry object for summary/debug
-    telemetry = {
-        "Region": env.get("REGION", "US"),
-        "SUBS_INCLUDE": env.get("SUBS_INCLUDE", []),
-        "Discover pages": env.get("DISCOVER_PAGES", 3),
-        "Discovered (raw)": len(items),
-        "Excluded for being seen": len(items) - len(eligible),
-        "Eligible after exclusions": len(eligible),
-        "Above match cut (≥ {:.1f})".format(min_cut): len(above_cut),
-    }
+    # 2) telemetry summary (markdown)
+    telemetry = _telemetry_markdown(
+        cfg=cfg,
+        discovered=len(items),
+        enriched=len(items),     # if your build step enriches details; set appropriately if you split phases
+        kept_after_exclusions=len(eligible),
+        above_cut=len(winners),
+        errors=0,                # plug in your actual error count if you track it in catalog_builder
+        excl_seen=excluded_seen,
+        excl_list_sz=len(seen_ids) + sum(1 for t, _ in seen_pairs if t),
+    )
+    _write_text(OUT_DIR / "telemetry.md", telemetry)
 
-    # write assistant_feed.json (for your debugging)
-    _write_json(OUT_DIR / "assistant_feed.json", eligible)
-
-    # write diagnostics pack (small, separate from big “out.zip”)
-    debug_payload = {
-        "telemetry": telemetry,
+    # 3) diagnostics.json (rich debug blob)
+    debug_payload: Dict[str, Any] = {
+        "env_effective": env,
+        "cfg": {
+            "region": cfg.region,
+            "subs_include": cfg.subs_include,
+            "discover_pages": cfg.discover_pages,
+            "rotate_minutes": cfg.rotate_minutes,
+            "min_match_cut": cfg.min_match_cut,
+        },
         "ratings_diagnostics": ratings_diag,
-        "min_match_cut": min_cut,
-        "eligible_sample_first_5": eligible[:5],
+        "counts": {
+            "raw_discovered": len(items),
+            "eligible_after_seen": len(eligible),
+            "excluded_seen": excluded_seen,
+            "above_cut": len(winners),
+        },
+        "sample_eligible": [
+            {
+                "title": it.get("title") or it.get("name"),
+                "year": it.get("year"),
+                "media_type": it.get("media_type") or it.get("type") or it.get("kind"),
+                "tmdb_vote": it.get("tmdb_vote") or it.get("vote_average"),
+                "match": it.get("match"),
+                "watch_available": it.get("watch_available") or it.get("providers"),
+            }
+            for it in eligible[:20]
+        ],
+        "summary": summarize_selection(eligible, cfg.min_match_cut),
     }
-    _write_json(OUT_DIR / "debug/diagnostics.json", debug_payload)
+    _write_json(DEBUG_DIR / "diagnostics.json", debug_payload)
 
-    # GH step summary
-    _append_step_summary("# Daily recommendations\n")
-    _append_step_summary("## Telemetry\n")
-    _append_step_summary(f"- Region: **{telemetry['Region']}**")
-    _append_step_summary(f"- SUBS_INCLUDE: `{','.join(telemetry['SUBS_INCLUDE'])}`")
-    _append_step_summary(f"- Discover pages: **{telemetry['Discover pages']}**")
-    _append_step_summary(f"- Discovered (raw): **{telemetry['Discovered (raw)']}**")
-    _append_step_summary(f"- Excluded for being seen: **{telemetry['Excluded for being seen']}**")
-    _append_step_summary(f"- Eligible after exclusions: **{telemetry['Eligible after exclusions']}**")
-    _append_step_summary(f"- Above match cut (≥ {min_cut:.1f}): **{telemetry[f'Above match cut (≥ {min_cut:.1f})']}**")
-
-    # Also surface ratings.csv diagnostics so you can confirm the column being used
-    _append_step_summary("\n## ratings.csv diagnostics\n")
-    if ratings_diag.get("found"):
-        _append_step_summary(f"- Found: **True**")
-        _append_step_summary(f"- Path tried: `{', '.join(ratings_diag.get('path_checked', []))}`")
-        _append_step_summary(f"- Columns: `{', '.join(ratings_diag.get('columns', []))}`")
-        _append_step_summary(f"- Rows: **{ratings_diag.get('n_rows', 0)}**")
-        _append_step_summary(f"- Chosen column: `{ratings_diag.get('chosen_column')}`")
-        _append_step_summary(f"- Seen (unique) count: **{ratings_diag.get('seen_count', 0)}**")
-        _append_step_summary(f"- Samples: `{ratings_diag.get('sample_first_5', [])}` … `{ratings_diag.get('sample_last_5', [])}`")
-    else:
-        _append_step_summary(f"- Found: **False**")
-        _append_step_summary(f"- Paths tried: `{', '.join(ratings_diag.get('path_checked', []))}`")
-
-    # Write a tiny summary.md for artifact viewers
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    with (OUT_DIR / "summary.md").open("w", encoding="utf-8") as f:
-        f.write("# Daily recommendations\n\n")
-        f.write(json.dumps(telemetry, indent=2))
-        f.write("\n")
-
-    # Exit code 0 even if none above cut; the job should succeed as long as the pipeline ran.
-    # If you want to fail on empty results, flip this condition.
-    if False and not above_cut:
-        raise SystemExit(2)
+    # Also helpful to print a one-liner to logs:
+    print(f" | results: discovered={len(items)} eligible={len(eligible)} above_cut={len(winners)}", flush=True)
 
 
 if __name__ == "__main__":
