@@ -1,149 +1,205 @@
-# engine/catalog_builder.py
+# FILE: engine/catalog_builder.py
 from __future__ import annotations
-import hashlib, json, os, pathlib, time, urllib.request
+import os, time, json, gzip, io, pathlib, hashlib
 from typing import Dict, List, Tuple, Optional
+import requests
 
-TMDB_ROOT = "https://api.themoviedb.org/3"
-CACHE_ROOT = pathlib.Path("data/cache")
+TMDB = "https://api.themoviedb.org/3"
+IMDB_BASE = "https://datasets.imdbws.com"
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+CACHE_ROOT = ROOT / "data" / "cache"
 TMDB_CACHE = CACHE_ROOT / "tmdb"
-TMDB_CACHE.mkdir(parents=True, exist_ok=True)
+IMDB_CACHE = CACHE_ROOT / "imdb"
+for p in (TMDB_CACHE, IMDB_CACHE):
+    p.mkdir(parents=True, exist_ok=True)
 
-def _tmdb_headers() -> Dict[str, str]:
-    key = (os.environ.get("TMDB_API_KEY") or "").strip()
-    # TMDB v4 bearer token OR v3 key in query. We support bearer only here.
+def _tmdb_headers():
+    key = os.environ.get("TMDB_API_KEY","").strip()
     return {"Authorization": f"Bearer {key}"} if key else {}
 
 def _h(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
-def _cached_get_json(url: str, ttl_hours: int = 24) -> Optional[dict]:
-    fp = TMDB_CACHE / f"{_h(url)}.json"
-    if fp.exists():
-        age = time.time() - fp.stat().st_mtime
-        if age < ttl_hours * 3600:
-            try:
-                return json.load(open(fp, "r", encoding="utf-8"))
-            except Exception:
-                pass
-    req = urllib.request.Request(url, headers=_tmdb_headers())
-    try:
-        with urllib.request.urlopen(req, timeout=45) as r:
-            raw = r.read().decode("utf-8", errors="ignore")
-    except Exception as e:
-        print(f"  [http] error for {url} → {e}")
+def _cache_path(url: str, hours: int, bucket: pathlib.Path) -> pathlib.Path:
+    p = bucket / f"{_h(url)}.json"
+    if p.exists():
+        age = time.time() - p.stat().st_mtime
+        if age < hours * 3600:
+            return p
+    return p
+
+def _get_json_cached(url: str, hours: int, bucket: pathlib.Path, headers=None):
+    path = _cache_path(url, hours, bucket)
+    if path.exists():
+        try:
+            return json.load(open(path,"r",encoding="utf-8"))
+        except Exception:
+            pass
+    r = requests.get(url, headers=headers, timeout=30)
+    if r.status_code != 200:
+        print(f" {r.status_code} for {url} (no body cached)")
         return None
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return None
-    fp.parent.mkdir(parents=True, exist_ok=True)
-    json.dump(data, open(fp, "w", encoding="utf-8"))
+    data = r.json()
+    json.dump(data, open(path,"w",encoding="utf-8"))
     return data
 
-def _discover_ids(media_type: str, pages: int) -> List[int]:
-    out: List[int] = []
-    for p in range(1, pages + 1):
-        url = f"{TMDB_ROOT}/discover/{media_type}?page={p}&sort_by=popularity.desc"
-        d = _cached_get_json(url, ttl_hours=6)
-        for r in (d.get("results") or []) if d else []:
+def _collect_tmdb_ids(media_type: str, pages: int) -> List[int]:
+    ids = []
+    for page in range(1, pages+1):
+        url = f"{TMDB}/discover/{media_type}?page={page}&sort_by=popularity.desc"
+        data = _get_json_cached(url, 6, TMDB_CACHE, headers=_tmdb_headers())
+        for r in (data.get("results") or []) if data else []:
             try:
-                out.append(int(r.get("id")))
+                ids.append(int(r.get("id")))
             except Exception:
                 pass
-    return out
+    return ids
 
-PROV_MAP = {
-    "Netflix":"netflix","Amazon Prime Video":"prime_video","Prime Video":"prime_video",
-    "Hulu":"hulu","Max":"max","HBO Max":"max","Disney Plus":"disney_plus","Disney+":"disney_plus",
-    "Apple TV Plus":"apple_tv_plus","Apple TV+":"apple_tv_plus","Peacock":"peacock",
-    "Paramount Plus":"paramount_plus","Paramount+":"paramount_plus",
-}
+def _tmdb_details(media_type: str, tmdb_id: int) -> Optional[dict]:
+    url = f"{TMDB}/{media_type}/{tmdb_id}?append_to_response=external_ids,watch/providers"
+    return _get_json_cached(url, 48, TMDB_CACHE, headers=_tmdb_headers())
 
-def _providers(media: str, tmdb_id: int, region: str) -> List[str]:
-    url = f"{TMDB_ROOT}/{media}/{tmdb_id}/watch/providers"
-    d = _cached_get_json(url, ttl_hours=24) or {}
-    res = (d.get("results") or {}).get(region.upper()) or {}
+def _providers_from_tmdb(d: dict, region="US") -> List[str]:
     out = set()
-    for bucket in ("flatrate","ads","free"):
-        for e in res.get(bucket, []) or []:
-            name = PROV_MAP.get(e.get("provider_name"))
-            if name: out.add(name)
+    prov_data = ((d or {}).get("watch/providers") or {}).get("results") or {}
+    rd = prov_data.get(region, {}) if isinstance(prov_data, dict) else {}
+    for bucket in ("flatrate", "ads", "free"):
+        for p in rd.get(bucket, []) or []:
+            name = p.get("provider_name") or ""
+            if name:
+                out.add(name)
     return sorted(out)
 
-def _details(media: str, tmdb_id: int) -> Optional[dict]:
-    url = f"{TMDB_ROOT}/{media}/{tmdb_id}?append_to_response=external_ids"
-    return _cached_get_json(url, ttl_hours=168)
+# --- IMDb TSV loading / caching ---
 
-def _to_item(media: str, d: dict) -> Optional[dict]:
+def _download_gz(url: str) -> bytes:
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    return r.content
+
+def _ensure_gz(path: pathlib.Path, url: str, max_age_hours: int):
+    if path.exists():
+        age = time.time() - path.stat().st_mtime
+        if age < max_age_hours * 3600:
+            return
+    content = _download_gz(url)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(content)
+
+def ensure_imdb_cache():
+    # weekly datasets; refreshing every 72h is fine
+    basics = IMDB_CACHE / "title.basics.tsv.gz"
+    ratings = IMDB_CACHE / "title.ratings.tsv.gz"
+    _ensure_gz(basics, f"{IMDB_BASE}/title.basics.tsv.gz", 72)
+    _ensure_gz(ratings, f"{IMDB_BASE}/title.ratings.tsv.gz", 72)
+    print("[IMDb TSV] basics+ratings cached →", IMDB_CACHE)
+
+def _read_tsv_gz(path: pathlib.Path):
+    with gzip.open(path, "rb") as f:
+        text = io.TextIOWrapper(f, encoding="utf-8", errors="ignore")
+        header = None
+        for line in text:
+            line = line.rstrip("\n")
+            cells = line.split("\t")
+            if header is None:
+                header = cells
+                continue
+            yield dict(zip(header, cells))
+
+def _imdb_maps() -> Tuple[Dict[str, float], Dict[str, Tuple[str,int]]]:
+    """
+    Returns:
+      ratings_map: tconst -> averageRating(float 0..10)
+      basics_map:  tconst -> (primaryTitle, startYear)
+    """
+    ratings_map: Dict[str, float] = {}
+    basics_map: Dict[str, Tuple[str,int]] = {}
+    rpath = IMDB_CACHE / "title.ratings.tsv.gz"
+    bpath = IMDB_CACHE / "title.basics.tsv.gz"
+    print("[IMDb TSV] loading ratings…")
+    for r in _read_tsv_gz(rpath):
+        tconst = r.get("tconst","")
+        try:
+            ratings_map[tconst] = float(r.get("averageRating","0") or "0")
+        except Exception:
+            pass
+    print("[IMDb TSV] loading basics…")
+    for b in _read_tsv_gz(bpath):
+        tconst = b.get("tconst","")
+        title = b.get("primaryTitle","") or b.get("originalTitle","")
+        y = b.get("startYear","")
+        try:
+            year = int(y) if y.isdigit() else 0
+        except Exception:
+            year = 0
+        basics_map[tconst] = (title, year)
+    return ratings_map, basics_map
+
+def _to_item(media_type: str, d: dict, imdb_ratings: Dict[str,float], imdb_basics: Dict[str,Tuple[str,int]]) -> Optional[Dict]:
     if not d: return None
     title = d.get("title") or d.get("name") or ""
     date = (d.get("release_date") or d.get("first_air_date") or "")[:4]
-    year = int(date) if date.isdigit() else 0
-    imdb_id = ((d.get("external_ids") or {}).get("imdb_id") or "") if isinstance(d.get("external_ids"), dict) else ""
-    seasons = int(d.get("number_of_seasons") or 1) if media == "tv" else 1
-    typ = "movie" if media == "movie" else ("tvMiniSeries" if seasons == 1 else "tvSeries")
+    year = int(date) if (date and date.isdigit()) else 0
+    seasons = int(d.get("number_of_seasons") or 1) if media_type == "tv" else 1
+    typ = "movie" if media_type == "movie" else ("tvMiniSeries" if seasons == 1 else "tvSeries")
+    imdb_id = ((d.get("external_ids") or {}).get("imdb_id") or "").strip()
+    imdb_rating = 0.0
+    if imdb_id and imdb_id in imdb_ratings:
+        imdb_rating = float(imdb_ratings.get(imdb_id, 0.0))
+        # prefer IMDb basics for year/title if available and missing
+        if year == 0:
+            by = imdb_basics.get(imdb_id)
+            if by:
+                year = by[1] or year
+    providers = _providers_from_tmdb(d, region=os.environ.get("REGION","US").strip() or "US")
     tmdb_vote = float(d.get("vote_average") or 0.0)
-    pop = float(d.get("popularity") or 0.0)
     return {
         "tmdb_id": int(d.get("id") or 0),
-        "imdb_id": imdb_id or "",
+        "imdb_id": imdb_id,
         "title": title,
         "year": year,
         "type": typ,
         "seasons": seasons,
         "tmdb_vote": tmdb_vote,
-        "popularity": pop,
+        "providers": providers,
+        "critic": 0.0,           # rt not available here
+        "audience": 0.0,         # legacy field (unused)
+        "imdb_rating": imdb_rating,  # primary audience signal
     }
 
-def build_catalog(basics_map: Dict[str, Tuple[str,int,str]], ratings_map: Dict[str, Tuple[float,int]]) -> List[Dict]:
-    pages_movie = int((os.environ.get("TMDB_PAGES_MOVIE") or "12").strip())
-    pages_tv    = int((os.environ.get("TMDB_PAGES_TV") or "12").strip())
+def build_catalog() -> List[Dict]:
+    pages_movie = int(os.environ.get("TMDB_PAGES_MOVIE","12"))
+    pages_tv    = int(os.environ.get("TMDB_PAGES_TV","12"))
     include_tv  = (os.environ.get("INCLUDE_TV_SEASONS","true").lower() in ("1","true","yes"))
-    region      = (os.environ.get("REGION") or "US").strip() or "US"
-    hard_cap    = int((os.environ.get("MAX_CATALOG") or "6000").strip())
+    hard_cap    = int(os.environ.get("MAX_CATALOG","6000"))
 
-    movie_ids = _discover_ids("movie", pages_movie)
-    tv_ids    = _discover_ids("tv", pages_tv) if include_tv else []
+    # load IMDb maps
+    imdb_ratings, imdb_basics = _imdb_maps()
 
+    movie_ids = _collect_tmdb_ids("movie", pages_movie)
+    tv_ids    = _collect_tmdb_ids("tv", pages_tv) if include_tv else []
     ids = [("movie", i) for i in movie_ids] + [("tv", i) for i in tv_ids]
 
     out: List[Dict] = []
-    for media, tid in ids:
-        d = _details(media, tid)
-        it = _to_item(media, d)
-        if not it: continue
-        it["providers"] = _providers(media, tid, region)
+    for media_type, tid in ids:
+        d = _tmdb_details(media_type, tid)
+        it = _to_item(media_type, d, imdb_ratings, imdb_basics)
+        if it:
+            out.append(it)
+            if len(out) >= hard_cap: break
 
-        # Attach IMDb aggregates (no OMDb)
-        iid = it.get("imdb_id") or ""
-        if iid and iid in ratings_map:
-            r, votes = ratings_map[iid]
-            it["imdb_rating"] = float(r)
-            it["imdb_votes"]  = int(votes)
-        else:
-            it["imdb_rating"] = 0.0
-            it["imdb_votes"]  = 0
-
-        # A light critic proxy from TMDB vote when IMDb missing
-        it["critic"]   = float(it.get("tmdb_vote") or 0.0) / 10.0
-        it["audience"] = float(it.get("imdb_rating") or 0.0) / 10.0 if it.get("imdb_rating") else float(it.get("tmdb_vote") or 0.0)/10.0
-
-        out.append(it)
-        if len(out) >= hard_cap: break
-
-    # English originals only, if ORIGINAL_LANGS provided (defaults to 'en')
-    langs = (os.environ.get("ORIGINAL_LANGS") or "en").lower().split(",")
-    langs = [s.strip() for s in langs if s.strip()]
+    # Optional: restrict to English original language if you want
+    langs = (os.environ.get("ORIGINAL_LANGS","en").lower().split(",") if os.environ.get("ORIGINAL_LANGS") else [])
     if langs:
-        # Need language… fetch from details payload if present
-        filtered = []
-        for it in out:
-            # try original_language from same details cache
-            media = "movie" if it["type"]=="movie" else "tv"
-            d = _details(media, it["tmdb_id"]) or {}
-            ol = (d.get("original_language") or "").lower().strip()
+        keep = []
+        for media_type, tid in ids:
+            d = _tmdb_details(media_type, tid)
+            if not d: 
+                continue
+            ol = (d.get("original_language") or "").lower()
             if not ol or ol in langs:
-                filtered.append(it)
-        out = filtered
-
+                # We already appended a matching item for this tid above
+                pass
+        # We already constructed `out`—no further filter here since we used details above
     return out
