@@ -1,160 +1,159 @@
-# engine/catalog_builder.py
 from __future__ import annotations
-import json
+from typing import List, Dict, Any, Tuple
 from pathlib import Path
-from typing import Any, Dict, List
-import csv
-import os
+import json
 
+from .tmdb_detail import discover, enrich_items_with_tmdb
 from .imdb_sync import (
-    load_ratings_csv,
-    fetch_user_ratings_web,
-    merge_user_sources,
-    to_user_profile,
+    load_ratings_csv, fetch_user_ratings_web, merge_user_sources,
+    to_user_profile, compute_genre_weights, build_exclusion_set, save_personal_state
 )
-from .tmdb_detail import enrich_items_with_tmdb  # assumes you already added this file
 
 ROOT = Path(__file__).resolve().parents[1]
-CACHE_DIR = ROOT / "data" / "cache"
-OUT_DIR = ROOT / "data" / "out" / "latest"
-IMDB_CACHE = CACHE_DIR / "imdb"
-IMDB_CACHE.mkdir(parents=True, exist_ok=True)
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+DATA = ROOT / "data"
+CACHE = DATA / "cache"
+STATE = CACHE / "state"
+OUT = DATA / "out" / "latest"
+OUT.mkdir(parents=True, exist_ok=True)
 
-IMDB_BASICS = IMDB_CACHE / "title.basics.tsv"
-IMDB_RATINGS = IMDB_CACHE / "title.ratings.tsv"
+def _normalize_langs(original_langs: str | None) -> str | None:
+    if not original_langs: return None
+    return original_langs.split(",")[0].strip()
 
-# --- IMDb TSV loading (if present) -------------------------------------------
+def _providers_from_env(subs_csv: str | None, region: str) -> List[int]:
+    # Minimal static mapping (can expand later). Matches earlier helper you had.
+    mapping = {
+        "US": {
+            "netflix": 8,
+            "prime_video": 9,
+            "hulu": 15,
+            "max": 384,
+            "disney_plus": 337,
+            "apple_tv_plus": 350,
+            "peacock": 386,
+            "paramount_plus": 531,
+        }
+    }
+    subs = []
+    if subs_csv:
+        subs = [s.strip().lower() for s in subs_csv.split(",") if s.strip()]
+    prov = mapping.get(region.upper(), mapping["US"])
+    ids = []
+    seen=set()
+    for s in subs:
+        pid = prov.get(s)
+        if pid and pid not in seen:
+            seen.add(pid)
+            ids.append(pid)
+    return ids
 
-def _load_tsv(path: Path) -> List[Dict[str, str]]:
-    rows: List[Dict[str, str]] = []
-    if not path.exists():
-        return rows
-    with path.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f, delimiter="\t")
-        for r in reader:
-            rows.append(r)
-    return rows
+def _discover_pages(env: Dict[str,str]) -> int:
+    try:
+        return max(1, min(10, int(env.get("DISCOVER_PAGES","3"))))
+    except Exception:
+        return 3
 
-def _merge_basics_ratings(basics: List[Dict[str, str]], ratings: List[Dict[str, str]]) -> List[Dict[str, Any]]:
-    by_id = {r["tconst"]: r for r in basics if r.get("tconst")}
-    for r in ratings:
-        t = r.get("tconst")
-        if not t or t not in by_id:
-            continue
-        by_id[t]["imdb_rating"] = r.get("averageRating")
-        by_id[t]["numVotes"] = r.get("numVotes")
-    items: List[Dict[str, Any]] = []
-    for tconst, row in by_id.items():
-        title_type = row.get("titleType")
-        if title_type not in {"movie", "tvSeries", "tvMiniSeries"}:
-            continue
-        start_year = row.get("startYear") or row.get("year")
-        try:
-            year = int(start_year) if start_year and str(start_year).isdigit() else None
-        except Exception:
-            year = None
-        genres = [g for g in (row.get("genres", "").split(",") if row.get("genres") else []) if g and g != r"\N"]
-        items.append({
-            "tconst": tconst,
-            "title": row.get("primaryTitle") or row.get("originalTitle"),
-            "type": "tvSeries" if (title_type or "").startswith("tv") and title_type != "tvMovie" else "movie",
-            "year": year,
-            "genres": genres,
-            "imdb_rating": row.get("imdb_rating"),
-        })
-    return items
-
-# --- User evidence ------------------------------------------------------------
-
-def _load_user_profile(env: Dict[str, str]) -> Dict[str, Dict]:
-    """
-    Returns profile map {tconst: {my_rating, rated_at}} by merging local CSV
-    and (if IMDB_USER_ID is present) scraped IMDb user ratings.
-    """
-    local = load_ratings_csv()  # data/user/ratings.csv
-    remote: List[Dict[str, Any]] = []
-    uid = (env.get("IMDB_USER_ID") or "").strip()
-    if uid:
-        remote = fetch_user_ratings_web(uid)
-    merged = merge_user_sources(local, remote)
-    profile = to_user_profile(merged)
-    return profile
-
-# --- Public API ---------------------------------------------------------------
-
-def build_catalog(env: Dict[str, str]) -> List[Dict[str, Any]]:
-    """
-    Builds filtered, enriched items and writes:
-      - data/out/latest/assistant_feed.json (raw filtered list used downstream)
-      - data/out/latest/run_meta.json (metadata/telemetry for summary)
-    Resilient: if IMDb TSVs are missing, starts from an empty list but still writes outputs.
-    """
-    # Load IMDb TSVs if present
-    basics = _load_tsv(IMDB_BASICS)
-    ratings = _load_tsv(IMDB_RATINGS)
-    used_imdb = bool(basics and ratings)
-    if used_imdb:
-        items = _merge_basics_ratings(basics, ratings)
-    else:
-        items = []  # may still get enrichment via tmdb_detail fallback in upstream steps
-
-    # User profile (for exclusion)
-    profile = _load_user_profile(env)
-    exclude_ids = set(profile.keys()) if profile else set()
-
-    # Enrich with TMDB (adds imdb_id when discover-based, providers, etc.)
+def _build_discover_pool(env: Dict[str,str]) -> Tuple[List[Dict[str,Any]], Dict[str,int]]:
     region = (env.get("REGION") or "US").upper()
+    langs = _normalize_langs(env.get("ORIGINAL_LANGS"))
+    provider_ids = _providers_from_env(env.get("SUBS_INCLUDE"), region)
+    pages = _discover_pages(env)
+
+    items: List[Dict[str,Any]] = []
+    tally = {"discover_calls": 0, "discover_movies": 0, "discover_tv": 0}
+
+    for page in range(1, pages+1):
+        dm = discover("movie", page, region, provider_ids, langs)
+        dv = discover("tv", page, region, provider_ids, langs)
+        tally["discover_calls"] += 2
+        for r in dm.get("results", []) or []:
+            items.append({
+                "tmdb_id": r.get("id"),
+                "tmdb_media_type": "movie",
+                "type": "movie",
+                "title": r.get("title"),
+                "year": int((r.get("release_date") or "0000")[:4]) if r.get("release_date") else None,
+                "tmdb_vote": r.get("vote_average"),
+                "providers": [],
+            })
+        tally["discover_movies"] += len(dm.get("results", []) or [])
+
+        for r in dv.get("results", []) or []:
+            items.append({
+                "tmdb_id": r.get("id"),
+                "tmdb_media_type": "tv",
+                "type": "tvSeries",
+                "title": r.get("name"),
+                "year": int((r.get("first_air_date") or "0000")[:4]) if r.get("first_air_date") else None,
+                "tmdb_vote": r.get("vote_average"),
+                "providers": [],
+            })
+        tally["discover_tv"] += len(dv.get("results", []) or [])
+    return items, tally
+
+def _apply_exclusions(items: List[Dict[str,Any]], ex_ids: set[str], ex_pairs: set[tuple[str,int|None]]) -> Tuple[List[Dict[str,Any]], Dict[str,int]]:
+    def norm(t: str) -> str:
+        return " ".join((t or "").strip().lower().split())
+    kept: List[Dict[str,Any]] = []
+    tallies = {"excluded_imdb": 0, "excluded_titleyear": 0}
+    for it in items:
+        imdb_id = it.get("imdb_id")
+        if imdb_id and imdb_id in ex_ids:
+            tallies["excluded_imdb"] += 1
+            continue
+        title = norm(it.get("title") or "")
+        year = it.get("year")
+        if title and (title, year) in ex_pairs:
+            tallies["excluded_titleyear"] += 1
+            continue
+        kept.append(it)
+    return kept, tallies
+
+def build_catalog(env: Dict[str,str]) -> List[Dict[str,Any]]:
+    # — Load user sources —
+    local_rows = load_ratings_csv()
+    remote_rows = fetch_user_ratings_web((env.get("IMDB_USER_ID") or "").strip())
+    merged_rows = merge_user_sources(local_rows, remote_rows)
+    profile = to_user_profile(merged_rows)
+    genre_weights = compute_genre_weights(profile)
+    save_personal_state(genre_weights, merged_rows)
+
+    ex_ids, ex_pairs = build_exclusion_set(merged_rows)
+
+    # — Discover fresh catalog —
+    discover_items, discover_stats = _build_discover_pool(env)
+
+    # — Enrich with TMDB (adds imdb_id, genres, providers, etc.) —
     api_key = env.get("TMDB_API_KEY") or ""
     if api_key:
-        enrich_items_with_tmdb(items, api_key=api_key, region=region)
+        enrich_items_with_tmdb(discover_items, api_key=api_key, region=(env.get("REGION") or "US"))
 
-    # Exclusion pass: remove anything in your profile (seen/rated)
-    pre_exclude = len(items)
-    kept_after_exclude: List[Dict[str, Any]] = []
-    excluded_count = 0
-    for it in items:
-        tid = it.get("tconst") or it.get("imdb_id")
-        if tid and str(tid) in exclude_ids:
-            excluded_count += 1
-            continue
-        kept_after_exclude.append(it)
+    # — Exclude anything you’ve seen/rated —
+    after_ex, excl_stats = _apply_exclusions(discover_items, ex_ids, ex_pairs)
 
-    # Providers filter using human-readable names (as enriched)
+    # — Provider filtering by human names (post-enrichment) —
     subs = [s.strip().lower() for s in (env.get("SUBS_INCLUDE") or "").split(",") if s.strip()]
-    filtered: List[Dict[str, Any]] = []
-    for it in kept_after_exclude:
-        provs = it.get("providers") or []
+    filtered: List[Dict[str,Any]] = []
+    for it in after_ex:
+        provs = [p.lower() for p in (it.get("providers") or [])]
         if subs:
-            low = [p.lower() for p in provs]
-            keep = any(any(s in p for p in low) for s in subs)
-            if not keep:
+            if not any(any(s in p for p in provs) for s in subs):
                 continue
         filtered.append(it)
 
-    # Write raw feed
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    (OUT_DIR / "assistant_feed.json").write_text(
-        json.dumps({"items": filtered}, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-
-    # Telemetry
+    # — Telemetry (saved to run_meta.json and used by summarize.py) —
     meta = {
-        "using_imdb": used_imdb,
-        "candidates_total": len(items),
-        "excluded_by_user_lists": excluded_count,
-        "kept_after_exclusion": len(kept_after_exclude),
-        "kept_after_provider_filter": len(filtered),
-        "env": {
-            "region": region,
-            "original_langs": env.get("ORIGINAL_LANGS", ""),
-            "subs_include": subs,
-        },
-        "profile": {
-            "loaded": bool(profile),
-            "size": len(profile),
-        },
+        "discover": discover_stats,
+        "exclusions": excl_stats,
+        "profile_size": len(profile),
+        "genre_weights_nonzero": len([g for g,v in genre_weights.items() if v != 0.5]),
+        "candidates_after_filtering": len(filtered),
+        "subs_include": subs,
+        "region": env.get("REGION") or "US",
+        "original_langs": env.get("ORIGINAL_LANGS") or "",
     }
-    (OUT_DIR / "run_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    (OUT / "run_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
+    # Raw feed (downstream scoring will turn this into assistant_ranked.json)
+    (OUT / "assistant_feed.json").write_text(json.dumps(filtered, ensure_ascii=False, indent=2), encoding="utf-8")
     return filtered
