@@ -2,29 +2,27 @@ name: nightly
 
 on:
   schedule:
-    # run once daily at 3:30am ET (07:30 UTC) — adjust as you like
-    - cron: '30 7 * * *'
+    - cron: '30 7 * * *'   # 07:30 UTC (3:30am ET)
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-24.04
 
-    # Map config + secrets to the environment that the code expects
     env:
-      # App config
+      # --- app config ---
       REGION: US
       ORIGINAL_LANGS: '["en"]'
       SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
       DISCOVER_PAGES: "12"
 
-      # TMDB auth: runner accepts EITHER v3 key or v4 bearer (or both).
-      TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}          # v3 key (query param)
-      TMDB_BEARER:  ${{ secrets.TMDB_ACCESS_TOKEN }}     # v4 access token (Authorization: Bearer ...)
+      # --- TMDB auth (either works; runner accepts both) ---
+      TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}          # v3 key
+      TMDB_BEARER:  ${{ secrets.TMDB_ACCESS_TOKEN }}     # v4 access token
 
-      # IMDb (optional — unseen filtering uses a CSV if present)
+      # --- IMDb (optional) ---
       IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
-      # IMDB_RATINGS_CSV_PATH: data/ratings.csv          # uncomment if you commit a CSV
+      # IMDB_RATINGS_CSV_PATH: data/ratings.csv
 
     steps:
       - name: Check out repository
@@ -35,28 +33,18 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install -U pip
           pip install -r requirements.txt
 
-      # Simple presence check (booleans only; values remain masked)
-      - name: Env sanity (booleans only)
-        run: |
-          python - <<'PY'
-          import os
-          print("HAS_TMDB_API_KEY:", bool(os.getenv("TMDB_API_KEY")))
-          print("HAS_TMDB_BEARER :", bool(os.getenv("TMDB_BEARER")))
-          print("HAS_IMDB_USER_ID:", bool(os.getenv("IMDB_USER_ID")))
-          PY
-
-      - name: Run recommendation engine
+      - name: Run engine
         run: |
           mkdir -p data/out data/cache
           python -m engine.runner
 
       - name: Make debug bundle
-        run: ./.github/scripts/make_debug_bundle.sh
+        run: bash ./.github/scripts/make_debug_bundle.sh
 
       - name: Upload debug bundle
         uses: actions/upload-artifact@v4
@@ -65,12 +53,12 @@ jobs:
           path: debug-data.zip
           if-no-files-found: warn
 
-      # (Optional) Upload latest outputs for quick download from Actions UI
-      - name: Upload latest run outputs
+      - name: Upload latest outputs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: latest-run
+          if-no-files-found: ignore
           path: |
             data/out/latest/runner.log
             data/out/latest/assistant_feed.json
@@ -78,4 +66,3 @@ jobs:
             data/out/latest/items.enriched.json
             data/out/latest/summary.md
             data/out/latest/diag.json
-          if-no-files-found: ignore
