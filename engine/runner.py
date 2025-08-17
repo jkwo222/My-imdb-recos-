@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -10,7 +9,7 @@ from typing import Any, Dict, List, Tuple
 from .catalog_builder import build_catalog
 from .personalize import genre_weights_from_profile, apply_personal_score
 
-# Optional imports — these may exist in your repo already
+# Optional imports — soft-fail if imdb_sync isn't present
 try:
     from .imdb_sync import (
         load_ratings_csv,
@@ -19,7 +18,6 @@ try:
         to_user_profile,
     )
 except Exception:
-    # Fallbacks if imdb_sync isn't available — treat as empty profile
     def load_ratings_csv() -> List[Dict[str, str]]:
         return []
     def fetch_user_ratings_web(uid: str) -> List[Dict[str, str]]:
@@ -27,42 +25,39 @@ except Exception:
     def merge_user_sources(a, b):
         return list(a) + list(b)
     def to_user_profile(rows):
-        # expected format: {tconst: {"my_rating": float, ...}, ...}
         out: Dict[str, Dict[str, Any]] = {}
         for r in rows:
-            t = str(r.get("tconst") or "").strip()
+            t = str(r.get("tconst") or r.get("imdb_id") or "").strip()
+            mr = None
             try:
-                mr = float(r.get("my_rating")) if r.get("my_rating") is not None else None
+                if r.get("my_rating") is not None:
+                    mr = float(r.get("my_rating"))
             except Exception:
                 mr = None
             if t:
                 out[t] = {"my_rating": mr}
         return out
 
-# Minimal helpers to read feedback downvotes without depending on another module
-def _read_jsonl_indexed(path: Path, key: str) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
+ROOT = Path(__file__).resolve().parents[1]
+OUT_DIR = ROOT / "data" / "out" / "latest"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DIR = ROOT / "data" / "cache"
+FEEDBACK_DOWNVOTES = CACHE_DIR / "feedback" / "downvotes.jsonl"
+
+def _read_jsonl_indexed(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
     if not path.exists():
-        return out
+        return rows
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             try:
-                obj = json.loads(line)
-                k = str(obj.get(key))
-                if k and k not in ("None", "null"):
-                    out[k] = obj
+                rows.append(json.loads(line))
             except Exception:
                 continue
-    return out
-
-ROOT = Path(__file__).resolve().parents[1]
-OUT_DIR = ROOT / "data" / "out" / "latest"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-CACHE_DIR = ROOT / "data" / "cache"
-FEEDBACK_DOWNVOTES = CACHE_DIR / "feedback" / "downvotes.jsonl"
+    return rows
 
 def _load_user_profile_from_env(env: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
     local = load_ratings_csv()  # expects data/user/ratings.csv
@@ -73,21 +68,29 @@ def _load_user_profile_from_env(env: Dict[str, str]) -> Dict[str, Dict[str, Any]
     merged = merge_user_sources(local, remote)
     return to_user_profile(merged)
 
+def _collect_item_id(it: Dict[str, Any]) -> str:
+    # Prefer tconst if present; else imdb_id
+    return str(it.get("tconst") or it.get("imdb_id") or "").strip()
+
+def _collect_downvote_id(row: Dict[str, Any]) -> str:
+    # Accept either tconst or imdb_id in the feedback log
+    return str(row.get("tconst") or row.get("imdb_id") or "").strip()
+
 def _read_downvote_ids() -> set[str]:
-    """Return a set of tconst IDs the user has downvoted (if any)."""
-    idx = _read_jsonl_indexed(FEEDBACK_DOWNVOTES, key="tconst")
+    """Return a set of ids (tconst or imdb_id) the user has downvoted."""
+    rows = _read_jsonl_indexed(FEEDBACK_DOWNVOTES)
     bad = set()
-    for tid, row in idx.items():
-        # Allow either {"downvote": true} or a "type": "downvote"
-        if row.get("downvote") is True or str(row.get("type")).lower() == "downvote":
-            bad.add(str(tid))
+    for r in rows:
+        if r.get("downvote") is True or str(r.get("type")).lower() == "downvote":
+            k = _collect_downvote_id(r)
+            if k:
+                bad.add(k)
     return bad
 
 def _fmt_providers(it: Dict[str, Any]) -> str:
     provs = it.get("providers") or []
     if not provs:
         return ""
-    # make it a short comma list
     return ", ".join(sorted(set(provs)))
 
 def _fmt_score(it: Dict[str, Any]) -> str:
@@ -106,18 +109,25 @@ def _fmt_imdb(it: Dict[str, Any]) -> str:
     try:
         return f"IMDb {float(r):.1f}"
     except Exception:
-        # sometimes ratings are strings like "8.7"
         try:
             return f"IMDb {float(str(r)):.1f}"
         except Exception:
             return ""
 
+def _ensure_list(x) -> List[str]:
+    if not x:
+        return []
+    if isinstance(x, list):
+        return [str(v) for v in x if v]
+    if isinstance(x, tuple):
+        return [str(v) for v in x if v]
+    return [str(x)]
+
 def _write_summary_md(env: Dict[str, str], ranked: List[Dict[str, Any]], *, genre_weights: Dict[str, float], candidates_count: int) -> None:
-    # header bits
     region = env.get("REGION") or "US"
     original_langs = env.get("ORIGINAL_LANGS") or ""
     subs = env.get("SUBS_INCLUDE") or ""
-    # taste snapshot (top few)
+
     gw_sorted = sorted(genre_weights.items(), key=lambda kv: kv[1], reverse=True)
     top_gw = gw_sorted[:8]
 
@@ -144,7 +154,6 @@ def _write_summary_md(env: Dict[str, str], ranked: List[Dict[str, Any]], *, genr
     lines.append("## Today’s top picks")
     lines.append("")
 
-    # Include up to 15 entries
     for i, it in enumerate(ranked[:15], start=1):
         title = it.get("title") or it.get("primaryTitle") or "Untitled"
         year = it.get("year")
@@ -164,75 +173,76 @@ def _write_summary_md(env: Dict[str, str], ranked: List[Dict[str, Any]], *, genr
             meta_bits.append(provtxt)
         if meta_bits:
             lines.append(f"   *{'  •  '.join(meta_bits)}*")
-        # tiny extra line with quick facts
-        # (keep short to avoid clutter — we already show IMDb + year)
         yr = it.get("year")
         if imdbtxt or yr:
             lines.append(f"   > {imdbtxt}; {yr if yr else ''}".rstrip("; ").strip())
         lines.append("")
 
-    md_path = OUT_DIR / "summary.md"
-    md_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    (OUT_DIR / "summary.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 def main() -> None:
     env = dict(os.environ)
 
     print(" | catalog:begin")
-    items = build_catalog(env)  # writes assistant_feed.json (base set)
+    items = build_catalog(env)
     print(f" | catalog:end kept={len(items)}")
 
-    # Load user profile (local CSV + optional IMDb public list merge)
+    # Validate presence of IDs and genres
+    ids_present = sum(1 for it in items if _collect_item_id(it))
+    genres_present = sum(1 for it in items if _ensure_list(it.get("genres")))
+    print(f"validation: items={len(items)} ids_present={ids_present} genres_present={genres_present}")
+
+    # Load user profile
     user_profile = _load_user_profile_from_env(env)
 
-    # Compute genre weights based on *mapped* titles in catalog
+    # Compute genre weights — the function already falls back from tconst to imdb_id internally.
     genre_weights = genre_weights_from_profile(items, user_profile, imdb_id_field="tconst")
 
-    # Apply personalization
+    # Personalize
     apply_personal_score(items, genre_weights, base_key="imdb_rating")
 
-    # Downvote memory
+    # Downvote memory (match either imdb_id or tconst)
     downvoted = _read_downvote_ids()
     if downvoted:
         before = len(items)
-        items = [it for it in items if str(it.get("tconst")) not in downvoted]
+        kept: List[Dict[str, Any]] = []
+        for it in items:
+            iid = _collect_item_id(it)
+            if iid and iid in downvoted:
+                continue
+            kept.append(it)
+        items = kept
         print(f"downvote-filter: removed {before - len(items)} items (persisted memory)")
 
-    # Optional scored cut
+    # Optional cut
+    cut = None
     try:
-        cut = int(env.get("MIN_MATCH_CUT")) if env.get("MIN_MATCH_CUT") else None
+        if env.get("MIN_MATCH_CUT"):
+            cut = float(env.get("MIN_MATCH_CUT"))
     except Exception:
         cut = None
     if cut is not None:
         before = len(items)
-        items = [it for it in items if (isinstance(it.get("score"), (int, float)) and it["score"] >= cut)]
+        items = [it for it in items if isinstance(it.get("score"), (int, float)) and float(it["score"]) >= cut]
         print(f"score-cut {cut}: kept {len(items)} / {before}")
 
-    # Sort by personalized score (desc), then IMDb rating (desc), then votes/year fallback
+    # Sort
     def _key(it: Dict[str, Any]) -> Tuple:
-        s = it.get("score")
-        try:
-            s = float(s) if s is not None else -1.0
-        except Exception:
-            s = -1.0
-        ir = it.get("imdb_rating")
-        try:
-            ir = float(ir) if ir is not None else -1.0
-        except Exception:
-            ir = -1.0
-        yr = it.get("year") or 0
+        s = it.get("score"); ir = it.get("imdb_rating"); yr = it.get("year") or 0
+        try: s = float(s) if s is not None else -1.0
+        except Exception: s = -1.0
+        try: ir = float(ir) if ir is not None else -1.0
+        except Exception: ir = -1.0
         return (-s, -ir, -yr)
 
     ranked = sorted(items, key=_key)
 
-    # Write ranked output
+    # Write ranked + summary + debug
     (OUT_DIR / "assistant_ranked.json").write_text(
         json.dumps(ranked, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-
-    # Summary markdown for the GH step summary + issue comment
     _write_summary_md(env, ranked, genre_weights=genre_weights, candidates_count=len(ranked))
 
-    # Some debug stats to help validate runs
     status = {
         "candidates_ranked": len(ranked),
         "downvotes_seen": len(downvoted),
@@ -242,9 +252,15 @@ def main() -> None:
             "ORIGINAL_LANGS": env.get("ORIGINAL_LANGS"),
             "SUBS_INCLUDE": env.get("SUBS_INCLUDE"),
             "MIN_MATCH_CUT": env.get("MIN_MATCH_CUT"),
-            "IMDB_USER_ID": bool(env.get("IMDB_USER_ID")),  # redact actual id
+            "IMDB_USER_ID": bool(env.get("IMDB_USER_ID")),
         },
         "top_genres": sorted(genre_weights.items(), key=lambda kv: kv[1], reverse=True)[:8],
+        "validation": {
+            "items_total": len(items),
+            "items_with_ids": ids_present,
+            "items_with_genres": genres_present,
+            "genres_missing_count": max(0, len(items) - genres_present),
+        },
     }
     (OUT_DIR / "debug_status.json").write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
 
