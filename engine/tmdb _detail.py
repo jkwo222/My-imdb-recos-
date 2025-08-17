@@ -1,7 +1,7 @@
 # engine/tmdb_detail.py
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .cache import (
     tmdb_find_by_imdb_cached,
@@ -16,11 +16,7 @@ def _norm_list(x) -> List[str]:
         return [str(i) for i in x if i]
     return [str(x)]
 
-def _coerce_media_type(x: str | None, fallback_kind: str) -> str:
-    """
-    TMDB /find may return 'movie' or 'tv' (sometimes 'person' which we ignore).
-    Fall back to item kind if needed.
-    """
+def _coerce_media_type(x: Optional[str], fallback_kind: str) -> str:
     x = (x or "").lower()
     if x in ("movie", "tv"):
         return x
@@ -37,17 +33,14 @@ def map_imdb_to_tmdb(
     """
     if not tconst or not api_key:
         return (None, None)
-
     data = tmdb_find_by_imdb_cached(tconst, api_key)
-    # /find returns 'movie_results' and/or 'tv_results'
     for bucket, mtype in (("movie_results", "movie"), ("tv_results", "tv")):
         results = data.get(bucket) or []
         if results:
-            best = results[0]
-            tid = best.get("id")
+            first = results[0]
+            tid = first.get("id")
             if isinstance(tid, int):
                 return (tid, _coerce_media_type(mtype, fallback_kind))
-    # Not found
     return (None, None)
 
 def enrich_one_with_tmdb(
@@ -57,49 +50,50 @@ def enrich_one_with_tmdb(
     region: str
 ) -> None:
     """
-    Mutates 'item' in place. Adds:
-      - tmdb_id, tmdb_media_type
-      - genres (normalized names, if TMDB has them)
-      - providers (names in the given region; flatrate & ads)
-    Safe to call repeatedly; respects existing fields.
+    Mutates 'item' in place:
+      - adds tmdb_id, tmdb_media_type (via /find/{imdb_id})
+      - merges genres from /movie|tv/{id}
+      - sets providers (flatrate + ads) for region via /watch/providers
     """
     if not api_key:
         return
 
-    # 1) ensure tmdb id & media type
     tmdb_id = item.get("tmdb_id")
     mtype = item.get("tmdb_media_type")
+
     if not tmdb_id:
         tconst = item.get("tconst")
         if tconst:
-            tid, mt = map_imdb_to_tmdb(str(tconst), api_key=api_key, fallback_kind=("tv" if item.get("type")!="movie" else "movie"))
+            tid, mt = map_imdb_to_tmdb(
+                str(tconst),
+                api_key=api_key,
+                fallback_kind=("tv" if item.get("type") != "movie" else "movie"),
+            )
             if tid:
                 item["tmdb_id"] = tid
-                item["tmdb_media_type"] = mt or ("tv" if item.get("type")!="movie" else "movie")
+                item["tmdb_media_type"] = mt or ("tv" if item.get("type") != "movie" else "movie")
                 tmdb_id = tid
                 mtype = item.get("tmdb_media_type")
-    # If still not mapped, we can't pull detail/providers
+
     if not tmdb_id:
         return
 
-    # 2) genres from TMDB details
+    # Genres + title merge from details
     try:
         det = tmdb_details_cached(int(tmdb_id), api_key, (mtype or "movie"))
-        genres = _norm_list(item.get("genres"))
+        base_genres = _norm_list(item.get("genres"))
         if isinstance(det, dict):
             glist = det.get("genres") or []
             names = [g.get("name") for g in glist if isinstance(g, dict) and g.get("name")]
-            # merge without duplicates
-            merged = list(dict.fromkeys([*genres, *names]))
+            merged = list(dict.fromkeys([*base_genres, *names]))
             if merged:
                 item["genres"] = merged
-            # also carry title/year if missing
             if not item.get("title"):
                 item["title"] = det.get("title") or det.get("name") or item.get("title")
     except Exception:
         pass
 
-    # 3) providers (names) for region
+    # Providers for region
     try:
         prov = tmdb_providers_cached(int(tmdb_id), api_key, (mtype or "movie"))
         if prov and "results" in prov:
@@ -117,9 +111,6 @@ def enrich_items_with_tmdb(
     api_key: str,
     region: str
 ) -> None:
-    """
-    Batch enrichment. Mutates in place.
-    """
     if not items or not api_key:
         return
     region = (region or "US").upper()
