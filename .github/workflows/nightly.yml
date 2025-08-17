@@ -14,7 +14,8 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
-      TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }} # TMDB v4 "API Read Access Token"
+      # If you created a "v4 API Read Access Token" (recommended), add it as a secret and uncomment below:
+      TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
       IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
       REGION: US
       ORIGINAL_LANGS: en
@@ -35,81 +36,57 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Optional: fetch IMDb TSV datasets (they're large). Keep them OUT of the main "out" artifact.
-      - name: Fetch IMDb TSV datasets
-        run: |
-          set -euxo pipefail
-          mkdir -p data/cache/imdb
-          pushd data/cache/imdb
-          wget -q https://datasets.imdbws.com/title.basics.tsv.gz -O title.basics.tsv.gz
-          wget -q https://datasets.imdbws.com/title.ratings.tsv.gz -O title.ratings.tsv.gz
-          wget -q https://datasets.imdbws.com/title.akas.tsv.gz -O title.akas.tsv.gz
-          gunzip -f title.basics.tsv.gz || true
-          gunzip -f title.ratings.tsv.gz || true
-          gunzip -f title.akas.tsv.gz || true
-          popd
-
       - name: Run engine
         run: |
           set -e
           python -m engine.runner
 
-      - name: Make debug bundle
+      # Always try to pack debug data, even if engine failed, so we have something to inspect
+      - name: Pack debug bundle (timestamped)
         if: always()
         run: |
           set -e
           python -m engine.debug_pack
-          ls -lh data/out/latest || true
+          echo "Debug dir listing:"
+          ls -lh data/debug || true
 
-      # ──────────────────────────────────────────────────────────────
-      # ARTIFACTS (split for usability)
-      # ──────────────────────────────────────────────────────────────
+      # Keep only the latest 7 debug zips to prevent artifact bloat
+      - name: Cleanup old debug zips (keep last 7)
+        if: always()
+        run: |
+          set -e
+          shopt -s nullglob
+          mkdir -p data/debug
+          files=(data/debug/debug-data-*.zip)
+          # Sort by mtime desc, skip first 7, delete the rest
+          ls -1t data/debug/debug-data-*.zip 2>/dev/null | tail -n +8 | xargs -r rm -f
+          echo "After cleanup:"
+          ls -lh data/debug || true
 
-      # 1) Main outputs: light & quick to download
-      - name: Upload artifact — out (light)
+      # Upload the main output artifact only (keep lean)
+      - name: Upload artifact — out (latest)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: out
+          path: |
+            data/out/latest
           if-no-files-found: warn
           compression-level: 6
           retention-days: 14
-          path: |
-            data/out/latest/assistant_feed.json
-            data/out/latest/assistant_ranked.json
-            data/out/latest/summary.md
-            data/cache/state/personal_state.json
-            data/cache/state/personal_history.json
-            data/cache/state/persistent_pool.json
-            data/user/ratings.csv
 
-      # 2) Debug-only: the zip you asked for, as a separate, tiny artifact
-      - name: Upload artifact — debug-data.zip
+      # Upload the debug artifact separately (timestamped file name pattern)
+      - name: Upload artifact — debug-data
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: debug-data
+          path: data/debug/debug-data-*.zip
           if-no-files-found: warn
-          # No compression needed (it's already a zip)
+          # don't recompress the zip we just created
           compression-level: 0
           retention-days: 14
-          path: data/out/latest/debug-data.zip
 
-      # 3) Heavy caches (optional to grab): TMDB/IMDb caches and IMDb TSVs
-      - name: Upload artifact — caches (heavy)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: caches
-          if-no-files-found: warn
-          compression-level: 1
-          retention-days: 7
-          path: |
-            data/cache/tmdb
-            data/cache/imdb
-            data/cache/feedback
-
-      # Run summary into the job summary UI
       - name: Add summary to run
         if: always()
         run: |
@@ -139,14 +116,17 @@ jobs:
             BODY="$(cat data/out/latest/summary.md)"
           fi
 
+          # find open issue by title
           ISSUE_NUMBER=$(gh api -X GET repos/${{ github.repository }}/issues --paginate -q \
             '.[] | select(.state=="open" and .title=="'"$TITLE"'") | .number' | head -n1)
 
+          # create if missing
           if [ -z "$ISSUE_NUMBER" ]; then
             ISSUE_NUMBER=$(gh api -X POST repos/${{ github.repository }}/issues \
               -f title="$TITLE" -f body="Tracking thread for daily recommendation digests." -q '.number')
           fi
 
+          # post comment
           gh api -X POST repos/${{ github.repository }}/issues/$ISSUE_NUMBER/comments \
             -f body="$BODY" >/dev/null
 
