@@ -1,8 +1,8 @@
 # engine/cache.py
 from __future__ import annotations
-from typing import Dict, Iterable, List, Any, Tuple, Optional
+from typing import Dict, Iterable, List, Any, Tuple, Optional, Set
 from pathlib import Path
-import json, io, os, time, tempfile, shutil
+import json, io, os, time, tempfile
 from datetime import datetime, timedelta
 
 # TMDB helpers (already provided in your engine/tmdb.py)
@@ -11,10 +11,13 @@ from .tmdb import find_by_imdb_id, search_title_year, watch_providers
 BASE = Path(__file__).resolve().parents[1]
 CACHE_DIR = BASE / "data" / "cache"
 
-# Files that persist across runs
+# Files/dirs that persist across runs
 STATE_DIR = CACHE_DIR / "state"
 TMDB_MAP_PATH = CACHE_DIR / "tmdb_map.json"          # imdb tconst -> {"media_type": "...", "tmdb_id": 123}
 TMDB_PROV_PATH = CACHE_DIR / "tmdb_providers.json"   # "movie:123" -> full payload from /watch/providers
+FEEDBACK_DIR = CACHE_DIR / "feedback"                # we mirror feedback here for runner-only executions
+USER_DIR = CACHE_DIR / "user"                        # misc user-derived caches
+PERSONAL_STATE_PATH = STATE_DIR / "personal.json"    # snapshot of genre weights & counts for summarize
 
 def ensure_dirs() -> None:
     for p in [
@@ -46,7 +49,7 @@ def read_json(path: Path, default: Any) -> Any:
     except FileNotFoundError:
         return default
     except Exception:
-        # Corrupted? Return default rather than blowing up the run.
+        # Corrupted? Return default rather than failing the run.
         return default
 
 def read_jsonl_indexed(path: Path, key: str) -> Dict[str, Any]:
@@ -230,3 +233,61 @@ def tmdb_providers_cached(
     prov_cache[key] = payload
     atomic_write_json(TMDB_PROV_PATH, prov_cache)
     return payload
+
+
+# ----------------------------
+# Feedback / downvote helpers
+# ----------------------------
+
+def _feedback_file_candidates() -> List[Path]:
+    """
+    Where feedback may live. We read from both the repo path (data/feedback)
+    and the mirrored cache folder (CACHE_DIR/feedback). Lines are JSON objects.
+    """
+    repo_feedback = BASE / "data" / "feedback" / "downvotes.jsonl"
+    cache_feedback = FEEDBACK_DIR / "downvotes.jsonl"
+    return [p for p in [repo_feedback, cache_feedback] if p.exists()]
+
+def load_downvoted_set() -> Set[str]:
+    """
+    Returns a set of imdb tconsts that were downvoted.
+    Expected JSONL shape per line (minimal):
+      {"tconst":"tt1234567","action":"downvote","value":1}
+    Other shapes are tolerated if they include 'tconst'.
+    """
+    out: Set[str] = set()
+    for p in _feedback_file_candidates():
+        try:
+            with p.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    tconst = str(obj.get("tconst") or obj.get("id") or "").strip()
+                    if not tconst:
+                        continue
+                    # consider only explicit downvotes if present; otherwise any 'value' < 0
+                    act = str(obj.get("action") or "").lower()
+                    val = obj.get("value")
+                    if act == "downvote" or (isinstance(val, (int, float)) and val < 0):
+                        out.add(tconst)
+        except Exception:
+            continue
+    return out
+
+
+# --------------------------------
+# Personalization snapshot helpers
+# --------------------------------
+
+def load_personal_state(default: Any = None) -> Any:
+    ensure_dirs()
+    return read_json(PERSONAL_STATE_PATH, default if default is not None else {})
+
+def save_personal_state(obj: Any) -> None:
+    ensure_dirs()
+    atomic_write_json(PERSONAL_STATE_PATH, obj)
