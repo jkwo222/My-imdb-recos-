@@ -1,160 +1,157 @@
-# .github/workflows/nightly.yml
 name: nightly
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "0 13 * * *"   # optional daily run at 13:00 UTC
+    - cron: "17 9 * * *"   # run daily; adjust as desired
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
+    strategy:
+      fail-fast: false
+      matrix:
+        attempt: [1, 2, 3, 4, 5, 6, 7]   # up to 7 runs is fine
     env:
-      TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
-      IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
+      PYTHONUTF8: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      # --- Engine env defaults (can override in repo/env or Secrets) ---
       REGION: US
-      ORIGINAL_LANGS: en
-      SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
-      DISCOVER_PAGES: 3
-      ROTATE_MINUTES: 60
-      PAGE_CAP: 1000
-      STEP: 37
+      ORIGINAL_LANGS: '["en"]'
+      # Expand pages searched per run:
+      DISCOVER_PAGES: "9"
+      # SUBS_INCLUDE can be overridden at repo/Org level; common set shown:
+      SUBS_INCLUDE: "netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus"
+      # Optional IMDb scraping of public ratings page:
+      IMDB_USER_ID: "${{ secrets.IMDB_USER_ID }}"
+      TMDB_ACCESS_TOKEN: "${{ secrets.TMDB_ACCESS_TOKEN }}"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-py311-${{ hashFiles('**/requirements*.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-py311-
+
       - name: Install deps
         run: |
-          python -m pip install -U pip
+          python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install rapidfuzz "pandas<3" requests
+          # If your engine has an extra file:
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
 
-      - name: Prepare output dirs
-        id: prep
+      - name: Run pipeline (attempt ${{ matrix.attempt }})
+        id: run
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          # Make sure output dirs exist
+          mkdir -p data/out
+          mkdir -p data/cache
+
+          # Run your engine
+          python -m engine.runner
+
+          echo "RUN_DONE=1" >> $GITHUB_OUTPUT
+
+      - name: Prepare 'latest' folder
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
-          RUN_DIR="data/out/run_${{ github.run_id }}_${{ github.run_number }}"
-          LATEST_DIR="data/out/latest"
-          ART_DIR="artifacts"
-          mkdir -p "$RUN_DIR" "$LATEST_DIR" "$ART_DIR" data data/cache/tmdb
-          echo "run_dir=$RUN_DIR"   >> "$GITHUB_OUTPUT"
-          echo "latest_dir=$LATEST_DIR" >> "$GITHUB_OUTPUT"
-          echo "art_dir=$ART_DIR"   >> "$GITHUB_OUTPUT"
 
-      - name: Quick self-check (optional)
-        continue-on-error: true
-        run: |
-          python - <<'PY'
-          try:
-              from engine.self_check import run_self_check
-              run_self_check()
-              print("SELF-CHECK: OK")
-          except Exception as e:
-              print("SELF-CHECK: SKIPPED/FAILED:", e)
-          PY
+          # Create a stable 'latest' pointer for artifacts
+          if compgen -G "data/out/run_*" > /dev/null; then
+            latest_dir="$(ls -dt data/out/run_* | head -n1)"
+            rm -rf data/out/latest
+            mkdir -p data/out
+            cp -r "$latest_dir" "data/out/latest"
 
-      - name: Run catalog
-        env:
-          REGION: ${{ env.REGION }}
-          ORIGINAL_LANGS: ${{ env.ORIGINAL_LANGS }}
-          SUBS_INCLUDE: ${{ env.SUBS_INCLUDE }}
-          DISCOVER_PAGES: ${{ env.DISCOVER_PAGES }}
-          ROTATE_MINUTES: ${{ env.ROTATE_MINUTES }}
-          PAGE_CAP: ${{ env.PAGE_CAP }}
-          STEP: ${{ env.STEP }}
-          TMDB_ACCESS_TOKEN: ${{ env.TMDB_ACCESS_TOKEN }}
-          IMDB_USER_ID: ${{ env.IMDB_USER_ID }}
-        run: |
-          set -euo pipefail
-          RUN_DIR="${{ steps.prep.outputs.run_dir }}"
-          LATEST_DIR="${{ steps.prep.outputs.latest_dir }}"
-          python -m engine.runner 2>&1 | tee "$RUN_DIR/runner.log" || true
-
-          for cand in \
-            "assistant_feed.json" \
-            "data/assistant_feed.json" \
-            "data/out/assistant_feed.json" \
-            "$RUN_DIR/assistant_feed.json" \
-            "out/assistant_feed.json"
-          do
-            if [ -f "$cand" ]; then
-              cp -f "$cand" "$RUN_DIR/assistant_feed.json"
-              break
-            fi
-          done
-          if [ ! -f "$RUN_DIR/assistant_feed.json" ]; then
-            echo "[]" > "$RUN_DIR/assistant_feed.json"
+            echo "Latest run directory: $latest_dir"
+            ls -al "data/out/latest" || true
+          else
+            echo "No run_* directories found under data/out"
           fi
-          if grep -q "Daily recommendations" "$RUN_DIR/runner.log" 2>/dev/null; then
-            awk 'BEGIN{p=0}/^# Daily recommendations/{p=1}p' "$RUN_DIR/runner.log" > "$RUN_DIR/summary.md" || true
-          fi
-          if [ ! -s "$RUN_DIR/summary.md" ]; then
-            echo "# Daily recommendations" > "$RUN_DIR/summary.md"
-            echo "" >> "$RUN_DIR/summary.md"
-            echo "_No summary captured; see runner.log for details._" >> "$RUN_DIR/summary.md"
-          fi
-          rsync -a --delete "$RUN_DIR/" "$LATEST_DIR/"
 
-      - name: Build debug-data zip
+      - name: Build compact debug artifact
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
-          ART_DIR="${{ steps.prep.outputs.art_dir }}"
-          RUN_DIR="${{ steps.prep.outputs.run_dir }}"
-          DEBUG_ZIP="$ART_DIR/debug-data_${{ github.run_id }}.zip"
-          mkdir -p "$ART_DIR"
-          ZIP_LIST=()
-          [ -f "$RUN_DIR/runner.log" ] && ZIP_LIST+=("$RUN_DIR/runner.log")
-          [ -f "$RUN_DIR/assistant_feed.json" ] && ZIP_LIST+=("$RUN_DIR/assistant_feed.json")
-          [ -f "$RUN_DIR/summary.md" ] && ZIP_LIST+=("$RUN_DIR/summary.md")
-          [ -f "data/ratings.csv" ] && ZIP_LIST+=("data/ratings.csv")
-          [ -d "data/cache/tmdb" ] && ZIP_LIST+=("data/cache/tmdb")
-          [ -f ".env" ] && ZIP_LIST+=(".env")
-          if [ "${#ZIP_LIST[@]}" -eq 0 ]; then
-            echo "no-debug-files" > "$ART_DIR/README.txt"
-            ZIP_LIST+=("$ART_DIR/README.txt")
+          mkdir -p debug-bundle
+          if [ -d "data/out/latest" ]; then
+            # copy only small, high-signal files
+            cp -f data/out/latest/runner.log debug-bundle/ 2>/dev/null || true
+            cp -f data/out/latest/assistant_feed.json debug-bundle/ 2>/dev/null || true
+            cp -f data/out/latest/items.discovered.json debug-bundle/ 2>/dev/null || true
+            cp -f data/out/latest/items.enriched.json debug-bundle/ 2>/dev/null || true
+            cp -f data/out/latest/summary.md debug-bundle/ 2>/dev/null || true
           fi
-          zip -9 -r "$DEBUG_ZIP" "${ZIP_LIST[@]}" \
-            -x "*.pyc" "*.pyo" "__pycache__/*" ".git/*" || true
-          echo "debug_zip=$DEBUG_ZIP" >> "$GITHUB_OUTPUT"
 
-      - name: Upload latest-out
+          # Add basic environment footprints helpful for debugging
+          echo "REGION=${REGION}" > debug-bundle/env.txt
+          echo "SUBS_INCLUDE=${SUBS_INCLUDE}" >> debug-bundle/env.txt
+          echo "ORIGINAL_LANGS=${ORIGINAL_LANGS}" >> debug-bundle/env.txt
+          echo "DISCOVER_PAGES=${DISCOVER_PAGES}" >> debug-bundle/env.txt
+
+          # Zip it
+          (cd debug-bundle && zip -q -r ../debug-data.zip .) || true
+          ls -lh debug-data.zip || true
+
+      - name: Upload debug artifact (small)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: latest-out
+          name: debug-data-attempt-${{ matrix.attempt }}
+          path: debug-data.zip
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload latest results (human-readable)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: site-out-attempt-${{ matrix.attempt }}
           path: data/out/latest/**
-          if-no-files-found: warn
-          retention-days: 14
-
-      - name: Upload debug-data
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-data
-          path: artifacts/debug-data_*.zip
-          if-no-files-found: warn
-          retention-days: 14
-
-      - name: Upload raw run folder (optional)
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: raw-run
-          path: ${{ steps.prep.outputs.run_dir }}/**
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Cleanup old runs
+      - name: Cleanup (trim caches & old runs)
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p data/out
-          cd data/out
-          ls -1d run_* 2>/dev/null | sort -r | awk 'NR>7' | xargs -r rm -rf
+          # prune pip caches a bit
+          python - <<'PY'
+import os, shutil, pathlib
+base = pathlib.Path.home() / ".cache" / "pip" / "http"
+if base.exists():
+    # keep most recent 500 files
+    files = sorted((p for p in base.rglob("*") if p.is_file()), key=lambda p: p.stat().st_mtime, reverse=True)
+    for p in files[500:]:
+        try:
+            p.unlink()
+        except Exception:
+            pass
+PY
+          # keep only 5 newest run_* dirs (plus the 'latest' copy we made)
+          if compgen -G "data/out/run_*" > /dev/null; then
+            mapfile -t runs < <(ls -dt data/out/run_* | tail -n +6 || true)
+            for r in "${runs[@]:-}"; do
+              echo "Removing old run dir: $r"
+              rm -rf "$r"
+            done
+          fi
