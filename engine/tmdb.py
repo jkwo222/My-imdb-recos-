@@ -221,3 +221,36 @@ def discover_tv_page(page: int, *, region: str = "US", provider_ids: Optional[Li
     data = _discover("tv", page, region=region, provider_ids=provider_ids, original_langs=original_langs)
     items = data.get("results", []) or []
     return items, int(data.get("page", page) or page)
+    
+    # --- NEW: ID resolution & providers ------------------------------------------
+
+def find_by_imdb_id(tconst: str) -> Dict:
+    """
+    Map an IMDb tconst -> TMDB id(s) via /find.
+    """
+    url = f"{_TMDB_API_BASE}/find/{tconst}"
+    params = {"external_source": "imdb_id", "language": "en-US"}
+    return _get_json("find_imdb", url, params)
+
+def search_title_year(title: str, year: int | None, kind: str) -> Dict:
+    """
+    Fallback if /find misses. kind: 'movie'|'tv'
+    """
+    kind = "movie" if kind == "movie" else "tv"
+    url = f"{_TMDB_API_BASE}/search/{kind}"
+    params = {"query": title, "language": "en-US", "include_adult": "false", "page": "1"}
+    if year and kind == "movie":
+        params["year"] = str(year)
+    if year and kind == "tv":
+        params["first_air_date_year"] = str(year)
+    return _get_json(f"search_{kind}", url, params)
+
+def watch_providers(media_type: str, tmdb_id: int) -> Dict:
+    """
+    Fetch watch providers for a given TMDB id.
+    media_type: 'movie' or 'tv'
+    """
+    media_type = "movie" if media_type == "movie" else "tv"
+    url = f"{_TMDB_API_BASE}/{media_type}/{tmdb_id}/watch/providers"
+    params = {"language": "en-US"}
+    return _get_json(f"providers_{media_type}", url, params)
