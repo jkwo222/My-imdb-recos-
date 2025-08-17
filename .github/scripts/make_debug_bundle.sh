@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# .github/scripts/make_debug_bundle.sh
 set -euo pipefail
 
-# Where to emit
 OUT_ZIP="debug-data.zip"
 BUNDLE_DIR="debug-bundle"
 
@@ -10,7 +8,7 @@ rm -f "$OUT_ZIP"
 rm -rf "$BUNDLE_DIR"
 mkdir -p "$BUNDLE_DIR"
 
-# 1) Include most recent run outputs if present
+# 1) Latest outputs (if present)
 if [[ -d "data/out/latest" ]]; then
   cp -f data/out/latest/runner.log            "$BUNDLE_DIR/" 2>/dev/null || true
   cp -f data/out/latest/assistant_feed.json   "$BUNDLE_DIR/" 2>/dev/null || true
@@ -20,7 +18,7 @@ if [[ -d "data/out/latest" ]]; then
   cp -f data/out/latest/diag.json             "$BUNDLE_DIR/" 2>/dev/null || true
 fi
 
-# 2) Environment capture (minimal + sanitized presence of secrets)
+# 2) Env capture (no secrets printed)
 {
   echo "REGION=${REGION:-}"
   echo "SUBS_INCLUDE=${SUBS_INCLUDE:-}"
@@ -29,13 +27,9 @@ fi
 } > "$BUNDLE_DIR/env.txt"
 
 {
-  for k in TMDB_API_KEY TMDB_BEARER OMDB_API_KEY IMDB_USER_ID IMDB_RATINGS_CSV_PATH; do
+  for k in TMDB_API_KEY TMDB_BEARER IMDB_USER_ID IMDB_RATINGS_CSV_PATH; do
     v="${!k:-}"
-    if [[ -n "${v}" ]]; then
-      echo "$k=<set>"
-    else
-      echo "$k=<missing>"
-    fi
+    if [[ -n "${v}" ]]; then echo "$k=<set>"; else echo "$k=<missing>"; fi
   done
   echo "REGION=${REGION:-}"
   echo "SUBS_INCLUDE=${SUBS_INCLUDE:-}"
@@ -45,32 +39,18 @@ fi
 
 # 3) Git state
 {
-  echo "== git status -sb =="
-  git status -sb || true
-  echo
-  echo "== git log -1 =="
-  git log -1 --oneline --decorate || true
-  echo
-  echo "== git remote -v =="
-  git remote -v || true
+  echo "== git status -sb =="; git status -sb || true
+  echo; echo "== git log -1 =="; git log -1 --oneline --decorate || true
+  echo; echo "== git remote -v =="; git remote -v || true
 } > "$BUNDLE_DIR/git.txt"
 
-# 4) Tree + listings
+# 4) Listings + symlink diag
 {
-  echo "# REPO TREE (find .)"
-  find . -maxdepth 3 -printf "%y %M %u %g %8s %TY-%Tm-%Td %TH:%TM:%TS %p\n" 2>/dev/null || true
-  echo
-  echo "# data/out (top)"
-  ls -alh "data/out" 2>/dev/null || echo "<no data/out>"
-  echo
-  echo "# data/out/latest (top)"
-  ls -alh "data/out/latest" 2>/dev/null || echo "<no latest>"
-  echo
-  echo "# data/cache (top)"
-  ls -alh "data/cache" 2>/dev/null || echo "<no cache>"
+  echo "# data/out (top)"; ls -alh "data/out" 2>/dev/null || echo "<no data/out>"
+  echo; echo "# data/out/latest (top)"; ls -alh "data/out/latest" 2>/dev/null || echo "<no latest>"
+  echo; echo "# data/cache (top)"; ls -alh "data/cache" 2>/dev/null || echo "<no cache>"
 } > "$BUNDLE_DIR/listings.txt"
 
-# 5) Symlink diagnostics
 {
   echo "# SYMLINK TARGETS"
   if [[ -e "data/out/latest" ]]; then
@@ -85,45 +65,12 @@ fi
   fi
 } > "$BUNDLE_DIR/links.txt"
 
-# 6) Disk usage snapshot
+# 5) Python info
 {
-  echo "== du -h data =="
-  du -h -d 2 data 2>/dev/null || du -h --max-depth=2 data 2>/dev/null || true
-  echo
-  echo "== df -h =="
-  df -h || true
-} > "$BUNDLE_DIR/dirs.txt"
-
-# 7) Python info
-{
-  echo "# Python info"
-  which python || true
-  python -V 2>&1 || true
-  echo
-  echo "# pip freeze"
-  pip freeze || true
+  echo "# Python info"; which python || true; python -V 2>&1 || true
+  echo; echo "# pip freeze"; pip freeze || true
 } > "$BUNDLE_DIR/python.txt"
 
-# 8) Runner latest sanity (double-check latest points correctly)
-{
-  echo "== runner latest sanity =="
-  if [[ -L "data/out/latest" ]]; then
-    LRP="$(realpath data/out/latest || true)"
-    echo "latest is symlink -> ${LRP}"
-    if [[ -n "${LRP}" && -d "${LRP}" && "${LRP}" == *"/data/out/run_"* ]]; then
-      echo "OK: latest resolves to a run directory."
-    else
-      echo "WARN: latest does not resolve to a run_ directory. Please inspect."
-    fi
-  else
-    if [[ -d "data/out/latest" ]]; then
-      echo "latest is a real directory (not symlink)."
-    else
-      echo "latest missing."
-    fi
-  fi
-} > "$BUNDLE_DIR/runner.sanity.txt"
-
-# 9) Zip it up
+# 6) Zip it
 ( cd "$BUNDLE_DIR" && zip -q -r "../${OUT_ZIP}" . ) || true
 ls -lh "$OUT_ZIP" || true
