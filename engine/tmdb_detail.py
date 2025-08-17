@@ -1,118 +1,115 @@
 # engine/tmdb_detail.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+import os
+import time
+from typing import Dict, List, Optional
 
-from .cache import (
-    tmdb_find_by_imdb_cached,
-    tmdb_details_cached,
-    tmdb_providers_cached,
-)
+import requests
 
-def _norm_list(x) -> List[str]:
-    if not x:
-        return []
-    if isinstance(x, (list, tuple)):
-        return [str(i) for i in x if i]
-    return [str(x)]
+TMDB_BASE = "https://api.themoviedb.org/3"
+_DEFAULT_TIMEOUT = (5, 20)
+_UA = "my-imdb-recos/1.0 (+github actions)"
 
-def _coerce_media_type(x: Optional[str], fallback_kind: str) -> str:
-    x = (x or "").lower()
-    if x in ("movie", "tv"):
-        return x
-    return "tv" if fallback_kind != "movie" else "movie"
 
-def map_imdb_to_tmdb(
-    tconst: str,
-    *,
-    api_key: str,
-    fallback_kind: str
-) -> Tuple[Optional[int], Optional[str]]:
+def _api_key_v3() -> str:
+    key = os.getenv("TMDB_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("TMDB_API_KEY missing (expecting TMDB v3 API key).")
+    return key
+
+
+def _headers() -> Dict[str, str]:
+    return {"Accept": "application/json", "User-Agent": _UA}
+
+
+def _get(url: str, params: Optional[Dict] = None) -> Dict:
+    """requests.get with v3 key via query param + simple retry/backoff."""
+    params = dict(params or {})
+    params["api_key"] = _api_key_v3()
+    for attempt in range(3):
+        r = requests.get(url, params=params, headers=_headers(), timeout=_DEFAULT_TIMEOUT)
+        if r.status_code == 429:
+            # backoff if rate-limited
+            sleep_s = float(r.headers.get("Retry-After", "1"))
+            time.sleep(min(max(sleep_s, 1.0), 5.0))
+            continue
+        r.raise_for_status()
+        return r.json()
+    # should not reach here
+    raise RuntimeError(f"TMDB GET failed for {url}")
+
+
+def fetch_movie_details(tmdb_id: int) -> Dict:
+    return _get(f"{TMDB_BASE}/movie/{tmdb_id}", {"language": "en-US"})
+
+
+def fetch_tv_details(tmdb_id: int) -> Dict:
+    # append external_ids so we can pull imdb_id for TV
+    return _get(
+        f"{TMDB_BASE}/tv/{tmdb_id}",
+        {"language": "en-US", "append_to_response": "external_ids"},
+    )
+
+
+def fetch_watch_providers(media_type: str, tmdb_id: int) -> Dict:
+    media_type = "movie" if media_type == "movie" else "tv"
+    return _get(f"{TMDB_BASE}/{media_type}/{tmdb_id}/watch/providers", {"language": "en-US"})
+
+
+def enrich_items_with_tmdb(items: List[Dict], *, api_key: str, region: str = "US") -> None:
     """
-    Returns (tmdb_id, media_type) or (None, None) if not found.
+    Mutates `items` in place. For each item with a tmdb_id:
+      - ensures tmdb_media_type
+      - populates title (fallback), imdb_id, genres
+      - populates providers (human-readable provider names for given region)
     """
-    if not tconst or not api_key:
-        return (None, None)
-    data = tmdb_find_by_imdb_cached(tconst, api_key)
-    for bucket, mtype in (("movie_results", "movie"), ("tv_results", "tv")):
-        results = data.get(bucket) or []
-        if results:
-            first = results[0]
-            tid = first.get("id")
-            if isinstance(tid, int):
-                return (tid, _coerce_media_type(mtype, fallback_kind))
-    return (None, None)
+    # ensure the provided api_key is present (warn if env doesn’t match)
+    env = os.getenv("TMDB_API_KEY", "")
+    if not env and api_key:
+        os.environ["TMDB_API_KEY"] = api_key
 
-def enrich_one_with_tmdb(
-    item: Dict[str, Any],
-    *,
-    api_key: str,
-    region: str
-) -> None:
-    """
-    Mutates 'item' in place:
-      - adds tmdb_id, tmdb_media_type (via /find/{imdb_id})
-      - merges genres from /movie|tv/{id}
-      - sets providers (flatrate + ads) for region via /watch/providers
-    """
-    if not api_key:
-        return
-
-    tmdb_id = item.get("tmdb_id")
-    mtype = item.get("tmdb_media_type")
-
-    if not tmdb_id:
-        tconst = item.get("tconst")
-        if tconst:
-            tid, mt = map_imdb_to_tmdb(
-                str(tconst),
-                api_key=api_key,
-                fallback_kind=("tv" if item.get("type") != "movie" else "movie"),
-            )
-            if tid:
-                item["tmdb_id"] = tid
-                item["tmdb_media_type"] = mt or ("tv" if item.get("type") != "movie" else "movie")
-                tmdb_id = tid
-                mtype = item.get("tmdb_media_type")
-
-    if not tmdb_id:
-        return
-
-    # Genres + title merge from details
-    try:
-        det = tmdb_details_cached(int(tmdb_id), api_key, (mtype or "movie"))
-        base_genres = _norm_list(item.get("genres"))
-        if isinstance(det, dict):
-            glist = det.get("genres") or []
-            names = [g.get("name") for g in glist if isinstance(g, dict) and g.get("name")]
-            merged = list(dict.fromkeys([*base_genres, *names]))
-            if merged:
-                item["genres"] = merged
-            if not item.get("title"):
-                item["title"] = det.get("title") or det.get("name") or item.get("title")
-    except Exception:
-        pass
-
-    # Providers for region
-    try:
-        prov = tmdb_providers_cached(int(tmdb_id), api_key, (mtype or "movie"))
-        if prov and "results" in prov:
-            pr = prov["results"].get(region.upper()) or {}
-            flatrate = [p.get("provider_name") for p in (pr.get("flatrate") or []) if p.get("provider_name")]
-            ads = [p.get("provider_name") for p in (pr.get("ads") or []) if p.get("provider_name")]
-            names = sorted(set([*(item.get("providers") or []), *flatrate, *ads]))
-            item["providers"] = names
-    except Exception:
-        pass
-
-def enrich_items_with_tmdb(
-    items: List[Dict[str, Any]],
-    *,
-    api_key: str,
-    region: str
-) -> None:
-    if not items or not api_key:
-        return
-    region = (region or "US").upper()
     for it in items:
-        enrich_one_with_tmdb(it, api_key=api_key, region=region)
+        mid = it.get("tmdb_id")
+        if mid is None:
+            continue
+        try:
+            tmdb_id = int(mid)
+        except Exception:
+            continue
+
+        mtype = it.get("tmdb_media_type") or ("movie" if it.get("type") == "movie" else "tv")
+        it["tmdb_media_type"] = mtype
+
+        try:
+            if mtype == "movie":
+                d = fetch_movie_details(tmdb_id)
+                it.setdefault("title", d.get("title") or d.get("original_title"))
+                it["imdb_id"] = it.get("imdb_id") or d.get("imdb_id")
+                if not it.get("genres"):
+                    it["genres"] = [g.get("name") for g in d.get("genres", []) if g.get("name")]
+            else:
+                d = fetch_tv_details(tmdb_id)
+                it.setdefault("title", d.get("name") or d.get("original_name"))
+                ext = d.get("external_ids") or {}
+                it["imdb_id"] = it.get("imdb_id") or ext.get("imdb_id")
+                if not it.get("genres"):
+                    it["genres"] = [g.get("name") for g in d.get("genres", []) if g.get("name")]
+        except Exception:
+            # best-effort enrichment; continue
+            pass
+
+        # Providers per region (names)
+        try:
+            prov = fetch_watch_providers(mtype, tmdb_id)
+            r = (prov or {}).get("results", {}).get(region.upper()) or {}
+            names = []
+            for grp in ("flatrate", "ads"):
+                for p in r.get(grp, []) or []:
+                    nm = p.get("provider_name")
+                    if nm:
+                        names.append(nm)
+            if names:
+                it["providers"] = sorted(set(names))
+        except Exception:
+            pass
