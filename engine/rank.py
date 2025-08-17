@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import math
 import json
-from collections import Counter, defaultdict
+from collections import defaultdict
 from typing import Dict, List, Any, Tuple, Optional
 
 import pandas as pd
 
+
+# ----------------------------
+# Helpers
+# ----------------------------
 
 def _safe(val, default=0.0):
     try:
@@ -49,28 +53,79 @@ def _extract_people(credits: Dict[str, Any]) -> Tuple[List[str], List[str]]:
     return cast_names, crew_names
 
 
+def _get_external_scores(meta: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Pull critic/audience scores from a few common keys.
+    Return values in [0, 100] or None.
+    """
+    critic_keys = ["critic_score", "rt_critic", "metacritic", "metacritic_score"]
+    audience_keys = ["audience_score", "rt_audience", "imdb_audience_score"]
+
+    critic = None
+    audience = None
+
+    for k in critic_keys:
+        if k in meta and meta[k] is not None:
+            critic = _safe(meta[k], None)
+            break
+    for k in audience_keys:
+        if k in meta and meta[k] is not None:
+            audience = _safe(meta[k], None)
+            break
+
+    # clamp to 0..100 if present
+    def clamp01(x):
+        if x is None:
+            return None
+        return max(0.0, min(100.0, float(x)))
+
+    return clamp01(critic), clamp01(audience)
+
+
+def _signed_boost(score_0_100: Optional[float]) -> float:
+    """
+    Map a 0..100 external score to a signed impact in [-1, +1]
+    with a neutral zone around 50..65 => 0.
+      - 0 -> -1 (max penalty)
+      - 50..65 -> ~0 (neutral)
+      - 100 -> +1 (max boost)
+    Piecewise-linear for clarity and predictability.
+    """
+    if score_0_100 is None:
+        return 0.0
+
+    s = float(score_0_100)
+
+    # Below 50: linear penalty from -1 at 0 up to 0 at 50
+    if s < 50.0:
+        return (s / 50.0) - 1.0  # 0 -> -1, 50 -> 0
+
+    # Neutral zone 50..65: exactly 0
+    if 50.0 <= s <= 65.0:
+        return 0.0
+
+    # Above 65: linear boost from 0 at 65 to +1 at 100
+    # 35 points span -> divide by 35
+    return (s - 65.0) / 35.0  # 65 -> 0, 100 -> +1
+
+
+# ----------------------------
+# Profile building
+# ----------------------------
+
 def build_profile_from_ratings(ratings_csv: str) -> Dict[str, Dict[str, float]]:
     """
     Create a user 'DNA' from the IMDb ratings CSV:
-    - boosts genres/directors/cast weighted by (rating - user_mean)
-    - slight decay for very old watches (if 'Date Rated' column exists)
-    The CSV format is the standard IMDb export.
+    - boosts genres/directors/writers weighted by (rating - user_mean)
+    - small temporal taste via release year
     """
     try:
         df = pd.read_csv(ratings_csv)
     except Exception:
-        return {
-            "genre": {},
-            "cast": {},
-            "director": {},
-            "writer": {},
-            "year": {},
-        }
+        return {"genre": {}, "cast": {}, "director": {}, "writer": {}, "year": {}}
 
-    # Normalize columns we care about (IMDb export field names can vary)
-    # Expect at least: Title, URL, Your Rating, Year, Genres, and optionally Directors, Writers
     col_map = {c.lower(): c for c in df.columns}
-    def col(*cands): 
+    def col(*cands):
         for c in cands:
             if c.lower() in col_map:
                 return col_map[c.lower()]
@@ -101,7 +156,7 @@ def build_profile_from_ratings(ratings_csv: str) -> Dict[str, Dict[str, float]]:
     for _, row in df.iterrows():
         r = float(row["_rating"])
         delta = r - user_mean  # positive if above your norm
-        boost = 1.0 + max(delta, -2.0) * 0.5  # keep stable; above-avg ≈ >1.0
+        boost = 1.0 + max(delta, -2.0) * 0.5  # stable; above-avg ≈ >1.0
 
         if c_genres and isinstance(row.get(c_genres), str):
             for g in [x.strip() for x in row[c_genres].split(",") if x.strip()]:
@@ -118,7 +173,9 @@ def build_profile_from_ratings(ratings_csv: str) -> Dict[str, Dict[str, float]]:
         if c_year and pd.notna(row.get(c_year)):
             try:
                 year = str(int(row[c_year]))
-                year_weights[year] += 0.25 * boost  # small temporal taste
+                year_weights[year] += 0.25 * boost
+            except Exception:
+                pass
 
     return {
         "genre": _norm(dict(genre_weights)),
@@ -130,26 +187,34 @@ def build_profile_from_ratings(ratings_csv: str) -> Dict[str, Dict[str, float]]:
     }
 
 
+# ----------------------------
+# Scoring
+# ----------------------------
+
 def score_candidate(
     item: Dict[str, Any],
     profile: Dict[str, Dict[str, float]],
-    w_critic: float = 0.25,
-    w_audience: float = 0.25,
+    w_critic: float = 0.35,
+    w_audience: float = 0.35,
 ) -> float:
     """
     Blend of:
       - profile similarity (genres, people, year signal)
-      - public signals if present (tmdb vote_average, vote_count)
-      - optional critic/audience scores on the item dict (if your pipeline adds them)
+      - public TMDB signals if present (vote_average, vote_count)
+      - signed external (critic/audience) boosts/penalties with a 50–65 neutral band
     """
     meta = item or {}
     genres = [g.get("name") for g in (meta.get("genres") or []) if isinstance(g, dict) and g.get("name")]
     genre_vec = {g: 1.0 for g in genres}
 
     credits = meta.get("credits") or {}
-    cast_names, crew_names = _extract_people(credits)
+    # cast
+    cast_names = []
+    if isinstance(credits.get("cast"), list):
+        cast_names = [c.get("name") for c in credits["cast"] if isinstance(c, dict) and c.get("name")]
     cast_vec = {n: 1.0 for n in cast_names[:10]}  # cap noise
-    # treat director/writer from crew (if roles present)
+
+    # director/writer from crew
     directors = [c.get("name") for c in credits.get("crew", []) if c.get("job") == "Director" and c.get("name")]
     writers = [c.get("name") for c in credits.get("crew", []) if c.get("department") == "Writing" and c.get("name")]
     director_vec = {n: 1.0 for n in directors}
@@ -166,15 +231,16 @@ def score_candidate(
         0.10 * _dot(_norm(year_vec), profile.get("year", {}))
     )
 
-    # Public signals
+    # Public signals (TMDB)
     tmdb_rating = _safe(meta.get("vote_average"), 0.0) / 10.0  # 0..1
     tmdb_count = _safe(meta.get("vote_count"), 0.0)
     pop_signal = tmdb_rating * (1.0 + min(tmdb_count, 2000.0) / 2000.0 * 0.25)  # slight boost if many votes
 
-    # Optional critic/audience if you later add them in catalog
-    critic = _safe(meta.get("critic_score"), 0.0) / 100.0
-    audience = _safe(meta.get("audience_score"), 0.0) / 100.0
-    external = w_critic * critic + w_audience * audience
+    # Signed critic/audience
+    critic_raw, audience_raw = _get_external_scores(meta)
+    critic_signed = _signed_boost(critic_raw)     # [-1, +1]
+    audience_signed = _signed_boost(audience_raw) # [-1, +1]
+    external = w_critic * critic_signed + w_audience * audience_signed
 
     # slight freshness preference if 'release_year' or 'first_air_year' recent
     try:
@@ -183,8 +249,18 @@ def score_candidate(
     except Exception:
         recency = 0.0
 
-    return 0.60 * sim + 0.25 * pop_signal + 0.10 * external + 0.05 * recency
+    # Final blend: make external meaningful but not dominant
+    # Range intuition:
+    # - sim in [0..1]
+    # - pop in [0..~1.25]
+    # - external in [-w_sum..+w_sum] (e.g., [-0.7..+0.7] with defaults)
+    # - recency in [0..1]
+    return 0.55 * sim + 0.20 * pop_signal + 0.20 * external + 0.05 * recency
 
+
+# ----------------------------
+# Ranking entrypoint
+# ----------------------------
 
 def rank_pool(
     pool: List[Dict[str, Any]],
@@ -192,7 +268,7 @@ def rank_pool(
     meta: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Rank the pool using your profile DNA + public signals.
+    Rank the pool using your profile DNA + public signals + signed external scores.
     Returns (ranked_list, rank_meta).
     """
     profile = build_profile_from_ratings(cfg.ratings_csv)
@@ -204,6 +280,14 @@ def rank_pool(
         )
         rec = dict(it)
         rec["_score"] = round(float(s), 6)
+        # Include what we used so you can inspect later
+        critic_raw, audience_raw = _get_external_scores(it)
+        rec["_external"] = {
+            "critic_raw": critic_raw,
+            "audience_raw": audience_raw,
+            "critic_signed": round(_signed_boost(critic_raw), 4) if critic_raw is not None else None,
+            "audience_signed": round(_signed_boost(audience_raw), 4) if audience_raw is not None else None,
+        }
         ranked.append(rec)
 
     ranked.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
@@ -217,6 +301,7 @@ def rank_pool(
                 "score": x.get("_score"),
                 "tmdb_id": x.get("id"),
                 "kind": x.get("media_type") or ("tv" if x.get("first_air_date") else "movie"),
+                "external": x.get("_external"),
             }
             for x in ranked[:5]
         ],
@@ -225,7 +310,7 @@ def rank_pool(
     # persist a small debug artifact
     try:
         dbg = {
-            "profile": {k: dict(sorted(v.items(), key=lambda kv: -kv[1])[:20]) for k, v in profile.items()},
+            "profile": {k: dict(sorted((v or {}).items(), key=lambda kv: -kv[1])[:20]) for k, v in profile.items()},
             "meta": rmeta,
         }
         with open("data/debug/rank_debug.json", "w", encoding="utf-8") as f:
