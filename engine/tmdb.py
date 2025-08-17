@@ -5,183 +5,189 @@ import hashlib
 import json
 import os
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
+from urllib.parse import urlencode
 
 import requests
 
-# ---- TMDB core ----
-_TMDB_BASE = "https://api.themoviedb.org/3"
-_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
+# ---- basic env helpers ----
 
-# Cache directory
-_CACHE_DIR = os.path.join("data", "cache")
-os.makedirs(_CACHE_DIR, exist_ok=True)
+def _env(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return v if v is not None and v != "" else default
 
-# Basic retry/backoff
-_RETRIES = 2
-_TIMEOUT = 20
+TMDB_API_KEY = _env("TMDB_API_KEY")
+
+# ---- caching with short hashed filenames to avoid OSError(36) ----
+
+def _cache_dir() -> str:
+    path = os.path.join("data", "cache")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def _cache_key(endpoint: str, url: str, params: Dict[str, Any]) -> str:
+    # Deterministic string that captures request uniqueness
+    raw = f"{endpoint}|{url}|{json.dumps(params, sort_keys=True, separators=(',',':'))}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+def _cache_path(prefix: str, key_hex: str) -> str:
+    # Short, safe filename
+    return os.path.join(_cache_dir(), f"{prefix}_{key_hex}.json")
 
 
-# --- Provider helpers ---------------------------------------------------------
+# ---- provider mapping & parsing ----
 
-# Stable mapping of provider slugs -> TMDB numeric IDs (global ones TMDB uses)
-# Add more if you subscribe to other services.
-_PROVIDER_ID_MAP = {
+_PROVIDER_NAME_TO_ID = {
+    # common US/global streaming ids (TMDB watch providers)
     "netflix": 8,
-    "prime_video": 9,      # Amazon Prime Video
+    "prime_video": 9,
     "hulu": 15,
     "max": 384,            # HBO Max / Max
     "disney_plus": 337,
     "apple_tv_plus": 350,
     "peacock": 386,
     "paramount_plus": 531,
+    # extend here if you add more services
 }
 
-def providers_from_env(subs_csv: str, region: str) -> List[int]:
+def providers_from_env(subs_csv: str, region: str) -> str:
     """
-    Convert a comma-separated list of provider slugs into TMDB provider IDs.
-    Region is accepted for future per-region mappings; for now IDs are global.
+    Convert a comma-separated list of service slugs into TMDB watch provider IDs
+    joined by '|', which TMDB accepts for with_watch_providers.
+    We keep the interface (subs_csv, region) to match catalog usage; 'region'
+    is not used to change IDs, but it's required by the caller.
     """
     if not subs_csv:
-        return []
-    slugs = [s.strip().lower() for s in subs_csv.split(",") if s.strip()]
-    ids: List[int] = []
-    for s in slugs:
-        pid = _PROVIDER_ID_MAP.get(s)
+        return ""
+    ids: List[str] = []
+    for raw in subs_csv.split(","):
+        name = raw.strip().lower()
+        if not name:
+            continue
+        # allow both "disney_plus" and "disney-plus" and "disney+"
+        name = name.replace("+", "_").replace("-", "_")
+        pid = _PROVIDER_NAME_TO_ID.get(name)
         if pid is not None:
-            ids.append(pid)
-    # De-duplicate while preserving order
-    seen = set()
-    out: List[int] = []
-    for i in ids:
-        if i not in seen:
-            seen.add(i)
-            out.append(i)
-    return out
+            ids.append(str(pid))
+    return "|".join(ids)
 
 
-# --- Caching primitives -------------------------------------------------------
+# ---- HTTP + TMDB helpers ----
 
-def _hash_cache_key(endpoint: str, params: Dict[str, Any]) -> str:
-    # Sort params for stability
-    items = sorted((k, "" if v is None else str(v)) for k, v in params.items())
-    payload = json.dumps({"endpoint": endpoint, "params": items}, separators=(",", ":"), sort_keys=True)
-    return hashlib.sha1(payload.encode("utf-8")).hexdigest()  # 40 chars
+_BASE = "https://api.themoviedb.org/3"
 
-
-def _cache_path(prefix: str, endpoint: str, params: Dict[str, Any]) -> str:
-    h = _hash_cache_key(endpoint, params)
-    return os.path.join(_CACHE_DIR, f"{prefix}_{h}.json")
-
-
-def _get_json(prefix: str, endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
+def _get_json(prefix: str, url: str, params: Dict[str, Any], ttl_seconds: int = 3600) -> Dict:
     """
-    GET JSON with local caching. Cache file name is a short hash to avoid
-    OS path length limits.
+    Get JSON from TMDB with a tiny cache on disk using hashed filenames.
     """
-    if not _API_KEY:
+    if not TMDB_API_KEY:
         raise RuntimeError("TMDB_API_KEY is not set")
 
-    query = dict(params or {})
-    query["api_key"] = _API_KEY
+    # attach API key
+    params = dict(params)
+    params["api_key"] = TMDB_API_KEY
 
-    cache_file = _cache_path(prefix, endpoint, query)
-    if os.path.exists(cache_file):
-        with open(cache_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+    # short hashed cache key
+    key = _cache_key(prefix, url, params)
+    path = _cache_path(prefix, key)
 
-    url = f"{_TMDB_BASE}/{endpoint.lstrip('/')}"
-    last_err: Exception | None = None
-    for attempt in range(_RETRIES + 1):
+    # fetch from cache if fresh
+    if os.path.exists(path):
         try:
-            resp = requests.get(url, params=query, timeout=_TIMEOUT)
-            if 500 <= resp.status_code < 600:
-                last_err = RuntimeError(f"TMDB 5xx on {endpoint}: {resp.status_code}")
-                time.sleep(1.0 * (attempt + 1))
-                continue
-            resp.raise_for_status()
-            data = resp.json()
-            with open(cache_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False)
-            return data
-        except Exception as e:
-            last_err = e
-            if attempt < _RETRIES:
-                time.sleep(1.0 * (attempt + 1))
-            else:
-                break
-    assert last_err is not None
-    raise last_err
+            mtime = os.path.getmtime(path)
+            if time.time() - mtime < ttl_seconds:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+
+    # live request
+    full_url = f"{url}?{urlencode(params)}"
+    resp = requests.get(full_url, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # write cache
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception:
+        # cache write failures are non-fatal
+        pass
+
+    return data
 
 
-# --- Public discovery functions used by catalog.py ----------------------------
+def _simplify_result(kind: str, r: Dict) -> Dict:
+    """
+    Normalize TMDB discover item into a compact dict the engine expects.
+    """
+    if kind == "movie":
+        title = r.get("title") or r.get("original_title") or ""
+        date = r.get("release_date") or ""
+        year = int(date[:4]) if date[:4].isdigit() else None
+    else:
+        title = r.get("name") or r.get("original_name") or ""
+        date = r.get("first_air_date") or ""
+        year = int(date[:4]) if date[:4].isdigit() else None
 
-def _discover(
-    kind: str,
-    page: int,
-    *,
-    region: str,
-    provider_ids: List[int] | None,
-    original_langs: str | None,
-    language: str | None = "en-US",
-    include_adult: bool = False,
-) -> Dict[str, Any]:
-    if kind not in ("movie", "tv"):
-        raise ValueError("kind must be 'movie' or 'tv'")
+    return {
+        "type": "movie" if kind == "movie" else "tvSeries",
+        "tmdb_id": r.get("id"),
+        "title": title,
+        "year": year,
+        "popularity": r.get("popularity", 0.0),
+        "vote_average": r.get("vote_average", 0.0),
+    }
 
-    endpoint = f"discover/{kind}"
+
+def _discover(kind: str, page: int, *, region: str, provider_ids: str, original_langs: str) -> Dict:
+    """
+    Call TMDB discover endpoint for movies or TV.
+    """
+    url = f"{_BASE}/discover/{kind}"
+
     params: Dict[str, Any] = {
+        "include_adult": "false",
+        "language": "en-US",  # response language
         "page": page,
         "sort_by": "popularity.desc",
-        "include_adult": str(bool(include_adult)).lower(),
-        "watch_region": region,
-        "language": language or "en-US",
-        "with_watch_monetization_types": "flatrate|free|ads",
+        "watch_region": region or "US",
     }
 
     if provider_ids:
-        params["with_watch_providers"] = "|".join(str(i) for i in provider_ids)
+        params["with_watch_providers"] = provider_ids
+        params["with_watch_monetization_types"] = "flatrate|free|ads"
 
     if original_langs:
+        # comma-separated list like "en,es" becomes filter for original language
         params["with_original_language"] = original_langs
 
-    prefix = f"tmdb_discover_{kind}"
-    return _get_json(prefix, endpoint, params)
+    return _get_json(f"discover_{kind}", url, params)
 
 
 def discover_movie_page(
     page: int,
     *,
     region: str,
-    provider_ids: List[int] | None,
-    original_langs: str | None,
-    language: str | None = "en-US",
-) -> Tuple[List[Dict[str, Any]], int]:
-    data = _discover(
-        "movie",
-        page,
-        region=region,
-        provider_ids=provider_ids,
-        original_langs=original_langs,
-        language=language,
-    )
-    return data.get("results", []), int(data.get("page", page) or page)
+    provider_ids: str,
+    original_langs: str,
+) -> Tuple[List[Dict], Dict]:
+    data = _discover("movie", page, region=region, provider_ids=provider_ids, original_langs=original_langs)
+    results = data.get("results", [])
+    items = [_simplify_result("movie", r) for r in results]
+    return items, {"page": data.get("page"), "total_pages": data.get("total_pages")}
 
 
 def discover_tv_page(
     page: int,
     *,
     region: str,
-    provider_ids: List[int] | None,
-    original_langs: str | None,
-    language: str | None = "en-US",
-) -> Tuple[List[Dict[str, Any]], int]:
-    data = _discover(
-        "tv",
-        page,
-        region=region,
-        provider_ids=provider_ids,
-        original_langs=original_langs,
-        language=language,
-    )
-    return data.get("results", []), int(data.get("page", page) or page)
+    provider_ids: str,
+    original_langs: str,
+    include_seasons: bool = True,  # placeholder; not used in discover
+) -> Tuple[List[Dict], Dict]:
+    data = _discover("tv", page, region=region, provider_ids=provider_ids, original_langs=original_langs)
+    results = data.get("results", [])
+    items = [_simplify_result("tv", r) for r in results]
+    return items, {"page": data.get("page"), "total_pages": data.get("total_pages")}
