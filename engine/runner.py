@@ -9,7 +9,6 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List
 
-# Local imports
 try:
     from .env import Env
 except Exception:
@@ -26,19 +25,17 @@ except Exception:
     def run_self_check() -> None:
         print("SELF-CHECK: (fallback)")
 
-# Optional components
 try:
-    from .scoring import score_items  # expects to add 'match' field (0..100)
+    from .scoring import score_items
 except Exception:
     score_items = None  # type: ignore
 
 try:
-    from .exclusions import load_seen_index, filter_unseen  # imdb-based unseen filter
+    from .exclusions import load_seen_index, filter_unseen
 except Exception:
     load_seen_index = None  # type: ignore
-    filter_unseen = None  # type: ignore
+    filter_unseen = None    # type: ignore
 
-# Optional: provider enrichment for top N
 try:
     from . import tmdb
 except Exception:
@@ -74,30 +71,46 @@ def _stamp_last_run(run_dir: Path) -> None:
 
 
 def _env_from_os() -> Env:
-    raw_langs = os.getenv("ORIGINAL_LANGS", '["en"]').strip()
-    try:
-        langs = json.loads(raw_langs) if raw_langs.startswith("[") else [x.strip() for x in raw_langs.split(",") if x.strip()]
-    except Exception:
-        langs = ["en"]
-    raw_subs = os.getenv("SUBS_INCLUDE", "").strip()
-    if raw_subs.startswith("["):
+    def _json_or_list(s: str) -> List[str]:
+        s = s.strip()
+        if s.startswith("["):
+            try:
+                import json as _json
+                return [str(x).strip() for x in _json.loads(s)]
+            except Exception:
+                return []
+        return [x.strip() for x in s.split(",") if x.strip()]
+
+    raw_langs = os.getenv("ORIGINAL_LANGS", '["en"]')
+    langs = _json_or_list(raw_langs)
+
+    raw_subs = os.getenv("SUBS_INCLUDE", "")
+    subs_list = _json_or_list(raw_subs)
+
+    def _int_env(name: str, default: int) -> int:
         try:
-            subs_list = [str(x).strip() for x in json.loads(raw_subs)]
+            v = os.getenv(name, "")
+            return int(v) if v else default
         except Exception:
-            subs_list = []
-    else:
-        subs_list = [x.strip() for x in raw_subs.split(",") if x.strip()]
-    pages_env = os.getenv("DISCOVER_PAGES", "").strip()
-    try:
-        pages = int(pages_env) if pages_env else 12
-    except Exception:
-        pages = 12
+            return default
+
+    pages = _int_env("DISCOVER_PAGES", 12)
     pages = max(1, min(50, pages))
+
+    # New pool knobs
+    pool_max = _int_env("POOL_MAX_ITEMS", 20000)
+    prune_at = _int_env("POOL_PRUNE_AT", 0)
+    prune_keep = _int_env("POOL_PRUNE_KEEP", max(0, prune_at - 5000) if prune_at > 0 else 0)
+
     return Env.from_mapping({
         "REGION": os.getenv("REGION", "US").strip() or "US",
         "ORIGINAL_LANGS": langs,
         "SUBS_INCLUDE": subs_list,
         "DISCOVER_PAGES": pages,
+        # Pool knobs (propagate into build_catalog via env)
+        "POOL_MAX_ITEMS": pool_max,
+        "POOL_PRUNE_AT": prune_at,
+        "POOL_PRUNE_KEEP": prune_keep,
     })
 
 
@@ -117,6 +130,7 @@ def _markdown_summary(items: List[Dict[str, Any]], env: Env, top_n: int = 25) ->
     pages = env.get("DISCOVER_PAGES", 1)
     prov_map = env.get("PROVIDER_MAP", {})
     unmatched = env.get("PROVIDER_UNMATCHED", [])
+    pool_t = env.get("POOL_TELEMETRY", {}) or {}
 
     lines = []
     lines.append("# Daily recommendations\n")
@@ -128,7 +142,15 @@ def _markdown_summary(items: List[Dict[str, Any]], env: Env, top_n: int = 25) ->
         lines.append(f"- Provider slugs not matched this region: `{unmatched}`")
     lines.append(f"- Discover pages: **{pages}**")
     lines.append(f"- Discovered (raw): **{discovered}**")
-    lines.append(f"- Eligible after exclusions: **{eligible}**\n")
+    lines.append(f"- Eligible after exclusions: **{eligible}**")
+    # Pool telemetry
+    if pool_t:
+        lines.append(f"- Pool: file_lines_before={pool_t.get('file_lines_before')} → file_lines_after={pool_t.get('file_lines_after')}, "
+                     f"unique_keys_est={pool_t.get('unique_keys_est')}, loaded_unique={pool_t.get('loaded_unique')}, "
+                     f"appended_this_run={pool_t.get('appended_this_run')}, pool_max_items={pool_t.get('pool_max_items')}")
+        if pool_t.get("prune_at", 0):
+            lines.append(f"- Pool prune policy: prune_at={pool_t.get('prune_at')}, keep={pool_t.get('prune_keep')}")
+    lines.append("")
 
     def _fmt_providers(p):
         if not p: return "_unknown_"
@@ -143,7 +165,6 @@ def _markdown_summary(items: List[Dict[str, Any]], env: Env, top_n: int = 25) ->
         title = it.get("title") or it.get("name") or "—"
         match = it.get("score", it.get("match", 0.0))
         aud = it.get("audience", it.get("tmdb_vote", 0.0))
-        # normalize audience display to 0..100
         try:
             audv = float(aud)
             if audv <= 10.0: audv *= 10.0
@@ -217,7 +238,9 @@ def main() -> None:
         _log(f"[catalog] FAILED: {ex!r}")
         traceback.print_exc()
         items = []
-    _log(f" | catalog:end discovered={env.get('DISCOVERED_COUNT', 0)} pooled={len(items)}")
+    pool_t = env.get("POOL_TELEMETRY", {}) or {}
+    _log(f" | catalog:end discovered={env.get('DISCOVERED_COUNT', 0)} "
+         f"pooled={len(items)} pool_file_lines={pool_t.get('file_lines_after')} loaded_unique={pool_t.get('loaded_unique')}")
 
     discovered = int(env.get("DISCOVERED_COUNT", 0))
     eligible = len(items)
@@ -241,14 +264,12 @@ def main() -> None:
         _log(f"[exclusions] FAILED: {ex!r}")
         traceback.print_exc()
 
-    # Add providers to the visible top before scoring (helps email table)
     _enrich_top_providers(items, env, top_n=40)
 
-    # Scoring
     ranked: List[Dict[str, Any]] = items
     try:
         if callable(score_items):
-            ranked = score_items(env, items)  # adds 'match'
+            ranked = score_items(env, items)
         ranked = sorted(ranked, key=lambda it: it.get("score", it.get("match", it.get("tmdb_vote", 0.0))), reverse=True)
     except Exception as ex:
         _log(f"[scoring] FAILED: {ex!r}")
@@ -271,7 +292,6 @@ def main() -> None:
             w = csv.writer(fh)
             w.writerow(["rank","title","year","media_type","match","audience","tmdb_vote","imdb_id","tmdb_id","providers","why"])
             for i, it in enumerate(ranked[:100], start=1):
-                # normalize audience for export
                 try:
                     aud = float(it.get("audience", it.get("tmdb_vote", 0.0)))
                     if aud <= 10.0: aud *= 10.0
@@ -293,7 +313,6 @@ def main() -> None:
     except Exception as ex:
         _log(f"[export] CSV failed: {ex!r}")
 
-    # Summary for the Issue (email)
     try:
         (run_dir / "summary.md").write_text(_markdown_summary(ranked, env, top_n=25), encoding="utf-8")
     except Exception as ex:
@@ -316,6 +335,7 @@ def main() -> None:
                 "DISCOVER_PAGES": env.get("DISCOVER_PAGES", 0),
                 "PROVIDER_MAP": env.get("PROVIDER_MAP", {}),
                 "PROVIDER_UNMATCHED": env.get("PROVIDER_UNMATCHED", []),
+                "POOL_TELEMETRY": env.get("POOL_TELEMETRY", {}),
             },
             "discover_pages": env.get("DISCOVER_PAGE_TELEMETRY", []),
             "paths": {
