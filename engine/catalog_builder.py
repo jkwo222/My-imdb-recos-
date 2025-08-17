@@ -24,24 +24,14 @@ def _attach_imdb_ids(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         out.append(it)
     return out
 
-
 def build_catalog(env: Env) -> List[Dict[str, Any]]:
-    """
-    Build the candidate set:
-      1) Discover pages for movie+tv with provider filters and langs.
-      2) Add trending (day+week).
-      3) Attach imdb_ids for unseen filtering.
-      4) Append to persistent pool (JSONL).
-      5) Load a *large* unique pool (configurable), combine with fresh, de-dupe, return newest-first.
-    """
     region = env.get("REGION", "US")
     langs = env.get("ORIGINAL_LANGS", ["en"])
     subs = env.get("SUBS_INCLUDE", [])
     pages = int(env.get("DISCOVER_PAGES", 12))
 
-    # Pool knobs (env-controlled)
-    pool_max = int(env.get("POOL_MAX_ITEMS", 20000))            # working set size (unique) to load
-    prune_at = int(env.get("POOL_PRUNE_AT", 0) or 0)            # if >0 and file > prune_at lines → prune
+    pool_max = int(env.get("POOL_MAX_ITEMS", 20000))
+    prune_at = int(env.get("POOL_PRUNE_AT", 0) or 0)
     prune_keep = int(env.get("POOL_PRUNE_KEEP", max(0, prune_at - 5000)) or 0)
 
     provider_ids, used_map = tmdb.providers_from_env(subs, region)
@@ -50,7 +40,6 @@ def build_catalog(env: Env) -> List[Dict[str, Any]]:
     fresh: List[Dict[str, Any]] = []
     diag_pages: List[Dict[str, Any]] = []
 
-    # Discover movie / tv
     for kind in ("movie", "tv"):
         for p in range(1, max(1, pages) + 1):
             if kind == "movie":
@@ -61,12 +50,11 @@ def build_catalog(env: Env) -> List[Dict[str, Any]]:
             d["kind"] = kind
             diag_pages.append(d)
 
-    # Trending
     for period in ("day", "week"):
         fresh.extend(tmdb.trending("movie", period))
         fresh.extend(tmdb.trending("tv", period))
 
-    # De-dupe fresh by (media_type, tmdb_id)
+    # De-dupe fresh
     seen_fresh = set()
     uniq_fresh: List[Dict[str, Any]] = []
     for it in fresh:
@@ -76,42 +64,33 @@ def build_catalog(env: Env) -> List[Dict[str, Any]]:
         uniq_fresh.append(it)
         seen_fresh.add(k)
 
-    # Attach imdb_ids
     with_ids = _attach_imdb_ids(uniq_fresh)
 
-    # Persist to pool
+    # --- telemetry fix: measure BEFORE append ---
+    stats_before = pool_mod.pool_stats(sample_unique=False)
+
     appended = pool_mod.append_candidates(with_ids)
 
-    # Optional prune to control file size on disk
-    stats_before = pool_mod.pool_stats(sample_unique=False)
-    if prune_at and stats_before.get("file_lines", 0) > prune_at and prune_keep > 0:
+    if prune_at and stats_before.get("file_lines", 0) + appended > prune_at and prune_keep > 0:
         pool_mod.prune_pool(keep_last_lines=prune_keep)
-    stats_after = pool_mod.pool_stats(sample_unique=True, sample_limit=200000)  # generous sample
 
-    # Load large unique working set from the pool (newest-first)
+    stats_after = pool_mod.pool_stats(sample_unique=True, sample_limit=200000)
+
     pool = pool_mod.load_pool(max_items=pool_max, unique_only=True, prefer_recent=True)
 
-    # Combine pool + fresh (avoid dupes)
     combined_keys = set()
     combined: List[Dict[str, Any]] = []
-
-    # Start with pool (already newest-first)
     for it in pool:
         k = (it.get("media_type"), int(it.get("tmdb_id") or 0))
         if k[0] and k[1] and k not in combined_keys:
-            combined.append(it)
-            combined_keys.add(k)
-
-    # Add fresh ones that aren't already in combined
+            combined.append(it); combined_keys.add(k)
     for it in with_ids:
         k = (it.get("media_type"), int(it.get("tmdb_id") or 0))
         if k[0] and k[1] and k not in combined_keys:
-            combined.append(it)
-            combined_keys.add(k)
+            combined.append(it); combined_keys.add(k)
 
-    # Telemetry for runner summary/diag
     env["DISCOVERED_COUNT"] = len(fresh)
-    env["ELIGIBLE_COUNT"] = len(combined)  # pre-exclusions
+    env["ELIGIBLE_COUNT"] = len(combined)
     env["PROVIDER_MAP"] = used_map
     env["PROVIDER_UNMATCHED"] = unmatched
     env["DISCOVER_PAGE_TELEMETRY"] = diag_pages[:]
@@ -125,5 +104,4 @@ def build_catalog(env: Env) -> List[Dict[str, Any]]:
         "prune_at": int(prune_at),
         "prune_keep": int(prune_keep),
     }
-
     return combined
