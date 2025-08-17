@@ -3,252 +3,235 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple, Any, Optional
 
 import requests
 
-# ----------------------------------------------------------------------
-# Paths / constants
-# ----------------------------------------------------------------------
+# -----------------------------
+# Configuration / constants
+# -----------------------------
 
-ROOT = Path(__file__).resolve().parents[1]
-CACHE_DIR = ROOT / "data" / "cache" / "tmdb" / "discover"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+TMDB_BASE = "https://api.themoviedb.org/3"
+CACHE_ROOT = Path("data/cache/tmdb")
+CACHE_ROOT.mkdir(parents=True, exist_ok=True)
 
-TMDB_V3 = "https://api.themoviedb.org/3"
-LANG_DEFAULT = "en-US"
+# If you want to disable local HTTP caching completely, set to False
+ENABLE_CACHE = True
+CACHE_TTL_SECS = 60 * 60 * 12  # 12 hours
 
-# Popular US flatrate providers id map (TMDB watch providers)
-PROVIDER_MAP = {
-    # flatrate SVODs
+# Provider aliases → TMDB watch provider IDs (US)
+# These IDs are stable on TMDB; add more as needed.
+PROVIDER_ALIASES: Dict[str, int] = {
     "netflix": 8,
     "prime_video": 9,
     "hulu": 15,
-    "max": 384,  # HBO Max / Max
+    "max": 384,               # HBO Max/Max (US)
     "disney_plus": 337,
     "apple_tv_plus": 350,
     "peacock": 386,
     "paramount_plus": 531,
-
-    # allow a few synonyms users sometimes use
-    "amazon_prime": 9,
-    "hbo_max": 384,
-    "disney+": 337,
-    "atv+": 350,
+    # Optional extras you may choose to include later:
+    "tubi": 73,
+    "plutotv": 120,
+    "starz": 43,
+    "showtime": 37,
 }
 
-# ----------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------
+# -----------------------------
+# Auth/session
+# -----------------------------
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+_V4_TOKEN = os.getenv("TMDB_ACCESS_TOKEN", "").strip()
+_V3_KEY = os.getenv("TMDB_API_KEY", "").strip()
 
-def _cache_path(kind: str, page: int, region: str, providers_key: str, langs_key: str) -> Path:
-    key = f"{kind}_p{page}_{region}_{providers_key}_{langs_key}"
-    return CACHE_DIR / f"{key}.json"
+def _build_session() -> requests.Session:
+    s = requests.Session()
+    if _V4_TOKEN:
+        s.headers.update({
+            "Authorization": f"Bearer {_V4_TOKEN}",
+            "Accept": "application/json",
+        })
+        s._tmdb_auth_mode = "v4"  # type: ignore[attr-defined]
+    elif _V3_KEY:
+        # v3 uses api_key query param; still send Accept header
+        s.headers.update({"Accept": "application/json"})
+        s._tmdb_auth_mode = "v3"  # type: ignore[attr-defined]
+    else:
+        # No creds; requests will 401 on first call
+        s.headers.update({"Accept": "application/json"})
+        s._tmdb_auth_mode = "none"  # type: ignore[attr-defined]
+    return s
 
-def _is_fresh(path: Path, ttl_hours: int) -> bool:
-    if not path.exists():
-        return False
+_SESSION = _build_session()
+
+
+# -----------------------------
+# Small disk cache
+# -----------------------------
+
+def _cache_path(key: str) -> Path:
+    # sanitize key for filename
+    safe = key.replace("/", "_").replace("?", "_").replace("&", "_").replace("=", "_").replace("|", "_")
+    return CACHE_ROOT / f"{safe}.json"
+
+def _cache_get(key: str) -> Optional[dict]:
+    if not ENABLE_CACHE:
+        return None
+    p = _cache_path(key)
+    if not p.exists():
+        return None
+    if (time.time() - p.stat().st_mtime) > CACHE_TTL_SECS:
+        return None
     try:
-        mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-        return (_utcnow() - mtime) <= timedelta(hours=ttl_hours)
-    except Exception:
-        return False
-
-def _write_cache(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-def _read_cache(path: Path) -> Optional[dict]:
-    try:
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return None
-    return None
 
-def _norm_langs(original_langs: Optional[List[str] | str]) -> str:
-    if not original_langs:
-        return ""
-    if isinstance(original_langs, str):
-        # support comma/pipe/space separated
-        toks = [t.strip() for t in original_langs.replace("|", ",").replace(" ", ",").split(",") if t.strip()]
-    else:
-        toks = [t.strip() for t in original_langs if t and t.strip()]
-    # TMDB expects a single value; many instances accept pipe-separated.
-    # We'll join with "|" (works in practice), but if single, it's fine.
-    return "|".join(dict.fromkeys(toks))  # dedupe, preserve order
+def _cache_set(key: str, obj: dict) -> None:
+    if not ENABLE_CACHE:
+        return
+    p = _cache_path(key)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(obj, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    except Exception:
+        pass
 
-def _provider_ids_from_slugs(slugs: Optional[str | List[str]]) -> List[int]:
-    if not slugs:
+
+# -----------------------------
+# HTTP helpers
+# -----------------------------
+
+def _get_json(cache_key: str, url: str, params: Dict[str, Any]) -> dict:
+    """
+    GET JSON with v4 bearer if available; fallback to v3 `api_key`.
+    Uses a light file cache to reduce rate-limit pressure.
+    Raises for HTTP errors so callers can see 401/429/etc.
+    """
+    # Try cache
+    if _SESSION._tmdb_auth_mode in ("v4", "v3") and params:  # type: ignore[attr-defined]
+        # include params in cache-key for correctness
+        cache_key = f"{cache_key}__{json.dumps(params, sort_keys=True, separators=(',', ':'))}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    req_params = dict(params or {})
+    if getattr(_SESSION, "_tmdb_auth_mode", "") == "v3" and _V3_KEY:
+        req_params["api_key"] = _V3_KEY  # v3 auth via query string
+
+    r = _SESSION.get(url, params=req_params, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    _cache_set(cache_key, data)
+    return data
+
+
+# -----------------------------
+# Public helpers
+# -----------------------------
+
+def providers_from_env(subs_env: Optional[str]) -> List[int]:
+    """
+    Parse SUBS_INCLUDE env value into TMDB provider IDs using PROVIDER_ALIASES.
+    Example: "netflix,prime_video,hulu" -> [8,9,15]
+    Unknown tokens are ignored (with no failure).
+    """
+    if not subs_env:
         return []
-    if isinstance(slugs, str):
-        toks = [t.strip() for t in slugs.split(",") if t.strip()]
-    else:
-        toks = [t.strip() for t in slugs if t and t.strip()]
     ids: List[int] = []
+    for raw in subs_env.split(","):
+        k = raw.strip().lower()
+        if not k:
+            continue
+        if k in PROVIDER_ALIASES:
+            ids.append(PROVIDER_ALIASES[k])
+    # de-dup preserve order
     seen = set()
-    for s in toks:
-        pid = PROVIDER_MAP.get(s.lower())
-        if pid and pid not in seen:
+    out: List[int] = []
+    for pid in ids:
+        if pid not in seen:
             seen.add(pid)
-            ids.append(pid)
-    return ids
+            out.append(pid)
+    return out
 
-# ----------------------------------------------------------------------
-# Authentication strategy
-# ----------------------------------------------------------------------
 
-@dataclass(frozen=True)
-class _AuthVariant:
-    name: str                 # "v4" or "v3"
-    headers: Dict[str, str]
-    query: Dict[str, str]
+# -----------------------------
+# Discover endpoints
+# -----------------------------
 
-def _auth_variants() -> List[_AuthVariant]:
+def _discover(
+    kind: str,
+    page: int,
+    *,
+    region: str,
+    provider_ids: List[int],
+    original_langs: Optional[str] = None,
+) -> dict:
     """
-    Build possible auth variants from environment.
-    Preference: v4 bearer (TMDB_ACCESS_TOKEN), then v3 (TMDB_API_KEY).
+    Generic discover wrapper.
+    kind: "movie" or "tv"
     """
-    v: List[_AuthVariant] = []
-    v4 = os.getenv("TMDB_ACCESS_TOKEN") or os.getenv("TMDB_BEARER") or ""
-    if v4.strip():
-        v.append(_AuthVariant("v4", headers={"Authorization": f"Bearer {v4.strip()}", "Accept": "application/json"}, query={}))
-    v3 = os.getenv("TMDB_API_KEY") or ""
-    if v3.strip():
-        v.append(_AuthVariant("v3", headers={"Accept": "application/json"}, query={"api_key": v3.strip()}))
-    return v
-
-class _AuthError(RuntimeError):
-    pass
-
-def _request_json_with_fallback(url: str, params: Dict[str, Any], timeout: Tuple[float, float]=(5, 25)) -> dict:
-    """
-    Try each available auth method until one succeeds.
-    If a 401 happens, we try the next variant. Other errors bubble up.
-    """
-    variants = _auth_variants()
-    if not variants:
-        raise _AuthError("TMDB auth missing: set TMDB_ACCESS_TOKEN (v4) or TMDB_API_KEY (v3).")
-
-    last_exc: Optional[Exception] = None
-    for idx, variant in enumerate(variants):
-        q = dict(params or {})
-        q.update(variant.query)
-        try:
-            r = requests.get(url, params=q, headers=variant.headers, timeout=timeout)
-            if r.status_code == 401:
-                # Try next variant
-                print(f"tmdb: 401 with auth={variant.name}; trying next if available…")
-                last_exc = requests.HTTPError("401 Unauthorized")
-                continue
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            # Non-401 — for the first variant, try the next; otherwise bubble up the last
-            last_exc = e
-            if idx < len(variants) - 1:
-                print(f"tmdb: error with auth={variant.name}: {type(e).__name__}; trying next…")
-                continue
-            break
-    # If we got here, nothing worked
-    # Provide a concise diagnostic without leaking keys
-    raise _AuthError(f"TMDB request failed for {url.split('?')[0]} with all auth variants. "
-                     f"Check TMDB_ACCESS_TOKEN / TMDB_API_KEY are valid and not rate-limited.") from last_exc
-
-# ----------------------------------------------------------------------
-# Discover
-# ----------------------------------------------------------------------
-
-def _discover(kind: str, page: int, *, region: str, provider_ids: List[int], original_langs: Optional[str | List[str]],
-              ttl_hours: int = 6) -> dict:
-    """
-    Raw discover call with caching. kind: "movie" or "tv".
-    """
-    if kind not in ("movie", "tv"):
-        raise ValueError("kind must be 'movie' or 'tv'")
-
-    langs_key = _norm_langs(original_langs)
-    providers_key = "_".join(str(x) for x in provider_ids) if provider_ids else "all"
-
-    # Cache
-    cache_file = _cache_path(kind, page, region.upper(), providers_key, langs_key or "any")
-    if _is_fresh(cache_file, ttl_hours):
-        cached = _read_cache(cache_file)
-        if cached:
-            return cached
+    assert kind in ("movie", "tv"), f"discover kind must be 'movie' or 'tv', got {kind!r}"
+    url = f"{TMDB_BASE}/discover/{kind}"
 
     params: Dict[str, Any] = {
         "include_adult": "false",
-        "language": LANG_DEFAULT,
-        "page": page,
         "sort_by": "popularity.desc",
-        "watch_region": region.upper(),
-        "with_watch_monetization_types": "flatrate|free|ads",
+        "language": "en-US",
+        "page": page,
     }
+
     if provider_ids:
-        params["with_watch_providers"] = "|".join(str(pid) for pid in provider_ids)
-    if langs_key:
-        params["with_original_language"] = langs_key
+        params["with_watch_providers"] = "|".join(str(x) for x in provider_ids)
+        params["watch_region"] = region
+        params["with_watch_monetization_types"] = "flatrate|free|ads"
 
-    url = f"{TMDB_V3}/discover/{kind}"
-    data = _request_json_with_fallback(url, params)
+    if original_langs:
+        # allow "en,ja,ko" etc.
+        params["with_original_language"] = original_langs
 
-    _write_cache(cache_file, data)
-    return data
+    return _get_json(f"discover_{kind}", url, params)
 
-def _item_from_result(kind: str, r: dict) -> Dict[str, Any]:
-    title = r.get("title") or r.get("name") or ""
-    release_date = r.get("release_date") or r.get("first_air_date") or ""
-    year = None
-    if release_date:
-        try:
-            year = int(release_date[:4])
-        except Exception:
-            year = None
-    return {
-        "tmdb_id": r.get("id"),
-        "tmdb_media_type": kind,
-        "type": "movie" if kind == "movie" else "show",
-        "title": title,
-        "year": year,
-        "overview": r.get("overview") or "",
-        "poster_path": r.get("poster_path"),
-        "backdrop_path": r.get("backdrop_path"),
-        # Keep TMDB rating separate; imdb rating can be merged elsewhere
-        "tmdb_vote_average": round(float(r.get("vote_average") or 0.0), 1) if r.get("vote_average") is not None else None,
-        # placeholders (filled later by tmdb_detail.enrich_items_with_tmdb)
-        "genres": [],
-        "providers": [],
-    }
 
-def discover_movie_page(page: int, *, region: str, provider_ids: Optional[List[int]] = None,
-                        original_langs: Optional[str | List[str]] = None) -> Tuple[List[Dict[str, Any]], dict]:
-    data = _discover(
-        "movie",
-        page,
-        region=region,
-        provider_ids=provider_ids or _provider_ids_from_slugs(os.getenv("SUBS_INCLUDE", "")),
-        original_langs=original_langs or os.getenv("ORIGINAL_LANGS", "en"),
-    )
-    results = data.get("results") or []
-    items = [_item_from_result("movie", r) for r in results]
-    return items, data
+def discover_movie_page(
+    page: int,
+    *,
+    region: str,
+    provider_ids: List[int],
+    original_langs: Optional[str] = None,
+) -> Tuple[List[dict], dict]:
+    """
+    Returns (items, raw_page) for movies.
+    """
+    data = _discover("movie", page, region=region, provider_ids=provider_ids, original_langs=original_langs)
+    results = data.get("results", []) or []
+    return results, data
 
-def discover_tv_page(page: int, *, region: str, provider_ids: Optional[List[int]] = None,
-                     original_langs: Optional[str | List[str]] = None) -> Tuple[List[Dict[str, Any]], dict]:
-    data = _discover(
-        "tv",
-        page,
-        region=region,
-        provider_ids=provider_ids or _provider_ids_from_slugs(os.getenv("SUBS_INCLUDE", "")),
-        original_langs=original_langs or os.getenv("ORIGINAL_LANGS", "en"),
-    )
-    results = data.get("results") or []
-    items = [_item_from_result("tv", r) for r in results]
-    return items, data
+
+def discover_tv_page(
+    page: int,
+    *,
+    region: str,
+    provider_ids: List[int],
+    original_langs: Optional[str] = None,
+) -> Tuple[List[dict], dict]:
+    """
+    Returns (items, raw_page) for TV.
+    """
+    data = _discover("tv", page, region=region, provider_ids=provider_ids, original_langs=original_langs)
+    results = data.get("results", []) or []
+    return results, data
+
+
+# -----------------------------
+# Simple auth-mode probe (optional)
+# -----------------------------
+
+def tmdb_auth_mode() -> str:
+    """
+    Return which auth mode the session is using: "v4", "v3", or "none".
+    Helpful for logging in runner.
+    """
+    return getattr(_SESSION, "_tmdb_auth_mode", "none")
