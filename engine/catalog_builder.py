@@ -51,4 +51,16 @@ def _discover_pool(env: Env) -> Dict[str, Any]:
         "items": items,
         "errors": errors,
         "region": region,
-       
+        "langs": langs,
+        "subs": subs,
+        "pages": pages,
+        "provider_ids": provider_ids,
+    }
+
+
+def build_catalog(env: Env) -> List[Dict[str, Any]]:
+    """
+    Public API used by runner.main(). Returns a flat list of items.
+    """
+    raw = _discover_pool(env)
+    return list(raw["items"])
