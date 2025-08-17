@@ -18,7 +18,7 @@ jobs:
       ORIGINAL_LANGS: en
       SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
       MIN_MATCH_CUT: 58.0
-
+      DISCOVER_PAGES: 3
     steps:
       - uses: actions/checkout@v4
 
@@ -32,49 +32,25 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Fetch IMDb TSVs (basics + ratings)
+        run: |
+          set -e
+          mkdir -p data/cache/imdb
+          cd data/cache/imdb
+          echo "Downloading IMDb TSVs…"
+          curl -fsSLO https://datasets.imdbws.com/title.basics.tsv.gz
+          curl -fsSLO https://datasets.imdbws.com/title.ratings.tsv.gz
+          echo "Unzipping…"
+          gunzip -f title.basics.tsv.gz
+          gunzip -f title.ratings.tsv.gz
+          ls -lh
+
       - name: Run engine
         run: |
           set -e
           python -m engine.runner
 
-      # Build a compact debug bundle (zip) so you can share one file
-      - name: Create debug bundle
-        if: always()
-        run: |
-          set -e
-          mkdir -p data/out/latest
-          BUNDLE="data/out/latest/debug-data.zip"
-
-          # Core outputs
-          zip -j -9 "$BUNDLE" \
-            data/out/latest/assistant_feed.json \
-            data/out/latest/assistant_ranked.json \
-            data/out/latest/summary.md \
-            data/out/latest/run_meta.json \
-            data/out/latest/debug_status.json 2>/dev/null || true
-
-          # Personalization & pool state
-          zip -9 "$BUNDLE" data/cache/state/persistent_pool.json 2>/dev/null || true
-          zip -9 "$BUNDLE" data/cache/state/personal_state.json 2>/dev/null || true
-          zip -9 "$BUNDLE" data/cache/state/personal_history.json 2>/dev/null || true
-
-          # User inputs if present
-          zip -9 "$BUNDLE" data/user/ratings.csv 2>/dev/null || true
-
-          # Request caches (useful to verify sources)
-          zip -r -9 "$BUNDLE" data/cache/tmdb 2>/dev/null || true
-          zip -r -9 "$BUNDLE" data/cache/imdb 2>/dev/null || true
-
-      - name: Upload debug bundle (single file)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-data
-          path: data/out/latest/debug-data.zip
-          if-no-files-found: warn
-          compression-level: 6
-
-      # Upload both outputs and key caches/state so we can diagnose runs
+      # Upload outputs + debug/state so we can analyze each run
       - name: Upload artifacts (outputs + debug/state)
         if: always()
         uses: actions/upload-artifact@v4
@@ -85,7 +61,7 @@ jobs:
           path: |
             # Primary outputs
             data/out/latest
-            # Personalization state (genre weights, profile snapshots, etc.)
+            # Personalization state (if your imdb_sync writes these)
             data/cache/state/personal_state.json
             data/cache/state/personal_history.json
             # Persistent item enrichment pool
@@ -125,17 +101,14 @@ jobs:
             BODY="$(cat data/out/latest/summary.md)"
           fi
 
-          # find open issue by title
           ISSUE_NUMBER=$(gh api -X GET repos/${{ github.repository }}/issues --paginate -q \
             '.[] | select(.state=="open" and .title=="'"$TITLE"'") | .number' | head -n1)
 
-          # create if missing
           if [ -z "$ISSUE_NUMBER" ]; then
             ISSUE_NUMBER=$(gh api -X POST repos/${{ github.repository }}/issues \
               -f title="$TITLE" -f body="Tracking thread for daily recommendation digests." -q '.number')
           fi
 
-          # post comment
           gh api -X POST repos/${{ github.repository }}/issues/$ISSUE_NUMBER/comments \
             -f body="$BODY" >/dev/null
 
