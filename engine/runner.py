@@ -2,113 +2,141 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
 from .catalog_builder import build_catalog
-from .personalize import genre_weights_from_profile, apply_personal_score
-from .imdb_sync import load_ratings_csv, fetch_user_ratings_web, merge_user_sources, to_user_profile
 from .summarize import write_summary_md
+from .personalize import genre_weights_from_profile, apply_personal_score
+
+# Optional imdb helpers
+try:
+    from .imdb_sync import (
+        load_ratings_csv,
+        fetch_user_ratings_web,
+        merge_user_sources,
+        to_user_profile,
+    )
+    _IMDB_SYNC_OK = True
+except Exception:
+    _IMDB_SYNC_OK = False
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT_DIR = ROOT / "data" / "out" / "latest"
-STATE_DIR = ROOT / "data" / "cache" / "state"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-def _read_json(path: Path, default: Any = None) -> Any:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
 
-def _write_json(path: Path, obj: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
-
-def _load_user_profile(env: Dict[str,str]) -> Dict[str,Dict]:
+def _load_user_profile(env: Dict[str, str]) -> Dict[str, Dict]:
+    if not _IMDB_SYNC_OK:
+        return {}
     local = load_ratings_csv()
     remote = []
     uid = (env.get("IMDB_USER_ID") or "").strip()
     if uid:
-        try:
-            remote = fetch_user_ratings_web(uid)
-        except Exception:
-            remote = []
+        remote = fetch_user_ratings_web(uid)
     merged = merge_user_sources(local, remote)
     profile = to_user_profile(merged)
     return profile
 
-def _ensure_why(items: List[Dict[str,Any]]) -> None:
+
+def _rank_items(items: List[Dict[str, Any]], env: Dict[str, str]) -> List[Dict[str, Any]]:
+    profile = _load_user_profile(env)
+    # Compute genre weights from your ratings on the current item universe
+    weights = genre_weights_from_profile(items, profile, imdb_id_field="imdb_id")
+    # Save weights for summary/debug
+    (OUT_DIR / "genre_weights.json").write_text(
+        json.dumps(weights, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    # Apply score (base: imdb_rating; fallback midpoint 60)
+    apply_personal_score(items, genre_weights=weights, base_key="imdb_rating")
+
+    # produce match_score (float) and reason string
+    ranked: List[Dict[str, Any]] = []
     for it in items:
-        bits = []
-        if it.get("imdb_rating") is not None:
-            try: bits.append(f"IMDb {float(it['imdb_rating']):.1f}")
-            except: pass
-        if it.get("tmdb_vote") is not None:
-            try: bits.append(f"TMDB {float(it['tmdb_vote']):.1f}")
-            except: pass
-        if it.get("year"):
-            bits.append(str(it["year"]))
-        if bits:
-            it["why"] = "; ".join(bits)
+        base = it.get("imdb_rating")
+        tmdb_vote = it.get("tmdb_vote")
+        year = it.get("year")
+        why_parts = []
+        if base is not None:
+            try:
+                why_parts.append(f"IMDb {float(base):.1f}")
+            except Exception:
+                pass
+        if tmdb_vote is not None:
+            try:
+                why_parts.append(f"TMDB {float(tmdb_vote):.1f}")
+            except Exception:
+                pass
+        if year:
+            why_parts.append(str(year))
+        why = "; ".join(why_parts) if why_parts else ""
+
+        score = it.get("score")
+        if score is None:
+            # convert imdb rating to 0–100
+            base10 = float(base) if base is not None else math.nan
+            score = (base10 * 10.0) if not math.isnan(base10) else 60.0
+
+        ranked.append(
+            {
+                **it,
+                "match_score": round(float(score), 2),
+                "why": why,
+            }
+        )
+
+    ranked.sort(key=lambda x: x.get("match_score") or 0.0, reverse=True)
+    return ranked
+
 
 def main() -> None:
-    # 1) Env
-    env = {k: v for k, v in os.environ.items()}
+    env = dict(os.environ)
+    t0 = time.time()
 
-    # 2) Build/enrich catalog (discover every run + TMDB enrich + provider filter + telemetry files)
     print(" | catalog:begin")
     items = build_catalog(env)
     print(f" | catalog:end kept={len(items)}")
 
-    # 3) Load user profile
-    user_profile = _load_user_profile(env)
-
-    # 4) Genre weights using imdb_id field (since discovered items carry imdb_id, not tconst)
-    genre_weights = genre_weights_from_profile(items, user_profile, imdb_id_field="imdb_id")
-
-    # 5) Personal score (uses best of IMDb/TMDB rating as base)
-    apply_personal_score(items, genre_weights)
-
-    # 6) Minimal validation stats
-    ids_present = sum(1 for x in items if x.get("imdb_id") or x.get("tconst"))
-    genres_present = sum(1 for x in items if x.get("genres"))
+    # Validate minimal fields
+    ids_present = sum(1 for it in items if it.get("imdb_id") or it.get("tconst"))
+    genres_present = sum(1 for it in items if it.get("genres"))
     print(f"validation: items={len(items)} ids_present={ids_present} genres_present={genres_present}")
 
-    # 7) Apply optional score cut (for ranked output only; summary does its own soft cut display)
-    min_cut = float(env.get("MIN_MATCH_CUT") or 0)
-    ranked = sorted(items, key=lambda x: float(x.get("match_score") or x.get("score") or 0), reverse=True)
-    kept_cut = [x for x in ranked if float(x.get("match_score") or x.get("score") or 0) >= min_cut]
-    print(f"score-cut {min_cut}: kept {len(kept_cut)} / {len(items)}")
+    ranked = _rank_items(items, env)
 
-    # 8) Ensure 'why' populated for display lines
-    _ensure_why(kept_cut)
+    # cut by MIN_MATCH_CUT if provided
+    cut = float(env.get("MIN_MATCH_CUT") or 0)
+    kept = [it for it in ranked if (it.get("match_score") or 0) >= cut]
+    print(f"score-cut {cut}: kept {len(kept)} / {len(ranked)}")
 
-    # 9) Write ranked outputs
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    _write_json(OUT_DIR / "assistant_ranked.json", {"items": kept_cut})
+    # write outputs
+    (OUT_DIR / "assistant_ranked.json").write_text(
+        json.dumps({"items": kept}, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
-    # 10) Telemetry (from catalog builder)
-    meta = _read_json(OUT_DIR / "run_meta.json", default={}) or {}
-    # also include the match cut used for the display
-    meta["min_match_cut"] = env.get("MIN_MATCH_CUT")
-    # store genre weights snapshot for debugging
-    _write_json(OUT_DIR / "genre_weights.json", genre_weights)
+    # summary.md
+    write_summary_md(env, genre_weights_path=OUT_DIR / "genre_weights.json")
 
-    # 11) Summary markdown (includes telemetry + genre weights + picks)
-    write_summary_md(env, kept_cut, genre_weights, meta)
-
-    # 12) Extra quick status
-    status = {
-        "total_items_scored": len(items),
-        "kept_after_cut": len(kept_cut),
+    # debug status
+    elapsed = round(time.time() - t0, 2)
+    dbg = {
+        "elapsed_sec": elapsed,
+        "ranked_total": len(ranked),
+        "kept_after_cut": len(kept),
         "min_match_cut": env.get("MIN_MATCH_CUT"),
     }
-    _write_json(OUT_DIR / "debug_status.json", status)
+    (OUT_DIR / "debug_status.json").write_text(
+        json.dumps(dbg, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
-    print(f"wrote → {OUT_DIR / 'assistant_ranked.json'}")
-    print(f"wrote → {OUT_DIR / 'summary.md'}")
-    print(f"wrote → {OUT_DIR / 'debug_status.json'}")
+    print(f"wrote → {OUT_DIR/'assistant_ranked.json'}")
+    print(f"wrote → {OUT_DIR/'summary.md'}")
+    print(f"wrote → {OUT_DIR/'debug_status.json'}")
+
 
 if __name__ == "__main__":
     main()
