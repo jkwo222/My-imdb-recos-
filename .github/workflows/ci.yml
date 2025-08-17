@@ -39,7 +39,14 @@ jobs:
           python -m pip install -U pip
           pip install -r requirements.txt
 
-      # Optional: boolean presence check (safe; values remain masked)
+      # Always runs on push/PR; fast import-only validation
+      - name: Quick self-check
+        run: |
+          python - <<'PY'
+          from engine.self_check import run_self_check
+          run_self_check()
+          PY
+
       - name: Env sanity (booleans only)
         run: |
           python - <<'PY'
@@ -49,23 +56,27 @@ jobs:
           print("HAS_IMDB_USER_ID:", bool(os.getenv("IMDB_USER_ID")))
           PY
 
-      - name: Run engine
+      # Run the heavy engine only on pushes (not PRs) AND only if we have TMDB secrets
+      - name: Run engine (push only; skip on PRs or missing secrets)
+        if: ${{ github.event_name == 'push' && (secrets.TMDB_API_KEY != '' || secrets.TMDB_ACCESS_TOKEN != '') }}
         run: |
           mkdir -p data/out data/cache
           python -m engine.runner
 
-      - name: Make debug bundle
-        run: ./.github/scripts/make_debug_bundle.sh
+      - name: Make debug bundle (push only)
+        if: ${{ github.event_name == 'push' && (secrets.TMDB_API_KEY != '' || secrets.TMDB_ACCESS_TOKEN != '') }}
+        run: bash ./.github/scripts/make_debug_bundle.sh
 
-      - name: Upload debug bundle
+      - name: Upload debug bundle (push only)
+        if: ${{ github.event_name == 'push' && (secrets.TMDB_API_KEY != '' || secrets.TMDB_ACCESS_TOKEN != '') }}
         uses: actions/upload-artifact@v4
         with:
           name: debug-data
           path: debug-data.zip
           if-no-files-found: warn
 
-      - name: Upload latest outputs (optional)
-        if: always()
+      - name: Upload latest outputs (push only)
+        if: ${{ github.event_name == 'push' && (secrets.TMDB_API_KEY != '' || secrets.TMDB_ACCESS_TOKEN != '') }}
         uses: actions/upload-artifact@v4
         with:
           name: latest-run
