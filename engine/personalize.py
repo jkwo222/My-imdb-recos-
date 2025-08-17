@@ -9,43 +9,19 @@ def _to_list(x) -> List[str]:
     if isinstance(x, (list, tuple)): return [str(i) for i in x if i]
     return [str(x)]
 
-def _extra_tags_from_item(it: Dict[str,Any]) -> List[str]:
-    """
-    Derive more specific tags from available fields. You can add:
-      - runtime buckets, year buckets, country, network, etc.
-    """
-    tags: List[str] = []
-    # type tag
-    t = it.get("type")
-    if t: tags.append(f"type:{t}")
-    # year bucket
-    y = it.get("year")
-    if isinstance(y, int):
-        decade = (y//10)*10
-        tags.append(f"decade:{decade}s")
-        if y >= 2020: tags.append("era:2020s+")
-        elif y >= 2010: tags.append("era:2010s")
-        elif y >= 2000: tags.append("era:2000s")
-        elif y >= 1990: tags.append("era:1990s")
-        else: tags.append("era:classic")
-    # providers (normalize to slugs)
-    for p in _to_list(it.get("providers")):
-        slug = p.lower().replace(" ", "_")
-        tags.append(f"provider:{slug}")
-    return tags
-
 def genre_weights_from_profile(
     items: List[Dict[str,Any]],
     user_profile: Dict[str,Dict],
     imdb_id_field: str="tconst",
 ) -> Dict[str, float]:
     """
-    Weight genres/tags by (my_rating - 6.0).
-    If rating is missing but item is present in user's public list, treat as weak +0.5 delta (i.e., 6.5).
+    Weight genres by (my_rating - 6.0) across rated titles found in items (where we know the mapping).
+    6.0 ~ neutral; >6 favors, <6 disfavors.
     """
     acc = defaultdict(float)
     cnt = defaultdict(int)
 
+    # index items by imdb id for genre lookup
     by_imdb = {}
     for it in items:
         tid = it.get(imdb_id_field) or it.get("imdb_id") or it.get("tconst")
@@ -58,56 +34,79 @@ def genre_weights_from_profile(
         if not it:
             continue
         genres = _to_list(it.get("genres")) or []
-        tags = genres + _extra_tags_from_item(it)
-
         r = row.get("my_rating")
         if r is None:
-            if row.get("from_public_list") or row.get("from_remote_user"):
-                r = 6.5
-            else:
-                continue
-
+            continue
         delta = float(r) - 6.0
-        for g in tags:
+        for g in genres:
             acc[g] += delta
             cnt[g] += 1
 
     if not acc:
         return {}
-
     mx = max(abs(v) for v in acc.values()) or 1.0
-    out = {g: (0.5 + 0.5*(v/mx)) for g,v in acc.items()}  # [-mx,+mx] -> [0,1]
+    out = {g: (0.5 + 0.5*(v/mx)) for g,v in acc.items()}  # map [-mx,+mx] -> [0,1]
     return {g: round(w, 4) for g,w in out.items()}
+
+def _best_rating_10(it: Dict[str,Any]) -> float | None:
+    """
+    Return best available audience-like rating on 0..10:
+      - IMDb (imdb_rating) if present and numeric
+      - else TMDB vote_average (tmdb_vote)
+    """
+    def _coerce(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
+    imdb = _coerce(it.get("imdb_rating"))
+    tmdb = _coerce(it.get("tmdb_vote"))
+    if imdb is not None and tmdb is not None:
+        return max(imdb, tmdb)
+    return imdb if imdb is not None else tmdb
 
 def apply_personal_score(
     items: List[Dict[str,Any]],
     genre_weights: Dict[str,float],
-    base_key: str="imdb_rating",
-    downvote_index: Dict[str,Any] | None = None,
 ) -> None:
     """
-    Mutates items: adds 'score' (0–100). Combines IMDb base with personalization & downvote penalty.
+    Mutates items: adds:
+      - 'score' (0–100)
+      - 'match_score' (rounded score, for display)
+      - 'why' string ("IMDb 8.7; TMDB 8.5; 2014") if data exists
+      - 'audience' (best audience rating, 0..10)
     """
     for it in items:
-        base = it.get(base_key)
-        try:
-            base10 = float(base) if base is not None else math.nan
-        except Exception:
-            base10 = math.nan
-        base100 = (base10 * 10.0) if not math.isnan(base10) else 60.0  # default mid
+        base10 = _best_rating_10(it)
+        base100 = (base10 * 10.0) if base10 is not None else 60.0  # fallback mid if unrated
 
-        # compute fit across genres + derived tags
-        tags = _to_list(it.get("genres")) + _extra_tags_from_item(it)
-        if genre_weights and tags:
-            fit = sum(genre_weights.get(x, 0.5) for x in tags) / len(tags)
+        g = _to_list(it.get("genres"))
+        if genre_weights and g:
+            fit = sum(genre_weights.get(x, 0.5) for x in g) / len(g)
+            # center around 0.5 => [-0.5..+0.5], scale to ±15 points
             adj = (fit - 0.5) * 30.0
         else:
             adj = 0.0
 
-        penalty = 0.0
-        if downvote_index:
-            tconst = str(it.get("tconst") or "")
-            if tconst in downvote_index:
-                penalty = -40.0  # hide it aggressively
+        raw = max(0.0, min(100.0, base100 + adj))
+        it["score"] = raw
+        it["match_score"] = round(raw, 2)
 
-        it["score"] = max(0.0, min(100.0, base100 + adj + penalty))
+        # audience field (best available)
+        it["audience"] = base10 if base10 is not None else None
+
+        # build "why"
+        bits = []
+        if it.get("imdb_rating") is not None:
+            try:
+                bits.append(f"IMDb {float(it['imdb_rating']):.1f}")
+            except Exception:
+                pass
+        if it.get("tmdb_vote") is not None:
+            try:
+                bits.append(f"TMDB {float(it['tmdb_vote']):.1f}")
+            except Exception:
+                pass
+        if it.get("year"):
+            bits.append(str(it["year"]))
+        it["why"] = "; ".join(bits) if bits else ""
