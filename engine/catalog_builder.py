@@ -6,8 +6,13 @@ from typing import Any, Dict, List
 import csv
 
 from .cache import load_state, save_state
-from .imdb_sync import load_ratings_csv, fetch_user_ratings_web, merge_user_sources, to_user_profile
-from .tmdb_detail import enrich_items_with_tmdb  # NEW
+from .imdb_sync import (
+    load_ratings_csv,
+    fetch_user_ratings_web,
+    merge_user_sources,
+    to_user_profile,
+)
+from .tmdb_detail import enrich_items_with_tmdb  # uses TMDB v3 via engine/tmdb.py
 
 ROOT = Path(__file__).resolve().parents[1]
 CACHE_DIR = ROOT / "data" / "cache"
@@ -31,7 +36,10 @@ def _load_tsv(path: Path) -> List[Dict[str, str]]:
             rows.append(r)
     return rows
 
-def _merge_basics_ratings(basics: List[Dict[str, str]], ratings: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+def _merge_basics_ratings(
+    basics: List[Dict[str, str]],
+    ratings: List[Dict[str, str]],
+) -> List[Dict[str, Any]]:
     by_id = {r["tconst"]: r for r in basics if r.get("tconst")}
     for r in ratings:
         t = r.get("tconst")
@@ -49,15 +57,23 @@ def _merge_basics_ratings(basics: List[Dict[str, str]], ratings: List[Dict[str, 
             year = int(start_year) if start_year and str(start_year).isdigit() else None
         except Exception:
             year = None
-        genres = [g for g in (row.get("genres", "").split(",") if row.get("genres") else []) if g and g != r"\N"]
-        items.append({
-            "tconst": tconst,
-            "title": row.get("primaryTitle") or row.get("originalTitle"),
-            "type": "tvSeries" if (title_type or "").startswith("tv") and title_type != "tvMovie" else "movie",
-            "year": year,
-            "genres": genres,
-            "imdb_rating": row.get("imdb_rating"),
-        })
+        genres = [
+            g
+            for g in (row.get("genres", "").split(",") if row.get("genres") else [])
+            if g and g != r"\N"
+        ]
+        items.append(
+            {
+                "tconst": tconst,
+                "title": row.get("primaryTitle") or row.get("originalTitle"),
+                "type": "tvSeries"
+                if (title_type or "").startswith("tv") and title_type != "tvMovie"
+                else "movie",
+                "year": year,
+                "genres": genres,
+                "imdb_rating": row.get("imdb_rating"),
+            }
+        )
     return items
 
 # --- User evidence ------------------------------------------------------------
@@ -79,9 +95,8 @@ def build_catalog(env: Dict[str, str]) -> List[Dict[str, Any]]:
     Builds filtered, enriched items and writes:
       - data/out/latest/assistant_feed.json (raw filtered)
       - data/out/latest/run_meta.json (metadata for summary)
-      - data/cache/state/personal_state.json (genre weights, etc., via imdb_sync.* helpers)
-    This function is resilient: if IMDb TSVs are missing it starts from an empty list and
-    still enriches known persistent items and writes outputs.
+      - persists enrichment forward in data/cache/state/persistent_pool.json
+    Resilient: if IMDb TSVs are missing, we still carry-forward the persistent pool.
     """
     # Load IMDb TSVs if present
     basics = _load_tsv(IMDB_BASICS)
@@ -90,30 +105,30 @@ def build_catalog(env: Dict[str, str]) -> List[Dict[str, Any]]:
     if used_imdb:
         items = _merge_basics_ratings(basics, ratings)
     else:
-        items = []  # We’ll still try to carry-forward from persistent pool
+        items = []  # fallback to persistent pool
 
-    # stitch in any prior run’s enrichment (tmdb mapping, providers, notes, etc.)
+    # stitch in any prior run’s enrichment
     persistent = load_state("persistent_pool", default={"items": {}})
     known_items: Dict[str, Any] = persistent.get("items", {})
 
-    # Bring forward known items if IMDb TSVs are missing, so we still have a pool
+    # If no IMDb TSVs, seed items from persistent pool so we still have candidates
     if not items and known_items:
-        items = []
         for k, v in known_items.items():
-            row = {
-                "tconst": k,
-                "title": v.get("title"),
-                "type": v.get("type") or "movie",
-                "year": v.get("year"),
-                "genres": v.get("genres") or [],
-                "imdb_rating": v.get("imdb_rating"),
-                "tmdb_id": v.get("tmdb_id"),
-                "tmdb_media_type": v.get("tmdb_media_type"),
-                "providers": v.get("providers") or [],
-            }
-            items.append(row)
+            items.append(
+                {
+                    "tconst": k,
+                    "title": v.get("title"),
+                    "type": v.get("type") or "movie",
+                    "year": v.get("year"),
+                    "genres": v.get("genres") or [],
+                    "imdb_rating": v.get("imdb_rating"),
+                    "tmdb_id": v.get("tmdb_id"),
+                    "tmdb_media_type": v.get("tmdb_media_type"),
+                    "providers": v.get("providers") or [],
+                }
+            )
 
-    # Merge forward enrichment for any IMDb-derived items, too
+    # Merge forward enrichment for any IMDb-derived rows too
     for it in items:
         k = it.get("tconst")
         if k and k in known_items:
@@ -122,13 +137,18 @@ def build_catalog(env: Dict[str, str]) -> List[Dict[str, Any]]:
                 if ck not in it or it[ck] in (None, "", [], {}):
                     it[ck] = cv
 
-    # Enrich with TMDB (genres + providers) before filter so fallback runs are richer
+    # Enrich with TMDB (genres/providers/ids) before filtering
     region = (env.get("REGION") or "US").upper()
     api_key = env.get("TMDB_API_KEY") or ""
     if api_key:
         enrich_items_with_tmdb(items, api_key=api_key, region=region)
 
-    # Providers filter using human-readable names (as enriched)
+    # --- IMPORTANT: normalize IDs so downstream uses a single key (`tconst`) ----
+    for it in items:
+        if not it.get("tconst") and it.get("imdb_id"):
+            it["tconst"] = it["imdb_id"]
+
+    # Providers filter using human-readable provider names
     subs = [s.strip().lower() for s in (env.get("SUBS_INCLUDE") or "").split(",") if s.strip()]
     filtered: List[Dict[str, Any]] = []
     for it in items:
@@ -146,9 +166,9 @@ def build_catalog(env: Dict[str, str]) -> List[Dict[str, Any]]:
         json.dumps(filtered, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    # Persist back anything new we learned (so the pool grows over time)
+    # Persist enrichment so the pool grows/improves over time
     for it in filtered:
-        tconst = str(it.get("tconst"))
+        tconst = str(it.get("tconst") or it.get("imdb_id") or "")
         if not tconst:
             continue
         known_items[tconst] = {
@@ -163,17 +183,14 @@ def build_catalog(env: Dict[str, str]) -> List[Dict[str, Any]]:
         }
     save_state("persistent_pool", {"items": known_items})
 
-    # Save meta for the summary
+    # Simple meta for summary step
     meta = {
         "using_imdb": used_imdb,
         "candidates_after_filtering": len(filtered),
         "note": "Using IMDb TSVs" if used_imdb else "Using TMDB fallback",
     }
-    (OUT_DIR / "run_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    # Also refresh personalized state from the latest ratings (handled by imdb_sync helpers)
-    # The helpers should already write to data/cache/state/personal_state.json as part of their logic.
-    # If not, you can ensure it here by recomputing genre weights and writing them. Left as-is
-    # to avoid duplicating logic if you've wired that elsewhere.
+    (OUT_DIR / "run_meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
     return filtered
