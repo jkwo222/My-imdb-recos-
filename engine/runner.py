@@ -1,7 +1,9 @@
-# engine/runner.py
 from __future__ import annotations
-import json, os, sys, time, shutil
-from datetime import datetime
+import json
+import os
+import sys
+import time
+from pathlib import Path
 from typing import Any, Dict, List
 
 from .env import Env
@@ -9,109 +11,142 @@ from .catalog_builder import build_catalog
 from .scoring import load_seen_index, filter_unseen, score_items
 from .self_check import run_self_check
 
-RUN_ROOT = "data/out"
+ROOT = Path(__file__).resolve().parents[1]
+OUT_DIR = ROOT / "data" / "out"
 
-def _now_slug() -> str:
-    # 2025-08-17T12-24-09Z -> filesystem-friendly
-    return datetime.utcnow().strftime("run_%Y%m%dT%H%M%SZ")
+def _install_safe_unraisable_hook() -> None:
+    """
+    Some libs raise unraisable exceptions during interpreter teardown
+    (e.g., when sys.stderr has already been detached). Make the hook
+    resilient so it never propagates or crashes.
+    """
+    def _safe_hook(unraisable):
+        try:
+            # Best-effort log; swallow any error if stderr is gone.
+            msg = f"[shutdown] Unraisable: {getattr(unraisable, 'exc_type', type(None)).__name__}: {getattr(unraisable, 'exc_value', '')}"
+            try:
+                print(msg, file=sys.stderr, flush=True)
+            except Exception:
+                pass
+        except Exception:
+            # Never let this raise.
+            pass
+    try:
+        sys.unraisablehook = _safe_hook  # type: ignore[attr-defined]
+    except Exception:
+        # Python <3.8 or restricted env; ignore.
+        pass
 
-def _mkdir(p: str) -> None:
-    os.makedirs(p, exist_ok=True)
+def _env_from_os() -> Env:
+    # Allow ORIGINAL_LANGS as JSON-ish (["en","es"]) or CSV ("en,es").
+    langs_raw = os.getenv("ORIGINAL_LANGS", "").strip()
+    langs: List[str]
+    if langs_raw.startswith("[") and langs_raw.endswith("]"):
+        try:
+            parsed = json.loads(langs_raw)
+            langs = [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            langs = ["en"]
+    elif "," in langs_raw:
+        langs = [t.strip() for t in langs_raw.split(",") if t.strip()]
+    else:
+        langs = [langs_raw] if langs_raw else ["en"]
 
-def _write_json(path: str, obj: Any) -> None:
-    with open(path, "w", encoding="utf-8") as f:
+    return Env.from_mapping({
+        "REGION": os.getenv("REGION", "US").strip() or "US",
+        "ORIGINAL_LANGS": langs,
+        "SUBS_INCLUDE": os.getenv("SUBS_INCLUDE", ""),
+        # default to 12 pages; can be overridden in workflow env
+        "DISCOVER_PAGES": int(os.getenv("DISCOVER_PAGES", "12") or "12"),
+    })
+
+def _write_json(p: Path, obj: Any) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
-def _write_text(path: str, txt: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(txt)
-
-def _copy_to_latest(run_dir: str) -> str:
-    latest_dir = os.path.join(RUN_ROOT, "latest")
-    if os.path.isdir(latest_dir):
-        shutil.rmtree(latest_dir)
-    shutil.copytree(run_dir, latest_dir)
-    return latest_dir
+def _timestamp_dir() -> Path:
+    ts = time.strftime("run_%Y%m%d_%H%M%S", time.gmtime())
+    return OUT_DIR / ts
 
 def main() -> None:
-    # Make sure core modules exist
+    _install_safe_unraisable_hook()
     run_self_check()
 
-    _mkdir(RUN_ROOT)
-    run_dir = os.path.join(RUN_ROOT, _now_slug())
-    _mkdir(run_dir)
+    env = _env_from_os()
 
-    # Emit a marker that our workflow can read
-    last_path_file = os.path.join(RUN_ROOT, "last_run_dir.txt")
-    _write_text(last_path_file, run_dir + "\n")
+    print(" | catalog:begin", flush=True)
+    t0 = time.time()
+    items = build_catalog(env)
+    kept = len(items)
+    print(f" | catalog:end kept={kept}", flush=True)
 
-    # Log file
-    log_path = os.path.join(run_dir, "runner.log")
-    # Simple tee: duplicate stdout to runner.log
-    class Tee:
-        def __init__(self, *streams):
-            self.streams = streams
-        def write(self, b):
-            for s in self.streams: s.write(b); s.flush()
-        def flush(self):
-            for s in self.streams: s.flush()
+    # Load "seen" index (ratings.csv and/or public IMDb if IMDB_USER_ID is set)
+    seen_idx = load_seen_index(str(ROOT / "data" / "ratings.csv"))
+    eligible = filter_unseen(items, seen_idx)
 
-    with open(log_path, "w", encoding="utf-8") as lf:
-        sys.stdout = Tee(sys.stdout, lf)  # type: ignore
-        sys.stderr = Tee(sys.stderr, lf)  # type: ignore
+    # Score
+    scored = score_items(env, eligible)
 
-        env = Env.from_os_environ()
+    # Basic counters for the logs
+    discovered = len(items)
+    elig_cnt = len(eligible)
+    above_cut = sum(1 for r in scored if r.get("match", 0) >= 58.0)
+    print(f" | results: discovered={discovered} eligible={elig_cnt} above_cut={above_cut}", flush=True)
 
-        print(" | catalog:begin", flush=True)
-        items: List[Dict[str, Any]] = build_catalog(env)
-        kept = len(items)
-        print(f" | catalog:end kept={kept}", flush=True)
+    # Persist run artifacts
+    run_dir = _timestamp_dir()
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(run_dir / "items.discovered.json", items)
+    _write_json(run_dir / "items.enriched.json", eligible)  # after exclusion but before scoring details
+    _write_json(run_dir / "assistant_feed.json", scored)
 
-        # Persist discovery pool for debugging
-        _write_json(os.path.join(run_dir, "items.discovered.json"), items)
+    # Tiny markdown summary for the site step (compat with your previous format)
+    summary_lines = [
+        "# Daily recommendations",
+        "",
+        "## Telemetry",
+        f"- Region: **{env.get('REGION', 'US')}**",
+        f"- SUBS_INCLUDE: `{env.get('SUBS_INCLUDE', '')}`",
+        f"- Discover pages: **{env.get('DISCOVER_PAGES', 0)}**",
+        f"- Discovered (raw): **{discovered}**",
+        f"- Eligible after exclusions: **{elig_cnt}**",
+        f"- Above match cut (≥ 58.0): **{above_cut}**",
+        "",
+        "## Your profile: genre weights",
+        "_No genre weights computed (no ratings.csv?)._",
+        "",
+        ("_No items above cut today._" if above_cut == 0 else ""),
+        "",
+    ]
+    (run_dir / "summary.md").write_text("\n".join(summary_lines), encoding="utf-8")
 
-        # Seen index (ratings.csv + optional public IMDb)
-        ratings_csv = os.path.join("data", "ratings.csv")
-        seen_idx = load_seen_index(ratings_csv)
+    # Maintain 'latest' copy for upload step
+    latest = OUT_DIR / "latest"
+    if latest.exists():
+        try:
+            if latest.is_symlink() or latest.is_file():
+                latest.unlink()
+            else:
+                import shutil
+                shutil.rmtree(latest)
+        except Exception:
+            pass
+    import shutil
+    shutil.copytree(run_dir, latest)
 
-        # In this simple version, “enriched” == discovered (you can swap in real enrichment later)
-        enriched = list(items)
-        _write_json(os.path.join(run_dir, "items.enriched.json"), enriched)
+    # Done; explicit clean exit for CI
+    elapsed = time.time() - t0
+    try:
+        print(f" | done in {elapsed:.2f}s", flush=True)
+    except Exception:
+        pass
 
-        # Filter & score
-        pool = filter_unseen(enriched, seen_idx)
-        ranked = score_items(env, pool)
-
-        # Persist results
-        _write_json(os.path.join(run_dir, "assistant_feed.json"), ranked)
-
-        # Human summary (also printed)
-        discovered = len(items)
-        eligible = len(pool)
-        above_cut = sum(1 for r in ranked if (r.get("match") or 0) >= 58.0)
-
-        summary_md = [
-            "# Daily recommendations",
-            "",
-            "## Telemetry",
-            f"- Region: **{env.get('REGION','US')}**",
-            f"- SUBS_INCLUDE: `{','.join(env.get('SUBS_INCLUDE',[])) if isinstance(env.get('SUBS_INCLUDE',[]), list) else env.get('SUBS_INCLUDE','')}`",
-            f"- Discover pages: **{env.get('DISCOVER_PAGES',3)}**",
-            f"- Discovered (raw): **{discovered}**",
-            f"- Enriched (details fetched): **{len(enriched)}**; errors: **0**",
-            f"- Exclusion list size (ratings + IMDb web): **{len([k for k in seen_idx.keys() if k.startswith('tt')])}**",
-            f"- Eligible after exclusions: **{eligible}**",
-            f"- Above match cut (≥ 58.0): **{above_cut}**",
-            "",
-        ]
-        if above_cut == 0:
-            summary_md.append("_No items above cut today._")
-        _write_text(os.path.join(run_dir, "summary.md"), "\n".join(summary_md) + "\n")
-
-        print(f" | results: discovered={discovered} eligible={eligible} above_cut={above_cut}", flush=True)
-
-    # Also mirror to data/out/latest for artifact pickup
-    _copy_to_latest(run_dir)
+    # On GitHub Actions, force a clean zero even if some atexit/unraisable nonsense fires later.
+    if os.getenv("GITHUB_ACTIONS", "").lower() == "true" or os.getenv("RUNNER_HARD_EXIT", "1") == "1":
+        os._exit(0)  # noqa: PLE1142
+    else:
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()
