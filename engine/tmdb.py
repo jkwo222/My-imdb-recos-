@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -13,29 +14,27 @@ TMDB_BASE = "https://api.themoviedb.org/3"
 CACHE_DIR = Path("data/cache/tmdb")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-UA = {"User-Agent": "RecoEngine/2.14 (+github actions)"}
+UA = {"User-Agent": "RecoEngine/3.0 (+github actions)"}
 
 
 # ---------- auth / http helpers ----------
 
 def _auth_headers_and_params() -> Tuple[Dict[str, str], Dict[str, str]]:
     """
-    Returns (headers, params) for TMDB auth. Prefers v4 bearer token if present.
-    - If TMDB_BEARER is set: uses Authorization: Bearer <token>
-    - Else requires TMDB_API_KEY param (?api_key=...)
+    Returns (headers, params) for TMDB v3 endpoints.
+    Preference:
+      1) TMDB_API_KEY  -> ?api_key=...
+      2) TMDB_BEARER   -> Authorization: Bearer <v4 token>
     """
+    api_key = os.getenv("TMDB_API_KEY", "").strip()
+    if api_key:
+        return dict(UA), {"api_key": api_key}
+
     bearer = os.getenv("TMDB_BEARER", "").strip()
     if bearer:
-        headers = {"Authorization": f"Bearer {bearer}", **UA}
-        params: Dict[str, str] = {}
-        return headers, params
+        return {"Authorization": f"Bearer {bearer}", **UA}, {}
 
-    api_key = os.getenv("TMDB_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("TMDB_API_KEY or TMDB_BEARER is required")
-    headers = dict(UA)
-    params = {"api_key": api_key}
-    return headers, params
+    raise RuntimeError("TMDB_API_KEY or TMDB_BEARER is required for TMDB v3 API calls")
 
 
 def _cache_key(path: str, params: Dict[str, Any]) -> str:
@@ -50,11 +49,12 @@ def _cache_path(group: str, key: str) -> Path:
     return g / f"{key}.json"
 
 
-def _http_get_json(path: str, params: Dict[str, Any], group: Optional[str] = None,
-                   ttl_min: int = 60) -> Dict[str, Any]:
+def _http_get_json(path: str, params: Dict[str, Any],
+                   group: Optional[str] = None, ttl_min: int = 60) -> Dict[str, Any]:
     headers, base_params = _auth_headers_and_params()
     full_params = {**base_params, **params}
     key = _cache_key(path, full_params)
+
     if group:
         cp = _cache_path(group, key)
         if cp.exists():
@@ -68,11 +68,11 @@ def _http_get_json(path: str, params: Dict[str, Any], group: Optional[str] = Non
                 pass
 
     url = f"{TMDB_BASE}{path}"
-    backoff = 0.8
+    backoff = 0.7
     last_err: Optional[Dict[str, Any]] = None
-    for attempt in range(5):
+    for _ in range(5):
         try:
-            r = requests.get(url, params=full_params, headers=headers, timeout=20)
+            r = requests.get(url, params=full_params, headers=headers, timeout=25)
             if r.status_code == 200:
                 data = r.json()
                 if group:
@@ -83,52 +83,82 @@ def _http_get_json(path: str, params: Dict[str, Any], group: Optional[str] = Non
                         pass
                 return data
             else:
-                last_err = {"status_code": r.status_code, "body": r.text}
+                last_err = {"status_code": r.status_code, "text": r.text[:300]}
         except Exception as e:
             last_err = {"exception": repr(e)}
         time.sleep(backoff)
-        backoff *= 1.7
+        backoff *= 1.8
     return {"__error__": last_err or {"error": "unknown"}}
 
 
-# Exposed for tmdb_detail.py
+# Exposed for detail helpers
 def _get_json(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    return _http_get_json(path, params, group="raw", ttl_min=60)
+    return _http_get_json(path, params, group="raw", ttl_min=90)
 
 
 # ---------- provider helpers ----------
 
-def _provider_slug(name: str) -> str:
-    return (name or "").strip().lower().replace(" ", "_")
+# Map TMDB provider *display names* to canonical slugs like env expects
+def _slugify_provider_name(name: str) -> str:
+    s = (name or "").strip().lower()
+    s = s.replace("&", "and")
+    s = s.replace("+", "_plus")
+    s = re.sub(r"[^\w\s\-]", "", s)     # drop punctuation except hyphen/underscore
+    s = s.replace("-", "_")
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"_+", "_", s)
+    return s
 
+# Common aliases from env to TMDB slugs
+PROVIDER_ALIASES = {
+    "prime_video": "amazon_prime_video",
+    "amazon_prime": "amazon_prime_video",
+    "apple_tv": "apple_tv_plus",
+    "apple_tv_plus": "apple_tv_plus",
+    "hbo_max": "max",
+    "hbomax": "max",
+    "disneyplus": "disney_plus",
+    "paramountplus": "paramount_plus",
+}
 
 def _providers_catalog(kind: str, region: str, ttl_min: int = 8 * 60) -> List[Dict[str, Any]]:
     path = f"/watch/providers/{'movie' if kind=='movie' else 'tv'}"
-    data = _http_get_json(path, {"watch_region": region}, group="providers", ttl_min=ttl_min)
+    data = _http_get_json(path, {"watch_region": region}, group=f"providers_{region}", ttl_min=ttl_min)
     return data.get("results") or []
 
 
-def providers_from_env(subs: List[str], region: str) -> List[int]:
-    subs_norm = {_provider_slug(s) for s in (subs or []) if s}
-    if not subs_norm:
-        return []
+def providers_from_env(subs: List[str], region: str) -> Tuple[List[int], Dict[str, int]]:
+    """
+    Map env SUBS_INCLUDE slugs (e.g., 'netflix', 'prime_video') to TMDB provider IDs for the region.
+    Returns (provider_ids, mapping_used) where mapping_used is slug->id for diag.
+    """
+    subs_in = [s for s in (subs or []) if s]
+    subs_norm = []
+    for s in subs_in:
+        key = s.strip().lower().replace("-", "_")
+        key = PROVIDER_ALIASES.get(key, key)
+        subs_norm.append(key)
+
     movie_provs = _providers_catalog("movie", region)
     tv_provs = _providers_catalog("tv", region)
     id_by_slug: Dict[str, int] = {}
     for entry in movie_provs + tv_provs:
-        nm = _provider_slug(entry.get("provider_name"))
+        nm = str(entry.get("provider_name") or "")
+        slug = _slugify_provider_name(nm)  # e.g. "Apple TV+" -> "apple_tv_plus"
         pid = int(entry.get("provider_id") or 0)
-        if nm and pid:
-            id_by_slug[nm] = pid
+        if slug and pid:
+            id_by_slug[slug] = pid
 
     out: List[int] = []
+    used_map: Dict[str, int] = {}
     seen = set()
     for s in subs_norm:
         pid = id_by_slug.get(s)
         if pid and pid not in seen:
             out.append(pid)
+            used_map[s] = pid
             seen.add(pid)
-    return out
+    return out, used_map
 
 
 # ---------- discovery ----------
@@ -155,8 +185,8 @@ def _normalize_items(kind: str, results: List[Dict[str, Any]]) -> List[Dict[str,
     return items
 
 
-def _discover(kind: str, page: int, region: str, langs: List[str], provider_ids: List[int],
-              slot: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def _discover(kind: str, page: int, region: str, langs: List[str],
+              provider_ids: List[int], slot: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     with_providers = "|".join(str(x) for x in provider_ids) if provider_ids else None
     with_langs = "|".join(langs) if langs else None
     params: Dict[str, Any] = {
@@ -170,7 +200,7 @@ def _discover(kind: str, page: int, region: str, langs: List[str], provider_ids:
         params["with_watch_monetization_types"] = "flatrate|free|ads|rent|buy"
     if with_langs:
         params["with_original_language"] = with_langs
-    params["cb"] = slot  # small cache-buster partitioning
+    params["cb"] = slot  # tiny cache shard
 
     data = _http_get_json(f"/discover/{'movie' if kind=='movie' else 'tv'}",
                           params, group=f"discover_{kind}", ttl_min=30)
@@ -181,6 +211,7 @@ def _discover(kind: str, page: int, region: str, langs: List[str], provider_ids:
         "total_pages": int(data.get("total_pages") or 1),
         "total_results": int(data.get("total_results") or 0),
         "returned": len(items),
+        "error": data.get("__error__"),
     }
     return items, diag
 
@@ -197,28 +228,42 @@ def discover_tv_page(page: int, region: str, langs: List[str],
     return _discover("tv", page, region, langs, provider_ids, slot)
 
 
-# ---------- detail / providers ----------
+# ---------- trending ----------
 
-def _merge_watch_providers(detail: Dict[str, Any], region: str) -> Dict[str, Any]:
-    results = (detail.get("watch/providers", {}) or {}).get("results", {})
-    region_blob = results.get(region, {}) if isinstance(results, dict) else {}
-    providers = set()
-    for bucket in ("flatrate", "ads", "free", "rent", "buy"):
-        for p in region_blob.get(bucket, []) or []:
-            nm = _provider_slug(p.get("provider_name"))
-            if nm:
-                providers.add(nm)
-    return {"providers": sorted(providers)}
+def trending(kind: str, period: str = "day") -> List[Dict[str, Any]]:
+    """
+    period: 'day' or 'week'
+    """
+    data = _http_get_json(f"/trending/{'movie' if kind=='movie' else 'tv'}/{period}",
+                          {}, group=f"trending_{kind}_{period}", ttl_min=30)
+    return _normalize_items(kind, data.get("results") or [])
+
+
+# ---------- detail lookups ----------
+
+def get_external_ids(kind: str, tmdb_id: int) -> Dict[str, Any]:
+    """
+    Returns at least {'imdb_id': 'tt...'} when available.
+    """
+    k = "movie" if kind == "movie" else "tv"
+    data = _http_get_json(f"/{k}/{int(tmdb_id)}/external_ids", {},
+                          group="external_ids", ttl_min=24*60)
+    return {
+        "imdb_id": data.get("imdb_id"),
+        "__error__": data.get("__error__"),
+    }
 
 
 def get_title_watch_providers(kind: str, tmdb_id: int, region: str) -> List[str]:
     k = "movie" if kind == "movie" else "tv"
-    data = _http_get_json(f"/{k}/{int(tmdb_id)}/watch/providers", {}, group="title_providers", ttl_min=180)
+    data = _http_get_json(f"/{k}/{int(tmdb_id)}/watch/providers", {},
+                          group="title_providers", ttl_min=180)
     results = (data.get("results") or {}).get(region, {})
     out = set()
     for bucket in ("flatrate", "ads", "free", "rent", "buy"):
         for p in results.get(bucket, []) or []:
-            nm = _provider_slug(p.get("provider_name"))
-            if nm:
-                out.add(nm)
+            nm = (p.get("provider_name") or "")
+            slug = _slugify_provider_name(nm)
+            if slug:
+                out.add(slug)
     return sorted(out)
