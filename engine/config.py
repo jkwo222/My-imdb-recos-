@@ -32,8 +32,11 @@ class Config:
     ratings_csv: str = "data/ratings.csv"
     shortlist_size: int = 50      # shortlist taken from catalog pool before ranking
     show_n: int = 10              # items shown in final feed
-    weight_critic: float = 0.25   # blend factor for critic/audience fields if present
-    weight_audience: float = 0.25
+
+    # External score weights (signed boost/penalty)
+    # These are *relative weights*—the signed critic/audience signal lands in [-1, +1]
+    weight_critic: float = 0.35
+    weight_audience: float = 0.35
 
     # I/O
     cache_dir: str = "data/cache"
@@ -57,7 +60,6 @@ class Config:
 def load_config() -> Config:
     """
     Build a Config from environment variables with safe defaults.
-    This function is what runner.py imports and what your workflow expects.
     """
     api = os.getenv("TMDB_API_KEY", "").strip()
     if not api:
@@ -67,17 +69,16 @@ def load_config() -> Config:
     langs = _getenv_csv("ORIGINAL_LANGS", "en")
     subs = _getenv_csv(
         "SUBS_INCLUDE",
-        # sensible default set
         "netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus",
     )
 
-    # Optional tuning
+    # Optional tuning via env
     pages_movie = int(os.getenv("DISCOVER_PAGES_MOVIE", "10"))
     pages_tv = int(os.getenv("DISCOVER_PAGES_TV", "10"))
     shortlist = int(os.getenv("SHORTLIST_SIZE", "50"))
     shown = int(os.getenv("SHOW_N", "10"))
-    w_c = float(os.getenv("WEIGHT_CRITIC", "0.25"))
-    w_a = float(os.getenv("WEIGHT_AUDIENCE", "0.25"))
+    w_c = float(os.getenv("WEIGHT_CRITIC", "0.35"))
+    w_a = float(os.getenv("WEIGHT_AUDIENCE", "0.35"))
     conc = int(os.getenv("TMDB_CONCURRENCY", "2"))
     delay = float(os.getenv("TMDB_MIN_DELAY_S", "0.20"))
 
