@@ -18,15 +18,18 @@ jobs:
       SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
       DISCOVER_PAGES: "12"
 
-      # TMDB: code prefers v3 key; falls back to v4 bearer if key missing
       TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
       TMDB_BEARER:  ${{ secrets.TMDB_ACCESS_TOKEN }}
-
-      # IMDb (optional; CSV expected at data/user/ratings.csv)
       IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
 
-      # Optional @mention for notifications (set in repo Variables)
       NOTIFY_USER: ${{ vars.NOTIFY_USER }}
+      # bump this to invalidate old caches
+      POOL_CACHE_VERSION: v1
+
+      # pool behavior knobs (already supported by code)
+      POOL_MAX_ITEMS: "20000"
+      # POOL_PRUNE_AT: "200000"
+      # POOL_PRUNE_KEEP: "150000"
 
     steps:
       - name: Check out repository
@@ -42,12 +45,23 @@ jobs:
           python -m pip install -U pip
           pip install -r requirements.txt
 
+      # NEW: restore the last saved cache (pool + tmdb)
+      - name: Restore pool/tmdb caches
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            data/cache/pool
+            data/cache/tmdb
+          key: pool-${{ runner.os }}-${{ env.REGION }}-${{ env.POOL_CACHE_VERSION }}-${{ github.run_id }}
+          restore-keys: |
+            pool-${{ runner.os }}-${{ env.REGION }}-${{ env.POOL_CACHE_VERSION }}-
+
       - name: Run engine
         run: |
           mkdir -p data/out data/cache
           python -m engine.runner
 
-      # Build a compact digest to overwrite the summary.md
       - name: Build digest summary
         run: |
           python -m engine.summarize \
@@ -55,7 +69,7 @@ jobs:
             --diag "data/out/latest/diag.json" \
             --ratings "data/user/ratings.csv" \
             --out "data/out/latest/summary.md" \
-            --top 10
+            --top 12
 
       - name: Make debug bundle
         run: bash ./.github/scripts/make_debug_bundle.sh
@@ -68,35 +82,23 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const title = 'Daily Recommendations';
-
             let body = '';
             try { body = fs.readFileSync('data/out/latest/summary.md', 'utf8'); }
             catch { body = 'No summary.md found. Check debug bundle.'; }
-
-            // Find existing open issue with this title (labeled daily-recos)
             const { data: issues } = await github.rest.issues.listForRepo({
               owner, repo, state: 'open', labels: 'daily-recos', per_page: 100
             });
             let issue = issues.find(i => i.title === title);
-
             if (!issue) {
-              const res = await github.rest.issues.create({
-                owner, repo, title, body, labels: ['daily-recos']
-              });
-              issue = res.data;
+              issue = (await github.rest.issues.create({ owner, repo, title, body, labels: ['daily-recos'] })).data;
             } else {
-              await github.rest.issues.update({
-                owner, repo, issue_number: issue.number, body
-              });
+              await github.rest.issues.update({ owner, repo, issue_number: issue.number, body });
             }
-
-            // Add a comment with the same digest to trigger a notification
             const mention = process.env.NOTIFY_USER ? ` cc @${process.env.NOTIFY_USER}` : '';
             await github.rest.issues.createComment({
               owner, repo, issue_number: issue.number,
               body: `Daily digest posted.${mention}\n\n` + body
             });
-            core.info(`Issue #${issue.number} updated and commented`);
 
       - name: Upload debug bundle
         uses: actions/upload-artifact@v4
@@ -125,3 +127,13 @@ jobs:
             data/out/latest/items.enriched.json
             data/out/latest/summary.md
             data/out/latest/diag.json
+
+      # NEW: save the updated cache with a unique key for this run
+      - name: Save pool/tmdb caches
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            data/cache/pool
+            data/cache/tmdb
+          key: pool-${{ runner.os }}-${{ env.REGION }}-${{ env.POOL_CACHE_VERSION }}-${{ github.run_id }}
