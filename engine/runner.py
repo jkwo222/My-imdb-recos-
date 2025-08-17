@@ -6,20 +6,26 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 # Local imports
 from .env import Env
 from .catalog_builder import build_catalog
 from .self_check import run_self_check
 
-# Optional scoring pieces (keep the import loose so runner still finishes if scoring changes)
-try:
+# Optional scoring pieces (runner should still complete if these are absent)
+try:  # pragma: no cover
     from .scoring import load_seen_index, filter_unseen, score_items
 except Exception:  # pragma: no cover
     load_seen_index = None  # type: ignore
     filter_unseen = None    # type: ignore
     score_items = None      # type: ignore
+
+# Optional diagnostics helper (safe if missing)
+try:  # pragma: no cover
+    from .diag import write_diag
+except Exception:  # pragma: no cover
+    write_diag = None  # type: ignore
 
 OUT_ROOT = Path("data/out")
 CACHE_ROOT = Path("data/cache")
@@ -39,10 +45,8 @@ def _stamp_last_run(run_dir: Path) -> None:
         if latest.is_symlink() or latest.is_file():
             latest.unlink()
         else:
-            # remove old directory
             import shutil
             shutil.rmtree(latest, ignore_errors=True)
-    # Try a symlink first for speed; fall back to copy on platforms that disallow it
     try:
         latest.symlink_to(run_dir, target_is_directory=True)
     except Exception:
@@ -94,13 +98,32 @@ def _env_from_os() -> Env:
     except Exception:
         pages = 12
 
-    # Compose Env
-    return Env.from_mapping({
-        "REGION": region,
-        "ORIGINAL_LANGS": langs,
-        "SUBS_INCLUDE": subs_list,
-        "DISCOVER_PAGES": pages,
-    })
+    # Compose Env (fall back to Env(mapping) if older class lacks from_mapping)
+    if hasattr(Env, "from_mapping"):
+        return Env.from_mapping({
+            "REGION": region,
+            "ORIGINAL_LANGS": langs,
+            "SUBS_INCLUDE": subs_list,
+            "DISCOVER_PAGES": pages,
+        })
+    # Back-compat shim: Env behaves like a dict
+    e = Env()  # type: ignore
+    try:
+        e.update({  # type: ignore
+            "REGION": region,
+            "ORIGINAL_LANGS": langs,
+            "SUBS_INCLUDE": subs_list,
+            "DISCOVER_PAGES": pages,
+        })
+    except Exception:
+        # last resort: wrap in a tiny dict-like object
+        return Env.from_dict({  # type: ignore[attr-defined]
+            "REGION": region,
+            "ORIGINAL_LANGS": langs,
+            "SUBS_INCLUDE": subs_list,
+            "DISCOVER_PAGES": pages,
+        })
+    return e  # type: ignore
 
 
 def _build_run_dir() -> Path:
@@ -109,6 +132,92 @@ def _build_run_dir() -> Path:
     rd = OUT_ROOT / f"run_{ts}"
     rd.mkdir(parents=True, exist_ok=True)
     return rd
+
+
+def _write_fs_reports(root: Path) -> None:
+    """
+    Emit:
+      - files.txt: flat list with size info under repo root (limited for safety)
+      - tree.txt: a lightweight ASCII tree starting at repo root
+      - env.json: selected environment snapshot
+    """
+    repo_root = Path(".").resolve()
+
+    def _rel(p: Path) -> str:
+        try:
+            return str(p.relative_to(repo_root))
+        except Exception:
+            return str(p)
+
+    files_out = root / "files.txt"
+    tree_out = root / "tree.txt"
+    env_out = root / "env.json"
+
+    # files.txt
+    lines: List[str] = []
+    max_files = 5000
+    count = 0
+    for base, dirs, files in os.walk(repo_root):
+        # Skip .git and venvs/caches to keep output small
+        if any(seg in {".git", ".github", "__pycache__", ".venv", "venv", ".mypy_cache"} for seg in Path(base).parts):
+            continue
+        for fname in files:
+            path = Path(base) / fname
+            try:
+                size = path.stat().st_size
+            except Exception:
+                size = -1
+            lines.append(f"{_rel(path)}\t{size}")
+            count += 1
+            if count >= max_files:
+                lines.append("... (truncated) ...")
+                break
+        if count >= max_files:
+            break
+    files_out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # tree.txt (brief)
+    tree_lines: List[str] = []
+    max_depth = 6
+    max_entries_per_dir = 200
+
+    def walk(prefix: str, dir_path: Path, depth: int) -> None:
+        if depth > max_depth:
+            tree_lines.append(prefix + "…")
+            return
+        try:
+            entries = sorted(dir_path.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+        except Exception:
+            return
+        shown = 0
+        for i, entry in enumerate(entries):
+            if entry.name in {".git", "__pycache__", ".venv", "venv", ".mypy_cache"}:
+                continue
+            connector = "└── " if i == len(entries) - 1 else "├── "
+            tree_lines.append(prefix + connector + entry.name)
+            shown += 1
+            if entry.is_dir():
+                new_prefix = prefix + ("    " if i == len(entries) - 1 else "│   ")
+                walk(new_prefix, entry, depth + 1)
+            if shown >= max_entries_per_dir:
+                tree_lines.append(prefix + "… (truncated)")
+                break
+
+    walk("", repo_root, 0)
+    tree_out.write_text("\n".join(tree_lines) + "\n", encoding="utf-8")
+
+    # env.json snapshot of interesting vars
+    env_snapshot = {
+        "REGION": os.getenv("REGION"),
+        "ORIGINAL_LANGS": os.getenv("ORIGINAL_LANGS"),
+        "SUBS_INCLUDE": os.getenv("SUBS_INCLUDE"),
+        "DISCOVER_PAGES": os.getenv("DISCOVER_PAGES"),
+        "HAS_TMDB_ACCESS_TOKEN": bool(os.getenv("TMDB_ACCESS_TOKEN")),
+        "HAS_TMDB_API_KEY": bool(os.getenv("TMDB_API_KEY")),
+        "PYTHON": sys.version,
+        "CWD": str(Path.cwd()),
+    }
+    _safe_json_dump(env_out, env_snapshot)
 
 
 def _summarize(items_scored: List[Dict[str, Any]], env: Env) -> str:
@@ -135,11 +244,12 @@ def _summarize(items_scored: List[Dict[str, Any]], env: Env) -> str:
 
 
 def main() -> None:
+    started_ts = time.time()
+
     # Self-check (tmdb discover functions present, etc.)
     try:
         run_self_check()
     except SystemExit as e:
-        # Ensure a readable failure
         print(str(e), file=sys.stderr, flush=True)
         raise
 
@@ -151,6 +261,7 @@ def main() -> None:
     run_dir = _build_run_dir()
     log_path = run_dir / "runner.log"
     log_lines: List[str] = []
+
     def _log(line: str) -> None:
         print(line, flush=True)
         log_lines.append(line)
@@ -180,6 +291,7 @@ def main() -> None:
 
     # Apply exclusions and scoring if available
     final_list: List[Dict[str, Any]] = items
+    ranked: List[Dict[str, Any]]
     try:
         # Exclusions: local ratings.csv + optional IMDb public
         seen_idx = {}
@@ -194,15 +306,13 @@ def main() -> None:
         if callable(score_items):
             ranked = score_items(env, final_list)  # type: ignore
         else:
-            # Fallback trivial ranking if scoring not wired
             ranked = list(final_list)
+
         # Decide cut
         def _get_match(d: Dict[str, Any]) -> float:
-            # allow both our score_items output and raw
             v = d.get("match")
             if isinstance(v, (int, float)):
                 return float(v)
-            # proxy from TMDB vote_average
             va = d.get("vote_average")
             try:
                 return float(va) * 10.0 if va is not None else 0.0
@@ -227,14 +337,52 @@ def main() -> None:
     except Exception as ex:
         _log(f"[scoring] FAILED: {ex!r}")
         traceback.print_exc()
+        # still write a minimal assistant_feed so the workflow has something
+        ranked = list(final_list)
+        _safe_json_dump(run_dir / "assistant_feed.json", ranked)
 
     _log(f" | results: discovered={discovered} eligible={eligible} above_cut={above_cut}")
 
-    # Write log file and stamp last run files/links
+    # Write log file
     try:
         log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
-    finally:
-        _stamp_last_run(run_dir)
+    except Exception:
+        pass
+
+    # Emit diag.json if helper is available
+    try:
+        if callable(write_diag):
+            # We don’t have provider_ids here; catalog_builder prints them.
+            # Capture a compact env snapshot:
+            env_snapshot = {
+                "REGION": env.get("REGION", "US"),
+                "ORIGINAL_LANGS": env.get("ORIGINAL_LANGS", []),
+                "SUBS_INCLUDE": env.get("SUBS_INCLUDE", []),
+                "DISCOVER_PAGES": env.get("DISCOVER_PAGES", 0),
+            }
+            write_diag(
+                run_dir,
+                discovered=int(discovered),
+                eligible=int(eligible),
+                above_cut=int(above_cut),
+                provider_ids=[],  # unknown at this layer
+                env_snapshot=env_snapshot,
+                started_ts=started_ts,
+                finished_ts=time.time(),
+                notes="runner emitted diag.json",
+            )
+    except Exception:
+        # Never fail the run on diag issues
+        pass
+
+    # Extra filesystem & env reports for debug bundle
+    try:
+        _write_fs_reports(run_dir)
+    except Exception:
+        pass
+
+    # Finally stamp last run markers/links
+    _stamp_last_run(run_dir)
 
 
 if __name__ == "__main__":
