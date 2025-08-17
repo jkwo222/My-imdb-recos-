@@ -2,104 +2,78 @@ name: ci
 
 on:
   push:
-    branches: ["**"]
+    branches: [ main ]
   pull_request:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  REGION: US
-  ORIGINAL_LANGS: '["en"]'
-  DISCOVER_PAGES: 3
-  SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
-  PYTHONUTF8: "1"
-  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
-  check:
+  test:
     runs-on: ubuntu-24.04
 
+    env:
+      # App config
+      REGION: US
+      ORIGINAL_LANGS: '["en"]'
+      SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
+      DISCOVER_PAGES: "12"
+
+      # TMDB auth (runner accepts either v3 or v4)
+      TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}          # v3 key (query param)
+      TMDB_BEARER:  ${{ secrets.TMDB_ACCESS_TOKEN }}     # v4 access token (Bearer)
+      # IMDb (optional)
+      IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
+      # IMDB_RATINGS_CSV_PATH: data/ratings.csv          # (optional) if you commit a CSV
+
     steps:
-      - name: Checkout
+      - name: Check out
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ runner.os }}-py311-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
-          restore-keys: |
-            pip-${{ runner.os }}-py311-
-
       - name: Install dependencies
-        shell: bash
         run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          python -m pip install -U pip
+          pip install -r requirements.txt
 
-      - name: Run engine (quick CI) — skip if secrets unavailable
-        id: run
-        shell: bash
-        env:
-          TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
-          IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
+      # Optional: boolean presence check (safe; values remain masked)
+      - name: Env sanity (booleans only)
         run: |
-          set -euxo pipefail
+          python - <<'PY'
+          import os
+          print("HAS_TMDB_API_KEY:", bool(os.getenv("TMDB_API_KEY")))
+          print("HAS_TMDB_BEARER :", bool(os.getenv("TMDB_BEARER")))
+          print("HAS_IMDB_USER_ID:", bool(os.getenv("IMDB_USER_ID")))
+          PY
+
+      - name: Run engine
+        run: |
           mkdir -p data/out data/cache
-
-          # If secrets aren't available (e.g., PR from a fork), skip gracefully.
-          if [ -z "${TMDB_ACCESS_TOKEN:-}" ]; then
-            echo "TMDB_ACCESS_TOKEN not present (likely a PR from a fork). Skipping engine run."
-            echo "skipped=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
           python -m engine.runner
 
-          # Record the actual run directory from the marker file
-          if [[ -f data/out/last_run_dir.txt ]]; then
-            run_dir="$(< data/out/last_run_dir.txt)"
-            echo "RUN_DIR=${run_dir}" >> "$GITHUB_OUTPUT"
-            echo "skipped=false" >> "$GITHUB_OUTPUT"
-            echo "CI run_dir: ${run_dir}"
-          else
-            echo "No last_run_dir.txt found; nothing to upload."
-            echo "RUN_DIR=" >> "$GITHUB_OUTPUT"
-            echo "skipped=false" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Make debug bundle
+        run: ./.github/scripts/make_debug_bundle.sh
 
-      - name: Upload debug (always)
+      - name: Upload debug bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-data
+          path: debug-data.zip
+          if-no-files-found: warn
+
+      - name: Upload latest outputs (optional)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ci-debug-${{ github.run_number }}
+          name: latest-run
+          if-no-files-found: ignore
           path: |
-            ${{ steps.run.outputs.RUN_DIR }}/runner.log
-            ${{ steps.run.outputs.RUN_DIR }}/assistant_feed.json
-            ${{ steps.run.outputs.RUN_DIR }}/items.discovered.json
-            ${{ steps.run.outputs.RUN_DIR }}/items.enriched.json
-            ${{ steps.run.outputs.RUN_DIR }}/summary.md
-            data/out/last_run_dir.txt
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Upload site (main only)
-        if: ${{ !fromJSON(steps.run.outputs.skipped || 'false') && github.ref == 'refs/heads/main' && steps.run.outputs.RUN_DIR != '' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: ci-site-${{ github.run_number }}
-          path: ${{ steps.run.outputs.RUN_DIR }}
-          if-no-files-found: warn
-          retention-days: 3
+            data/out/latest/runner.log
+            data/out/latest/assistant_feed.json
+            data/out/latest/items.discovered.json
+            data/out/latest/items.enriched.json
+            data/out/latest/summary.md
+            data/out/latest/diag.json
