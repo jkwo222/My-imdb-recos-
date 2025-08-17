@@ -1,99 +1,151 @@
 # engine/rank.py
 from __future__ import annotations
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple
+from math import copysign
 
-# Default: audience > critic
-DEFAULT_WEIGHTS = {
-    "audience_weight": 0.65,   # audience emphasized
-    "critic_weight":   0.35,
-    "commitment_cost_scale": 1.0,
-    "novelty_weight":  0.15,
-    "min_match_cut":   58.0,
-}
+from .taste import taste_boost_for
 
-def _to_01(v, lo, hi) -> float:
+def _in(val, lo, hi) -> float:
     try:
-        x = float(v)
+        x = float(val)
     except Exception:
         return 0.0
-    if hi == lo:
+    if x < lo: return lo
+    if x > hi: return hi
+    return x
+
+def _boost_from_rating(r: float) -> float:
+    """
+    Map a raw rating in [0,1] → boost/penalty in [-1, +1] with a
+    neutral band around 0.50–0.65.
+
+    - r <= 0.35 → ~strong penalty approaching -1
+    - 0.50–0.65 → ~0 (neutral)
+    - r >= 0.85 → strong boost approaching +1
+    Piecewise-linear for clarity & debuggability.
+    """
+    r = _in(r, 0.0, 1.0)
+    if r <= 0.35:
+        # 0.00 .. 0.35 → -1 .. -0.5
+        return -1.0 + (r / 0.35) * 0.5
+    if r < 0.50:
+        # 0.35 .. 0.50 → -0.5 .. -0.15
+        return -0.5 + ((r - 0.35) / 0.15) * 0.35
+    if r <= 0.65:
         return 0.0
-    return max(0.0, min(1.0, (x - lo) / (hi - lo)))
+    if r < 0.85:
+        # 0.65 .. 0.85 → 0 .. +0.6
+        return ((r - 0.65) / 0.20) * 0.6
+    # 0.85 .. 1.00 → 0.6 .. 1.0
+    return 0.6 + ((r - 0.85) / 0.15) * 0.4
 
-def _commitment_penalty(it: Dict[str, Any], scale: float) -> float:
-    t = (it.get("type") or "").strip()
-    if t == "tvSeries":
-        seasons = int(it.get("seasons") or 1)
-        if seasons >= 3:
-            return 0.09 * scale
-        if seasons == 2:
-            return 0.04 * scale
-    return 0.0
+def _audience_score(it: Dict[str, Any]) -> float:
+    # prefer OMDb IMDb audience (0..1), else TMDB vote (0..10 → 0..1)
+    if (it.get("audience") or 0) > 0:
+        return float(it.get("audience"))
+    va = it.get("tmdb_vote")
+    return float(va) / 10.0 if va else 0.0
 
-def _novelty_bonus(it: Dict[str, Any], w: float) -> float:
-    year = it.get("year")
-    pop  = it.get("popularity")
-    yb = 0.03 if isinstance(year, int) and year >= 2022 else (0.02 if isinstance(year, int) and year >= 2018 else 0.0)
-    pb = 0.02 * _to_01(pop or 0.0, 0.0, 2000.0)
-    return w * (yb + pb)
+def _critic_score(it: Dict[str, Any]) -> float:
+    # prefer OMDb RT (0..1); if missing, you can optionally fall back later
+    return float(it.get("critic") or 0.0)
 
-def score_item(it: Dict[str, Any], w: Dict[str, Any], taste_boost: float = 0.0) -> float:
-    aw = float(w.get("audience_weight", DEFAULT_WEIGHTS["audience_weight"]))
-    cw = float(w.get("critic_weight",   DEFAULT_WEIGHTS["critic_weight"]))
-    cc = float(w.get("commitment_cost_scale", DEFAULT_WEIGHTS["commitment_cost_scale"]))
-    nw = float(w.get("novelty_weight", DEFAULT_WEIGHTS["novelty_weight"]))
+def explain_reasons(it: Dict[str, Any], weights: Dict[str, float], taste_b: float, base_boost: float) -> List[str]:
+    reasons: List[str] = []
+    aud = _audience_score(it); cri = _critic_score(it)
 
-    # audience (prefer imdb/audience -> tmdb)
-    if it.get("audience") not in (None, ""):
-        audience_01 = float(it["audience"])
-        if audience_01 > 1.0:
-            audience_01 = _to_01(audience_01, 0.0, 10.0)
-    elif it.get("imdb_rating") not in (None, ""):
-        audience_01 = _to_01(it["imdb_rating"], 0.0, 10.0)
-    else:
-        audience_01 = _to_01(it.get("tmdb_vote", 0.0), 0.0, 10.0)
+    if aud >= 0.75:
+        reasons.append("strong audience rating")
+    elif aud <= 0.45 and aud > 0:
+        reasons.append("audience rating is low (penalized)")
 
-    # critic (prefer rt -> tmdb)
-    if it.get("critic") not in (None, ""):
-        critic_01 = float(it["critic"])
-        if critic_01 > 1.0:
-            critic_01 = _to_01(critic_01, 0.0, 100.0)
-    elif it.get("rt") not in (None, ""):
-        critic_01 = _to_01(it["rt"], 0.0, 100.0)
-    else:
-        critic_01 = _to_01(it.get("tmdb_vote", 0.0), 0.0, 10.0)
+    if cri >= 0.75:
+        reasons.append("critically rated")
+    elif cri <= 0.45 and cri > 0:
+        reasons.append("critic rating is low (penalized)")
 
-    base = aw * audience_01 + cw * critic_01
-    penalty = _commitment_penalty(it, cc)
-    bonus   = _novelty_bonus(it, nw)
-    match = base + taste_boost + bonus - penalty
+    if abs(taste_b) >= 0.02:
+        reasons.append("genre fit with your past ratings")
 
-    # map to 0..100 with neutral ~50–65
-    score = 60.0 + 20.0 * match
-    return round(max(40.0, min(99.0, score)), 1)
+    prov = it.get("providers") or []
+    if prov:
+        reasons.append(f"available on: {', '.join(prov)}")
 
-def rank_items(items: List[Dict[str, Any]],
-               w: Dict[str, Any],
-               taste_for: callable | None = None) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
+    if (it.get("type") == "tvSeries") and int(it.get("seasons") or 1) >= 3:
+        reasons.append("commitment penalty for multi-season series")
+
+    # when both ratings are missing, still say why (providers / taste)
+    if not reasons:
+        reasons.append("popular on your services")
+
+    return reasons
+
+def rank_candidates(items: List[Dict[str, Any]],
+                    weights: Dict[str, float],
+                    taste_profile: Dict[str, float]) -> List[Dict[str, Any]]:
+    """
+    Produce a ranked list with 'match' and 'why' for each item.
+    weights:
+      - audience_weight (dominant)
+      - critic_weight
+      - novelty_weight (0..1)
+      - commitment_cost_scale
+    """
+    aw = float(weights.get("audience_weight", 0.65))
+    cw = float(weights.get("critic_weight", 0.35))
+    # ensure audience > critic, gently renormalize if not
+    if cw >= aw:
+        aw = min(0.8, max(0.5, aw))
+        cw = max(0.2, min(0.5, 1.0 - aw))
+
+    novelty_w = float(weights.get("novelty_weight", 0.15))
+    cc_scale = float(weights.get("commitment_cost_scale", 1.0))
+
+    ranked: List[Dict[str, Any]] = []
     for it in items:
-        genres = it.get("genres") or []
-        tboost = 0.0
-        if taste_for:
-            try:
-                tboost = float(taste_for(genres))
-            except Exception:
-                tboost = 0.0
-        m = score_item(it, w, tboost)
-        row = dict(it)
-        row["match"] = m
-        if "type" not in row:
-            kind = it.get("kind")
-            row["type"] = "tvSeries" if kind == "tv" else "movie"
-        out.append(row)
-    out.sort(key=lambda r: r.get("match", 0.0), reverse=True)
-    return out
+        aud = _audience_score(it)
+        cri = _critic_score(it)
 
-# --- Back-compat shim for older runner imports ---
-def rank_candidates(items: List[Dict[str, Any]], w: Dict[str, Any], taste_for: callable | None = None):
-    return rank_items(items, w, taste_for=taste_for)
+        aud_boost = _boost_from_rating(aud)
+        cri_boost = _boost_from_rating(cri)
+
+        # Taste boost in [-0.08, +0.15] from your profile (already clamped there)
+        taste_b = taste_boost_for(it.get("genres") or [], taste_profile)  # typically small
+
+        # Commitment penalty for multi-season shows
+        commit_pen = 0.0
+        if (it.get("type") == "tvSeries"):
+            seasons = int(it.get("seasons") or 1)
+            if seasons >= 3:
+                commit_pen = 0.09 * cc_scale   # ~9 pts
+            elif seasons == 2:
+                commit_pen = 0.04 * cc_scale   # ~4 pts
+
+        # Novelty: if we ever pass a novelty signal (e.g., popularity), reward a bit
+        pop = float(it.get("popularity") or 0.0)
+        # quick sigmoid-ish:  pop_normalized ~ 0..1 for 0..200
+        pop_n = max(0.0, min(1.0, pop / 200.0))
+        novelty = novelty_w * pop_n
+
+        base = 60.0
+        # 20 points of headroom for ratings; taste scales to ~ +/-5,
+        # novelty up to ~ +3; commitment subtracts absolute points.
+        rating_part = 20.0 * (aw * aud_boost + cw * cri_boost)
+        taste_part  = 35.0 * taste_b   # scale taste into points ([-2.8, +5.25] approx)
+        novelty_part = 20.0 * novelty  # up to ~+3
+        s = base + rating_part + taste_part + novelty_part
+        s -= (commit_pen * 100.0)
+
+        # clamp to [0, 100], then floor at 55 to keep obvious duds out
+        match = round(max(0.0, min(100.0, s)), 1)
+
+        reasons = explain_reasons(it, weights, taste_b, rating_part)
+
+        ranked.append({
+            **it,
+            "match": match,
+            "why": reasons
+        })
+
+    ranked.sort(key=lambda x: x["match"], reverse=True)
+    return ranked
