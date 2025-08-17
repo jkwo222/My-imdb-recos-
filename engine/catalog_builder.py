@@ -30,7 +30,7 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 IMDB_BASICS = IMDB_CACHE / "title.basics.tsv"
 IMDB_RATINGS = IMDB_CACHE / "title.ratings.tsv"
 
-# ---------- tiny JSON helpers (self-contained) ----------
+# ---------- tiny JSON helpers ----------
 
 def _read_json(path: Path, default: Any) -> Any:
     try:
@@ -213,17 +213,19 @@ def build_catalog(env: Dict[str, str]) -> List[Dict[str, Any]]:
     Builds filtered, enriched items and writes:
       - data/out/latest/assistant_feed.json
       - data/out/latest/run_meta.json
+      - data/out/latest/debug_status.json (extra diagnostics)
 
     Pipeline:
-      1) Optionally load IMDb TSVs (basics+ratings) if present.
+      1) Optionally load IMDb TSVs (basics+ratings).
       2) Load persistent pool (carry-forward enrichment).
       3) Always run TMDB Discover for fresh titles (movies + TV).
       4) Enrich with TMDB details (incl. imdb_id for TV) + providers.
       5) Exclude anything in your lists (ratings.csv + IMDb public list).
       6) Filter by subscriptions.
-      7) Persist back to pool; write outputs + telemetry.
+      7) Persist back to pool; write outputs + telemetry/diagnostics.
     """
     t0 = time.time()
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # (1) IMDb TSVs (optional)
     basics = _load_tsv(IMDB_BASICS)
@@ -235,23 +237,32 @@ def build_catalog(env: Dict[str, str]) -> List[Dict[str, Any]]:
     persistent = _read_json(PERSIST_PATH, {"items": {}})
     known_items: Dict[str, Any] = persistent.get("items", {})
 
+    # index by tmdb_id and imdb_id for cross-checks
+    known_by_tmdb: Dict[str, Dict[str, Any]] = {}
+    imdb_to_tmdb: Dict[str, str] = {}
+    for _, v in known_items.items():
+        tmdb_id = v.get("tmdb_id")
+        imdb_id = v.get("imdb_id")
+        if tmdb_id is not None:
+            known_by_tmdb[str(tmdb_id)] = v
+        if imdb_id:
+            imdb_to_tmdb[str(imdb_id)] = str(tmdb_id) if tmdb_id is not None else ""
+
     # (3) Discover fresh every run
     discovered = _discover_fresh(env)
     discovered_total = len(discovered)
 
-    # Working set starts with discovered (IMDb TSV rows aren't the primary source here)
+    # Working set is discovered
     items: List[Dict[str, Any]] = discovered[:]
 
-    # Carry-forward enrichment for same TMDB id (if we already know about it)
+    # Carry-forward enrichment for same TMDB id
     by_tmdb: Dict[str, Dict] = {str(it.get("tmdb_id")): it for it in items if it.get("tmdb_id") is not None}
-    for k, v in known_items.items():
-        if v.get("tmdb_id") is not None:
-            key = str(v["tmdb_id"])
-            if key in by_tmdb:
-                it = by_tmdb[key]
-                for ck, cv in v.items():
-                    if ck not in it or it[ck] in (None, "", [], {}):
-                        it[ck] = cv
+    for key, carry in known_by_tmdb.items():
+        if key in by_tmdb:
+            it = by_tmdb[key]
+            for ck, cv in carry.items():
+                if ck not in it or it[ck] in (None, "", [], {}):
+                    it[ck] = cv
 
     # (4) Enrich via TMDB (adds imdb_id for TV, genres, providers)
     region = (env.get("REGION") or "US").upper()
@@ -263,14 +274,25 @@ def build_catalog(env: Dict[str, str]) -> List[Dict[str, Any]]:
     profile, profile_loaded = _load_user_profile(env)
     user_tconsts = set(profile.keys()) if profile else set()
 
-    def _is_excluded(it: Dict[str, Any]) -> bool:
-        imdb_id = it.get("imdb_id")
+    # — helper: should exclude?
+    def _is_excluded(it: Dict[str, Any]) -> Tuple[bool, str]:
+        imdb_id = (it.get("imdb_id") or "").strip()
+        tconst = (it.get("tconst") or "").strip()
+        tmdb_id = it.get("tmdb_id")
+        # direct IMDb id or tconst in your list
         if imdb_id and imdb_id in user_tconsts:
-            return True
-        tconst = it.get("tconst")
+            return True, "imdb_id_in_user_lists"
         if tconst and tconst in user_tconsts:
-            return True
-        return False
+            return True, "tconst_in_user_lists"
+        # if we already had this tmdb_id mapped to an imdb_id you've rated
+        if tmdb_id is not None:
+            k = str(tmdb_id)
+            prior = known_by_tmdb.get(k)
+            if prior:
+                prior_imdb = (prior.get("imdb_id") or "").strip()
+                if prior_imdb and prior_imdb in user_tconsts:
+                    return True, "tmdb_linked_to_rated_imdb"
+        return False, ""
 
     # (6) Subscriptions filter (robust slug->name mapping)
     subs_slugs = [s.strip().lower() for s in (env.get("SUBS_INCLUDE") or "").split(",") if s.strip()]
@@ -278,14 +300,28 @@ def build_catalog(env: Dict[str, str]) -> List[Dict[str, Any]]:
 
     excluded_by_providers = 0
     excluded_by_user = 0
+    excluded_reasons: Dict[str, int] = {}
+    excluded_samples: List[Dict[str, Any]] = []
     filtered: List[Dict[str, Any]] = []
 
     for it in items:
+        # subs filter
         if not _passes_subs_filter(it, allowed_names):
             excluded_by_providers += 1
             continue
-        if _is_excluded(it):
+        # user exclusions
+        ex, reason = _is_excluded(it)
+        if ex:
             excluded_by_user += 1
+            excluded_reasons[reason] = excluded_reasons.get(reason, 0) + 1
+            if len(excluded_samples) < 25:
+                excluded_samples.append({
+                    "title": it.get("title"),
+                    "year": it.get("year"),
+                    "tmdb_id": it.get("tmdb_id"),
+                    "imdb_id": it.get("imdb_id"),
+                    "reason": reason,
+                })
             continue
         filtered.append(it)
 
@@ -309,7 +345,7 @@ def build_catalog(env: Dict[str, str]) -> List[Dict[str, Any]]:
             "type": it.get("type"),
             "year": it.get("year"),
             "imdb_id": it.get("imdb_id"),
-            "imdb_rating": it.get("imdb_rating"),  # available if later blended
+            "imdb_rating": it.get("imdb_rating"),
             "tmdb_vote": it.get("tmdb_vote"),
         }
         if not prev:
@@ -332,6 +368,7 @@ def build_catalog(env: Dict[str, str]) -> List[Dict[str, Any]]:
         "discovered_total": discovered_total,
         "excluded_by_providers": excluded_by_providers,
         "excluded_by_user_ratings_or_imdb_list": excluded_by_user,
+        "excluded_reasons": excluded_reasons,
         "kept_after_filter": kept_after_filter,
         "movies_kept": sum(1 for x in filtered if (x.get("tmdb_media_type") or "").startswith("movie")),
         "tv_kept": sum(1 for x in filtered if (x.get("tmdb_media_type") or "").startswith("tv")),
@@ -345,5 +382,17 @@ def build_catalog(env: Dict[str, str]) -> List[Dict[str, Any]]:
         "note": "Discover + enrich pipeline; IMDb TSVs optional.",
     }
     _write_json(OUT_DIR / "run_meta.json", meta)
+
+    # extra diagnostics to help audit exclusions
+    debug_status = {
+        "excluded_samples": excluded_samples,  # up to 25 examples with reasons
+        "profile_tconst_count": len(user_tconsts),
+        "known_pool_items": pool_size_after,
+    }
+    _write_json(OUT_DIR / "debug_status.json", debug_status)
+
+    # also drop raw lists we’ll include in the debug zip
+    _write_json(OUT_DIR / "raw_discovered.json", {"items": items})
+    _write_json(OUT_DIR / "raw_filtered.json", {"items": filtered})
 
     return filtered
