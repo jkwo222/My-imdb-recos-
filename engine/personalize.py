@@ -3,110 +3,125 @@ from __future__ import annotations
 from typing import Dict, List, Any, Tuple
 from collections import defaultdict
 import math
+from datetime import datetime
 
 def _to_list(x) -> List[str]:
-    if not x: return []
-    if isinstance(x, (list, tuple)): return [str(i) for i in x if i]
+    if not x:
+        return []
+    if isinstance(x, (list, tuple)):
+        return [str(i) for i in x if i]
     return [str(x)]
 
-def genre_weights_from_profile(
-    items: List[Dict[str,Any]],
-    user_profile: Dict[str,Dict],
-    imdb_id_field: str="tconst",
-) -> Dict[str, float]:
-    """
-    Weight genres by (my_rating - 6.0) across rated titles found in items (where we know the mapping).
-    6.0 ~ neutral; >6 favors, <6 disfavors.
-    """
-    acc = defaultdict(float)
-    cnt = defaultdict(int)
+def _safe_float(x, default=None):
+    try:
+        return float(x)
+    except Exception:
+        return default
 
-    # index items by imdb id for genre lookup
-    by_imdb = {}
-    for it in items:
-        tid = it.get(imdb_id_field) or it.get("imdb_id") or it.get("tconst")
-        if not tid: 
-            continue
-        by_imdb[str(tid)] = it
+# -------------------------
+# Affinity (Genres/Directors)
+# -------------------------
 
-    for tid, row in user_profile.items():
-        it = by_imdb.get(str(tid))
-        if not it:
-            continue
-        genres = _to_list(it.get("genres")) or []
+def genre_weights_from_profile(profile: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
+    """
+    Weight each genre by (my_rating - 6.0). Normalize to [0,1].
+    Uses genres stored in the profile rows themselves.
+    """
+    acc = defaultdict(float); cnt = defaultdict(int)
+    for _, row in profile.items():
         r = row.get("my_rating")
         if r is None:
             continue
         delta = float(r) - 6.0
-        for g in genres:
+        for g in _to_list(row.get("genres")):
             acc[g] += delta
             cnt[g] += 1
-
     if not acc:
         return {}
     mx = max(abs(v) for v in acc.values()) or 1.0
-    out = {g: (0.5 + 0.5*(v/mx)) for g,v in acc.items()}  # map [-mx,+mx] -> [0,1]
-    return {g: round(w, 4) for g,w in out.items()}
+    return {g: round(0.5 + 0.5*(v/mx), 4) for g, v in acc.items()}
 
-def _best_rating_10(it: Dict[str,Any]) -> float | None:
+def director_weights_from_profile(profile: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
+    acc = defaultdict(float); cnt = defaultdict(int)
+    for _, row in profile.items():
+        r = row.get("my_rating")
+        if r is None:
+            continue
+        delta = float(r) - 6.0
+        for d in _to_list(row.get("directors")):
+            acc[d] += delta
+            cnt[d] += 1
+    if not acc:
+        return {}
+    mx = max(abs(v) for v in acc.values()) or 1.0
+    return {d: round(0.5 + 0.5*(v/mx), 4) for d, v in acc.items()}
+
+# -------------------------
+# Scoring
+# -------------------------
+
+def _avg_rating_10(it: Dict[str, Any]) -> float:
     """
-    Return best available audience-like rating on 0..10:
-      - IMDb (imdb_rating) if present and numeric
-      - else TMDB vote_average (tmdb_vote)
+    Blend IMDb (0-10) and TMDB vote (0-10).
     """
-    def _coerce(x):
-        try:
-            return float(x)
-        except Exception:
-            return None
-    imdb = _coerce(it.get("imdb_rating"))
-    tmdb = _coerce(it.get("tmdb_vote"))
-    if imdb is not None and tmdb is not None:
-        return max(imdb, tmdb)
-    return imdb if imdb is not None else tmdb
+    imdb = _safe_float(it.get("imdb_rating"))
+    tmdb_raw = _safe_float(it.get("tmdb_vote"))
+    tmdb = tmdb_raw if tmdb_raw is None else float(tmdb_raw)
+    vals = [v for v in [imdb, tmdb] if v is not None]
+    if not vals:
+        return 6.0  # neutral-ish default
+    return sum(vals)/len(vals)
+
+def _authority_bonus(it: Dict[str, Any]) -> float:
+    """
+    Small positive bonus for high vote counts (IMDb numVotes).
+    Scale: log10(numVotes+1) clamped to [0..6] -> up to +6 * 0.8 ≈ +4.8 points.
+    """
+    nv = _safe_float(it.get("numVotes"), 0.0)
+    if nv is None:
+        nv = 0.0
+    import math
+    return min(6.0, math.log10(1.0 + nv)) * 0.8
+
+def _genre_fit(it: Dict[str, Any], gw: Dict[str, float]) -> float:
+    g = _to_list(it.get("genres"))
+    if not g or not gw:
+        return 0.0
+    fit = sum(gw.get(x, 0.5) for x in g) / len(g)
+    return (fit - 0.5) * 30.0  # ±15
+
+def _director_fit(it: Dict[str, Any], dw: Dict[str, float]) -> float:
+    if not dw:
+        return 0.0
+    ds = _to_list(it.get("directors"))
+    if not ds:
+        return 0.0
+    # Take top director affinity
+    best = max((dw.get(d, 0.5) for d in ds), default=0.5)
+    return (best - 0.5) * 20.0  # ±10
 
 def apply_personal_score(
-    items: List[Dict[str,Any]],
-    genre_weights: Dict[str,float],
+    items: List[Dict[str, Any]],
+    genre_weights: Dict[str, float],
+    director_weights: Dict[str, float],
 ) -> None:
     """
-    Mutates items: adds:
-      - 'score' (0–100)
-      - 'match_score' (rounded score, for display)
-      - 'why' string ("IMDb 8.7; TMDB 8.5; 2014") if data exists
-      - 'audience' (best audience rating, 0..10)
+    Mutates items: adds 'match_score' (0–100) and 'why'.
     """
     for it in items:
-        base10 = _best_rating_10(it)
-        base100 = (base10 * 10.0) if base10 is not None else 60.0  # fallback mid if unrated
-
-        g = _to_list(it.get("genres"))
-        if genre_weights and g:
-            fit = sum(genre_weights.get(x, 0.5) for x in g) / len(g)
-            # center around 0.5 => [-0.5..+0.5], scale to ±15 points
-            adj = (fit - 0.5) * 30.0
-        else:
-            adj = 0.0
-
-        raw = max(0.0, min(100.0, base100 + adj))
-        it["score"] = raw
-        it["match_score"] = round(raw, 2)
-
-        # audience field (best available)
-        it["audience"] = base10 if base10 is not None else None
-
-        # build "why"
+        base10 = _avg_rating_10(it)
+        base100 = base10 * 10.0
+        adj = 0.0
+        adj += _genre_fit(it, genre_weights)
+        adj += _director_fit(it, director_weights)
+        adj += _authority_bonus(it)
+        score = max(0.0, min(100.0, base100 + adj))
+        it["match_score"] = round(score, 2)
+        # Build a simple "why"
+        imdb = _safe_float(it.get("imdb_rating"))
+        tmdb = _safe_float(it.get("tmdb_vote"))
         bits = []
-        if it.get("imdb_rating") is not None:
-            try:
-                bits.append(f"IMDb {float(it['imdb_rating']):.1f}")
-            except Exception:
-                pass
-        if it.get("tmdb_vote") is not None:
-            try:
-                bits.append(f"TMDB {float(it['tmdb_vote']):.1f}")
-            except Exception:
-                pass
-        if it.get("year"):
-            bits.append(str(it["year"]))
-        it["why"] = "; ".join(bits) if bits else ""
+        if imdb is not None: bits.append(f"IMDb {imdb:g}")
+        if tmdb is not None: bits.append(f"TMDB {tmdb:g}")
+        if it.get("year"): bits.append(str(it["year"]))
+        it["why"] = "; ".join(bits)
