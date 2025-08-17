@@ -1,98 +1,92 @@
-# engine/runner.py
 from __future__ import annotations
-
-import json
-import os
-import sys
+from typing import List, Dict, Any
+import json, math
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from collections import defaultdict
 
 from .catalog_builder import build_catalog
-from .imdb_sync import load_ratings_csv, fetch_user_ratings_web, merge_user_sources, to_user_profile
-from .personalize import genre_weights_from_profile, director_weights_from_profile, apply_personal_score
-from .summarize import write_summary_md
+from .imdb_sync import load_ratings_csv, fetch_user_ratings_web, merge_user_sources, to_user_profile, compute_genre_weights
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT_DIR = ROOT / "data" / "out" / "latest"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+OUT = ROOT / "data" / "out" / "latest"
+OUT.mkdir(parents=True, exist_ok=True)
 
-def _load_user_profile(env: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+def _load_user_profile(env: Dict[str,str]) -> Dict[str, Dict]:
     local = load_ratings_csv()
-    remote: List[Dict[str, Any]] = []
-    uid = (env.get("IMDB_USER_ID") or "").strip()
-    # Remote is optional; we only use cache if present (no scraping here).
-    if uid:
-        remote = fetch_user_ratings_web(uid)
+    remote = fetch_user_ratings_web((env.get("IMDB_USER_ID") or "").strip())
     merged = merge_user_sources(local, remote)
-    profile = to_user_profile(merged)
-    return profile
+    return to_user_profile(merged)
 
-def _rank_items(items: List[Dict[str, Any]], env: Dict[str, str]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def _to_list(x):
+    if not x: return []
+    if isinstance(x, (list, tuple)): return [i for i in x if i]
+    return [x]
+
+def _rank_items(items: List[Dict[str,Any]], env: Dict[str,str]) -> Dict[str,Any]:
     profile = _load_user_profile(env)
+    genre_weights = compute_genre_weights(profile)
 
-    # Exclusion set: everything you've rated/seen (from CSV + cached web)
-    exclude_ids = set(profile.keys())
-    before_excl = len(items)
-    items = [it for it in items if not it.get("tconst") or str(it["tconst"]) not in exclude_ids]
+    min_cut = float(env.get("MIN_MATCH_CUT") or 58.0)
 
-    # Affinity
-    gweights = genre_weights_from_profile(profile)
-    dweights = director_weights_from_profile(profile)
+    ranked = []
+    for it in items:
+        # base: take the best rating available
+        imdb = it.get("imdb_rating")
+        tmdb = it.get("tmdb_vote")
+        base10 = None
+        try:
+            if imdb is not None: base10 = float(imdb)
+        except Exception: pass
+        try:
+            if tmdb is not None: base10 = max(float(tmdb), base10 or 0.0)
+        except Exception: pass
+        if base10 is None: base10 = 6.0  # default neutral
+        base100 = base10 * 10.0
 
-    # Score
-    apply_personal_score(items, gweights, dweights)
+        g = _to_list(it.get("genres"))
+        if g and genre_weights:
+            fit = sum(genre_weights.get(x, 0.5) for x in g) / len(g)
+            adj = (fit - 0.5) * 30.0
+        else:
+            adj = 0.0
 
-    # Cut
-    cut = float(env.get("MIN_MATCH_CUT") or "58")
-    kept = [it for it in items if (it.get("match_score") or 0.0) >= cut]
+        score = max(0.0, min(100.0, base100 + adj))
+        it2 = dict(it)
+        it2["match_score"] = round(score, 2)
+        ranked.append(it2)
 
-    telemetry = {
-        "total_input": before_excl,
-        "excluded_already_seen": before_excl - len(items),
-        "scored_total": len(items),
-        "score_cut": cut,
+    # cut + sort
+    kept = [r for r in ranked if r["match_score"] >= min_cut]
+    kept.sort(key=lambda x: (-x["match_score"], x.get("year") or 0, x.get("title") or ""))
+
+    out = {"items": kept, "telemetry": {
+        "total": len(items),
         "kept": len(kept),
-        "subs_include": [s.strip() for s in (env.get("SUBS_INCLUDE") or "").split(",") if s.strip()],
-        "region": env.get("REGION") or "US",
-        "original_langs": env.get("ORIGINAL_LANGS") or "",
-        "profile_size": len(profile),
-        "affinity": {
-            "genres_learned": sorted(gweights.keys()),
-            "directors_learned": sorted(dweights.keys()),
-        },
-    }
+        "score_cut": min_cut,
+    }}
+    (OUT / "assistant_ranked.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    return out
 
-    # Write ranked list for inspection
-    (OUT_DIR / "assistant_ranked.json").write_text(
-        json.dumps(kept, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    (OUT_DIR / "debug_status.json").write_text(
-        json.dumps(telemetry, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    return kept, telemetry
-
-def main() -> None:
+def main():
+    import os
     env = dict(os.environ)
     print(" | catalog:begin")
-    items = build_catalog(env)  # pulls IMDb TSVs if present; enriches via TMDB; applies provider filter
+    items = build_catalog(env)
     print(f" | catalog:end kept={len(items)}")
 
-    ranked, telemetry = _rank_items(items, env)
+    ranked = _rank_items(items, env)
 
-    # Summary/email
-    write_summary_md(
-        env,
-        items_ranked=ranked,
-        genre_weights=None,   # computed inside summary from debug_status + ranked
-        director_weights=None,
-        telemetry=telemetry,
-    )
+    # hand a compact status to summarize
+    debug = {
+        "items_in": len(items),
+        "ranked_kept": ranked["telemetry"]["kept"],
+        "score_cut": ranked["telemetry"]["score_cut"],
+    }
+    (OUT / "debug_status.json").write_text(json.dumps(debug, indent=2), encoding="utf-8")
 
-    print(f"validation: items={len(ranked)} ids_present={sum(1 for i in ranked if i.get('imdb_id') or i.get('tconst'))} genres_present={sum(1 for i in ranked if i.get('genres'))}")
-    print(f"score-cut {telemetry['score_cut']}: kept {telemetry['kept']} / {telemetry['scored_total']}")
-    (OUT_DIR / "assistant_ranked.json").write_text(
-        json.dumps(ranked, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    # write summary
+    from .summarize import write_summary_md
+    write_summary_md(env, genre_weights=compute_genre_weights(_load_user_profile(env)))
 
 if __name__ == "__main__":
     main()
