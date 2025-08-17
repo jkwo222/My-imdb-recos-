@@ -3,41 +3,41 @@ name: nightly
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 4 * * *" # daily 04:17 UTC
+    # Run every day at 16:30 UTC (adjust as you like)
+    - cron: "30 16 * * *"
 
 permissions:
-  contents: read
-  pages: write          # for deploy
-  id-token: write       # for deploy
-
-concurrency:
-  group: nightly-${{ github.ref }}
-  cancel-in-progress: false
-
-env:
-  REGION: US
-  ORIGINAL_LANGS: '["en"]'
-  DISCOVER_PAGES: 12
-  SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
-  PYTHONUTF8: "1"
-  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  contents: write
 
 jobs:
   build:
-    name: build
     runs-on: ubuntu-24.04
-    outputs:
-      site_path: data/out/latest
+
+    env:
+      PYTHONUTF8: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      REGION: US
+      ORIGINAL_LANGS: '["en"]'
+      # Expanded discover pages per your request
+      DISCOVER_PAGES: "12"
+      # Comma-separated list (your preferred format)
+      SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
+      # Secrets you must set in repo settings → Secrets and variables → Actions
+      IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
+      TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: pip cache
+      - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -55,84 +55,82 @@ jobs:
 
       - name: Run engine
         shell: bash
-        env:
-          TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
-          IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
         run: |
           set -euxo pipefail
           mkdir -p data/out data/cache
           python -m engine.runner
-          # keep last 5 runs
-          if compgen -G "data/out/run_*" > /dev/null; then
-            ls -dt data/out/run_* | tail -n +6 | xargs -r rm -rf --
-          fi
+          echo "RUN_DONE=1" >> "$GITHUB_OUTPUT"
 
-      - name: Pin latest run folder (marker-based)
+      # ---- Fallback stamping (B) ----
+      - name: Stamp last run marker (fallback)
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -f data/out/last_run_dir.txt ]]; then
-            run_dir="$(< data/out/last_run_dir.txt)"
-            echo "Last run: ${run_dir}"
-            rm -rf data/out/latest
-            cp -r "${run_dir}" data/out/latest
-            ls -al data/out/latest || true
-          else
-            echo "ERROR: data/out/last_run_dir.txt not found."
-            find data/out -maxdepth 2 -type d -print || true
-            exit 1
+          mkdir -p data/out
+          if [ ! -f data/out/last_run_dir.txt ]; then
+            if compgen -G "data/out/run_*" > /dev/null; then
+              latest_dir="$(ls -dt data/out/run_* | head -n1)"
+              printf '%s\n' "$latest_dir" > data/out/last_run_dir.txt
+              rm -rf data/out/latest
+              ln -s "$latest_dir" data/out/latest 2>/dev/null || cp -r "$latest_dir" data/out/latest
+              echo "Stamped last_run_dir.txt with: $latest_dir"
+            else
+              echo "WARNING: no run_* dirs found; nothing to stamp"
+            fi
           fi
+
+      - name: Prepare latest dir for upload (robust)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/out
+          if [ -f data/out/last_run_dir.txt ]; then
+            latest_dir="$(cat data/out/last_run_dir.txt)"
+          elif compgen -G "data/out/run_*" > /dev/null; then
+            latest_dir="$(ls -dt data/out/run_* | head -n1)"
+          else
+            echo "No run_* directories found under data/out"
+            exit 0
+          fi
+          rm -rf data/out/latest
+          ln -s "$latest_dir" data/out/latest 2>/dev/null || cp -r "$latest_dir" data/out/latest
+          echo "Latest run directory: $latest_dir"
+          ls -al "data/out/latest" || true
 
       - name: Upload site artifact
         uses: actions/upload-artifact@v4
         with:
-          name: site-out-${{ github.run_number }}
+          name: site-out
           path: data/out/latest
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 7
 
-      - name: Build debug bundle
+      - name: Bundle debug data
         shell: bash
         run: |
           set -euo pipefail
           rm -f debug-data.zip
           mkdir -p debug-bundle
-          cp -f data/out/latest/runner.log                 debug-bundle/ || true
-          cp -f data/out/latest/assistant_feed.json        debug-bundle/ || true
-          cp -f data/out/latest/items.discovered.json      debug-bundle/ || true
-          cp -f data/out/latest/items.enriched.json        debug-bundle/ || true
-          cp -f data/out/latest/summary.md                 debug-bundle/ || true
-          cp -f data/out/last_run_dir.txt                  debug-bundle/ || true
+          if [ -d "data/out/latest" ]; then
+            cp -f data/out/latest/runner.log debug-bundle/ 2>/dev/null || true
+            cp -f data/out/latest/assistant_feed.json debug-bundle/ 2>/dev/null || true
+            cp -f data/out/latest/items.discovered.json debug-bundle/ 2>/dev/null || true
+            cp -f data/out/latest/items.enriched.json debug-bundle/ 2>/dev/null || true
+            cp -f data/out/latest/summary.md debug-bundle/ 2>/dev/null || true
+          fi
           {
             echo "REGION=${REGION}"
             echo "SUBS_INCLUDE=${SUBS_INCLUDE}"
             echo "ORIGINAL_LANGS=${ORIGINAL_LANGS}"
             echo "DISCOVER_PAGES=${DISCOVER_PAGES}"
           } > debug-bundle/env.txt
-          (cd debug-bundle && zip -q -r ../debug-data.zip .)
+          (cd debug-bundle && zip -q -r ../debug-data.zip .) || true
           ls -lh debug-data.zip || true
 
-      - name: Upload debug bundle
+      - name: Upload debug artifact
         uses: actions/upload-artifact@v4
         with:
-          name: debug-data-${{ github.run_number }}
+          name: debug-data
           path: debug-data.zip
+          if-no-files-found: warn
           retention-days: 14
-
-      # Prepare Pages artifact from site output
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: data/out/latest
-
-  deploy:
-    name: deploy
-    needs: build
-    runs-on: ubuntu-24.04
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
