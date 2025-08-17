@@ -17,7 +17,10 @@ jobs:
       REGION: US
       ORIGINAL_LANGS: en
       SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
-      MIN_MATCH_CUT: 58.0
+      MIN_MATCH_CUT: 58
+      # Optional: adjust how many TMDB discover pages to pull each run
+      DISCOVER_PAGES: 3
+
     steps:
       - uses: actions/checkout@v4
 
@@ -28,6 +31,7 @@ jobs:
 
       - name: Install deps
         run: |
+          set -e
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
@@ -36,41 +40,37 @@ jobs:
           set -e
           python -m engine.runner
 
-      # 🔧 NEW: build debug-data.zip (goes to data/out/latest/debug-data.zip)
+      # --- Build a compact debug bundle (zip) with logs/state for analysis ---
       - name: Make debug-data.zip
         if: always()
         run: |
           set -e
           python -m engine.debug_pack
-          ls -lah data/out/latest || true
-          test -f data/out/latest/debug-data.zip && echo "Debug zip present."
 
-      # Upload normal outputs + useful state
-      - name: Upload artifacts (outputs + debug/state)
+      # --- Upload primary outputs only (keeps artifact small) ---
+      - name: Upload outputs (out)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: out
-          if-no-files-found: warn
-          compression-level: 6
           path: |
             data/out/latest
-            data/cache/state/personal_state.json
-            data/cache/state/personal_history.json
-            data/cache/state/persistent_pool.json
-            data/cache/feedback
-            data/cache/tmdb
-            data/cache/imdb
+          if-no-files-found: warn
+          compression-level: 6
+          overwrite: false
 
-      # 🔧 NEW: also upload the debug zip as a dedicated artifact so it's easy to spot
-      - name: Upload debug zip (separate artifact)
+      # --- Upload the debug bundle as its own easy-to-download artifact ---
+      - name: Upload debug bundle (debug-data)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: debug-data
-          if-no-files-found: error
           path: data/out/latest/debug-data.zip
+          if-no-files-found: error
+          compression-level: 6
+          overwrite: true
 
+      # --- Add run summary to the job summary page ---
       - name: Add summary to run
         if: always()
         run: |
@@ -81,6 +81,7 @@ jobs:
             echo "_No summary produced (data/out/latest/summary.md missing)._ " >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      # --- Post summary as a comment to a 'Daily Recommendations' issue ---
       - name: Ensure gh CLI
         if: always()
         run: |
@@ -100,17 +101,14 @@ jobs:
             BODY="$(cat data/out/latest/summary.md)"
           fi
 
-          # find open issue by title
           ISSUE_NUMBER=$(gh api -X GET repos/${{ github.repository }}/issues --paginate -q \
             '.[] | select(.state=="open" and .title=="'"$TITLE"'") | .number' | head -n1)
 
-          # create if missing
           if [ -z "$ISSUE_NUMBER" ]; then
             ISSUE_NUMBER=$(gh api -X POST repos/${{ github.repository }}/issues \
               -f title="$TITLE" -f body="Tracking thread for daily recommendation digests." -q '.number')
           fi
 
-          # post comment
           gh api -X POST repos/${{ github.repository }}/issues/$ISSUE_NUMBER/comments \
             -f body="$BODY" >/dev/null
 
