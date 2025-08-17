@@ -2,102 +2,116 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Any, Dict, List, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT_DIR = ROOT / "data" / "out" / "latest"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-
-def _load_json(path: Path, default):
+def _fmt_score(x: Optional[float]) -> str:
+    if x is None:
+        return "—"
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return f"{float(x):.0f}"
     except Exception:
-        return default
+        return "—"
 
+def _table(rows: List[List[str]]) -> str:
+    if not rows:
+        return ""
+    # Very small markdown helper
+    header = rows[0]
+    out = ["|" + "|".join(header) + "|", "|" + "|".join("---" for _ in header) + "|"]
+    for r in rows[1:]:
+        out.append("|" + "|".join(r) + "|")
+    return "\n".join(out)
 
-def _top_genre_rows(weights: Dict[str, float], top_n: int = 12) -> List[Tuple[str, float]]:
-    if not weights:
-        return []
-    rows = sorted(weights.items(), key=lambda kv: kv[1], reverse=True)
-    return rows[:top_n]
+def _top_n(items: List[Dict[str, Any]], n: int = 15) -> List[Dict[str, Any]]:
+    return sorted(items, key=lambda x: (x.get("match_score") or 0), reverse=True)[:n]
 
+def write_summary_md(
+    env: Dict[str, str],
+    *,
+    items_ranked: List[Dict[str, Any]],
+    genre_weights: Optional[Dict[str, float]],
+    director_weights: Optional[Dict[str, float]],
+    telemetry: Dict[str, Any],
+) -> None:
+    region = telemetry.get("region") or env.get("REGION") or "US"
+    langs = telemetry.get("original_langs") or env.get("ORIGINAL_LANGS") or "en"
+    subs = telemetry.get("subs_include") or [s.strip() for s in (env.get("SUBS_INCLUDE") or "").split(",") if s.strip()]
 
-def write_summary_md(env: Dict[str, str], *, genre_weights_path: Path) -> None:
-    ranked = _load_json(OUT_DIR / "assistant_ranked.json", {"items": []})
-    feed = _load_json(OUT_DIR / "assistant_feed.json", {"items": [], "telemetry": {}})
-    meta = _load_json(OUT_DIR / "run_meta.json", {})
-    weights = _load_json(genre_weights_path, {})
+    # Read affinity keys (genre/director names only) from telemetry; weights are used implicitly in scoring
+    gnames = telemetry.get("affinity", {}).get("genres_learned") or []
+    dnames = telemetry.get("affinity", {}).get("directors_learned") or []
 
-    items: List[Dict[str, Any]] = ranked.get("items", [])
-    tel = feed.get("telemetry", {})
+    # Telemetry details block
+    tele_lines = [
+        f"*Region*: **{region}**  •  *Original langs*: **{langs}**",
+        f"*Subscriptions filtered*: **{', '.join(subs)}**",
+        f"*Profile size*: **{telemetry.get('profile_size', 0)}**",
+        f"*Inputs*: **{telemetry.get('total_input', 0)}**  •  *Excluded (seen/rated)*: **{telemetry.get('excluded_already_seen', 0)}**",
+        f"*Scored*: **{telemetry.get('scored_total', 0)}**  •  *Score cut*: **{_fmt_score(telemetry.get('score_cut'))}**  •  *Kept*: **{telemetry.get('kept', 0)}**",
+    ]
 
-    region = meta.get("region") or env.get("REGION") or "US"
-    orig_langs = (meta.get("original_langs") or env.get("ORIGINAL_LANGS") or "").strip() or "—"
-    subs = meta.get("subs_include") or (env.get("SUBS_INCLUDE") or "").split(",")
-    subs_disp = ", ".join(s for s in subs if s) or "—"
-
-    # Telemetry / counts
-    cand = int(meta.get("candidates_after_filtering") or tel.get("kept_after_subs") or len(feed.get("items", [])))
-    sources = meta.get("sources") or tel.get("sources") or {}
-    excluded = int(meta.get("excluded_rated_or_list") or tel.get("excluded_rated_or_list") or 0)
-    discover_pages = int(meta.get("discover_pages") or tel.get("discover_pages") or 0)
-    profile_loaded = bool(meta.get("user_profile_loaded") or tel.get("user_profile_loaded") or False)
-
-    # Top genre weights table
-    top_rows = _top_genre_rows(weights, 12)
-
-    # Build “Today’s top picks”
-    lines: List[str] = []
-    lines.append(f"# Daily Recommendations — {os.getenv('GITHUB_RUN_DATE','') or ''}".strip())
-    lines.append("")
-    lines.append(f"*Region*: **{region}**  •  *Original langs*: **{orig_langs}**")
-    lines.append(f"*Subscriptions filtered*: **{subs_disp}**")
-    lines.append(f"*Candidates after filtering*: **{cand}**")
-    lines.append("")
-    lines.append("## Your taste snapshot")
-    lines.append("")
-    if top_rows:
-        lines.append("| Genre | Weight |")
-        lines.append("|---|---:|")
-        for g, w in top_rows:
-            lines.append(f"| {g} | {w:.2f} |")
+    # Taste snapshot tables (names only; weights are baked into match_score)
+    genre_rows = [["Genre", "Seen-basis"]]
+    if gnames:
+        for g in sorted(gnames)[:16]:
+            genre_rows.append([g, "✓"])
     else:
-        lines.append("_No genre evidence yet (ratings not loaded or too sparse)._")
-    lines.append("")
+        genre_rows.append(["—", "—"])
 
-    lines.append("## Telemetry")
-    lines.append("")
-    lines.append(f"- Profile loaded: **{profile_loaded}**")
-    lines.append(f"- Excluded due to your lists/ratings: **{excluded}**")
-    if sources:
-        s_imdb = int(sources.get("imdb_tsv") or 0)
-        s_disc = int(sources.get("tmdb_discover") or 0)
-        s_pers = int(sources.get("persistent") or 0)
-        lines.append(f"- Source mix (merged before filters): IMDb TSV **{s_imdb}**, TMDB Discover **{s_disc}**, Persistent pool **{s_pers}**")
-    if discover_pages:
-        lines.append(f"- TMDB Discover pages queried: **{discover_pages}**")
-    cut = env.get("MIN_MATCH_CUT") or "—"
-    lines.append(f"- Score cut threshold: **{cut}**")
-    lines.append("")
+    director_rows = [["Director", "Seen-basis"]]
+    if dnames:
+        for d in sorted(dnames)[:10]:
+            director_rows.append([d, "✓"])
+    else:
+        director_rows.append(["—", "—"])
 
-    lines.append("## Today’s top picks")
-    lines.append("")
-    for idx, it in enumerate(items[:50], 1):
-        title = it.get("title") or "Untitled"
+    # Top picks rows
+    picks = _top_n(items_ranked, 15)
+    pick_lines: List[str] = []
+    idx = 1
+    for it in picks:
+        t = it.get("title") or "(unknown)"
         year = it.get("year") or "—"
-        mtype = it.get("type") or "movie"
-        score = it.get("match_score") or 0
+        mtype = it.get("type") or it.get("tmdb_media_type") or "title"
         imdb = it.get("imdb_rating")
         provs = it.get("providers") or []
-        prov_txt = ", ".join(provs) if provs else "—"
+        score = _fmt_score(it.get("match_score"))
         why = it.get("why") or ""
-        lines.append(f"{idx}. **{title}** ({year}) — {mtype}")
-        lines.append(f"   *score {score:.1f}  •  IMDb {imdb if imdb is not None else '—'}  •  {prov_txt}*")
-        if why:
-            lines.append(f"   > {why}")
-        lines.append("")
+        prov_txt = ", ".join(sorted(set(provs))) if provs else "—"
+        pick_lines.append(
+            f"{idx}. **{t}** ({year}) — {mtype}\n"
+            f"   *score {score}*  •  IMDb {imdb if imdb is not None else '—'}  •  {prov_txt}\n"
+            f"   > {why}"
+        )
+        idx += 1
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    (OUT_DIR / "summary.md").write_text("\n".join(lines), encoding="utf-8")
+    md = []
+    md.append(f"# Daily Recommendations — {datetime.utcnow().date().isoformat()}")
+    md.append("")
+    md.extend(tele_lines)
+    md.append("")
+    md.append("## Your taste snapshot")
+    md.append("")
+    md.append(_table(genre_rows))
+    md.append("")
+    md.append("### Director affinities")
+    md.append(_table(director_rows))
+    md.append("")
+    md.append("## Today’s top picks")
+    md.append("")
+    if pick_lines:
+        md.extend(pick_lines)
+    else:
+        md.append("_None above the score cut today._")
+    md.append("")
+    md.append(f"---\n_Generated from {telemetry.get('scored_total', 0)} candidate titles (after filtering & exclusions)._")
+
+    (OUT_DIR / "summary.md").write_text("\n".join(md), encoding="utf-8")
