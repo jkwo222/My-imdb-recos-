@@ -34,9 +34,9 @@ class Config:
     show_n: int = 10              # items shown in final feed
 
     # External score weights (signed boost/penalty)
-    # These are *relative weights*—the signed critic/audience signal lands in [-1, +1]
-    weight_critic: float = 0.35
-    weight_audience: float = 0.35
+    # Audience is intentionally weighted higher than critic by default.
+    weight_critic: float = 0.20
+    weight_audience: float = 0.50
 
     # I/O
     cache_dir: str = "data/cache"
@@ -77,8 +77,11 @@ def load_config() -> Config:
     pages_tv = int(os.getenv("DISCOVER_PAGES_TV", "10"))
     shortlist = int(os.getenv("SHORTLIST_SIZE", "50"))
     shown = int(os.getenv("SHOW_N", "10"))
-    w_c = float(os.getenv("WEIGHT_CRITIC", "0.35"))
-    w_a = float(os.getenv("WEIGHT_AUDIENCE", "0.35"))
+
+    # Let env override the new defaults; audience > critic
+    w_c = float(os.getenv("WEIGHT_CRITIC", "0.20"))
+    w_a = float(os.getenv("WEIGHT_AUDIENCE", "0.50"))
+
     conc = int(os.getenv("TMDB_CONCURRENCY", "2"))
     delay = float(os.getenv("TMDB_MIN_DELAY_S", "0.20"))
 
