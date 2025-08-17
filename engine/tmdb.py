@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import hashlib
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional
 
@@ -30,7 +31,7 @@ PROVIDER_ALIASES_US: Dict[str, int] = {
     "apple_tv_plus": 350,
     "peacock": 386,
     "paramount_plus": 531,
-    # optionally extend:
+    # optional extras:
     "tubi": 73,
     "plutotv": 120,
     "starz": 43,
@@ -63,24 +64,23 @@ def _build_session() -> requests.Session:
 _SESSION = _build_session()
 
 # -----------------------------
-# Small disk cache
+# Small disk cache (hashed keys)
 # -----------------------------
 
-def _cache_path(key: str) -> Path:
-    safe = (
-        key.replace("/", "_")
-           .replace("?", "_")
-           .replace("&", "_")
-           .replace("=", "_")
-           .replace("|", "_")
-           .replace(":", "_")
-    )
-    return CACHE_ROOT / f"{safe}.json"
+def _hashed_cache_path(key: str) -> Path:
+    """
+    Use a compact, safe filename based on SHA1 of the key. Include a short prefix
+    for human readability (prefix = text before '__', truncated).
+    """
+    prefix = key.split("__", 1)[0]
+    prefix = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in prefix)[:40]
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
+    return CACHE_ROOT / f"{prefix}-{digest}.json"
 
 def _cache_get(key: str) -> Optional[dict]:
     if not ENABLE_CACHE:
         return None
-    p = _cache_path(key)
+    p = _hashed_cache_path(key)
     if not p.exists():
         return None
     if (time.time() - p.stat().st_mtime) > CACHE_TTL_SECS:
@@ -93,7 +93,7 @@ def _cache_get(key: str) -> Optional[dict]:
 def _cache_set(key: str, obj: dict) -> None:
     if not ENABLE_CACHE:
         return
-    p = _cache_path(key)
+    p = _hashed_cache_path(key)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(obj, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
@@ -142,7 +142,6 @@ def providers_from_env(subs_env: Optional[str], region: Optional[str] = None) ->
     """
     if not subs_env:
         return []
-    # Choose mapping (future: per-region switch)
     mapping = PROVIDER_ALIASES_US
 
     raw_tokens = [t.strip().lower() for t in subs_env.split(",") if t.strip()]
