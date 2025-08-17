@@ -4,9 +4,24 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List
 import csv
+from datetime import datetime
 
-from .cache import load_state, save_state, tmdb_providers_cached, ensure_dirs
-from .imdb_sync import load_ratings_csv, fetch_user_ratings_web, merge_user_sources, to_user_profile
+from .cache import (
+    ensure_dirs,
+    load_state,
+    save_state,
+    tmdb_providers_cached,
+    load_downvoted_set,
+    load_personal_state,
+    save_personal_state,
+)
+from .imdb_sync import (
+    load_ratings_csv,
+    fetch_user_ratings_web,
+    merge_user_sources,
+    to_user_profile,
+)
+from .personalize import genre_weights_from_profile
 
 ROOT = Path(__file__).resolve().parents[1]
 CACHE_DIR = ROOT / "data" / "cache"
@@ -50,7 +65,6 @@ def _merge_basics_ratings(basics: List[Dict[str,str]], ratings: List[Dict[str,st
             year = None
         raw_genres = row.get("genres")
         genres = [g for g in (raw_genres.split(",") if raw_genres else []) if g and g != r"\N"]
-        # Normalize type to 'movie' or 'tv'
         norm_type = "movie"
         if title_type and title_type.startswith("tv") and title_type != "tvMovie":
             norm_type = "tv"
@@ -72,7 +86,6 @@ def _providers_for_item(it: Dict[str,Any], api_key: str, region: str) -> List[st
     """
     tmdb_id = it.get("tmdb_id")
     mtype = (it.get("tmdb_media_type") or it.get("type") or "movie")
-    # Resolve & cache providers (uses imdb tconst/title/year hints if tmdb_id is absent)
     prov = tmdb_providers_cached(
         int(tmdb_id) if tmdb_id else None,
         api_key,
@@ -94,9 +107,14 @@ def _providers_for_item(it: Dict[str,Any], api_key: str, region: str) -> List[st
 def _load_user_profile(env: Dict[str,str]) -> Dict[str,Dict]:
     """
     Loads and merges local ratings.csv and (optionally) your public IMDb ratings via IMDB_USER_ID.
-    The returned dict is keyed by tconst with fields like {"my_rating": 8.0, ...}.
+    Returned dict is keyed by tconst with {"my_rating": 8.0, ...}.
     """
-    local = load_ratings_csv()  # data/user/ratings.csv
+    local = []
+    try:
+        local = load_ratings_csv()  # data/user/ratings.csv
+    except Exception:
+        local = []
+
     remote: List[Dict[str,str]] = []
     uid = (env.get("IMDB_USER_ID") or "").strip()
     if uid:
@@ -104,6 +122,7 @@ def _load_user_profile(env: Dict[str,str]) -> Dict[str,Dict]:
             remote = fetch_user_ratings_web(uid)
         except Exception:
             remote = []
+
     merged = merge_user_sources(local, remote)
     profile = to_user_profile(merged)
     return profile
@@ -121,11 +140,12 @@ def ensure_imdb_cache() -> None:
 def build_catalog(env: Dict[str,str]) -> List[Dict[str,Any]]:
     """
     Returns the filtered, enriched items and writes assistant_feed.json.
-    Persists enrichment across runs so the pool grows and the mapping is reused.
+    Persists enrichment & personalization across runs so recommendations improve over time.
     """
     ensure_dirs()
     ensure_imdb_cache()
 
+    # Load canonical IMDb data
     basics = _load_tsv(IMDB_BASICS)
     ratings = _load_tsv(IMDB_RATINGS)
     items = _merge_basics_ratings(basics, ratings)
@@ -134,15 +154,33 @@ def build_catalog(env: Dict[str,str]) -> List[Dict[str,Any]]:
     persistent = load_state("persistent_pool", default={"items": {}})
     known_items: Dict[str,Any] = dict(persistent.get("items") or {})
 
-    # Merge known enrichment forward into current items
+    # Merge known enrichment forward into current items (fill blanks, don't clobber)
     for it in items:
         k = it["tconst"]
         if k in known_items:
             prev = known_items[k]
-            # Only fill blanks; don't clobber newly-parsed fields
             for kk, vv in prev.items():
                 if kk not in it or it[kk] in (None, "", [], {}):
                     it[kk] = vv
+
+    # Personalization inputs
+    user_profile = _load_user_profile(env)
+    genre_weights = {}
+    try:
+        genre_weights = genre_weights_from_profile(items, user_profile, imdb_id_field="tconst")
+    except Exception:
+        genre_weights = {}
+
+    # Persist a small snapshot for summarize.py (and for debugging)
+    personal_state = {
+        "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "user_profile_size": len(user_profile),
+        "genre_weights": genre_weights,
+    }
+    save_personal_state(personal_state)
+
+    # Feedback (downvotes) -> exclude set
+    downvoted = load_downvoted_set()
 
     # Provider filter setup
     region = (env.get("REGION") or "US").upper()
@@ -151,6 +189,10 @@ def build_catalog(env: Dict[str,str]) -> List[Dict[str,Any]]:
 
     filtered: List[Dict[str,Any]] = []
     for it in items:
+        # Skip anything the user downvoted
+        if it["tconst"] in downvoted:
+            continue
+
         # Resolve providers lazily and cache
         provs = it.get("providers")
         if provs is None:
@@ -162,18 +204,22 @@ def build_catalog(env: Dict[str,str]) -> List[Dict[str,Any]]:
             low = [p.lower() for p in provs]
             keep = any(any(s in p for p in low) for s in subs)
             if not keep:
+                # Even if we don't keep it this run, persist updated enrichment so the pool grows.
+                known_items[it["tconst"]] = {
+                    "tmdb_id": it.get("tmdb_id"),
+                    "tmdb_media_type": it.get("tmdb_media_type") or ("movie" if (it.get("type") == "movie") else "tv"),
+                    "providers": it.get("providers"),
+                    "genres": it.get("genres"),
+                    "title": it.get("title"),
+                    "type": it.get("type"),
+                    "year": it.get("year"),
+                    "imdb_rating": it.get("imdb_rating"),
+                }
                 continue
 
         filtered.append(it)
 
-    # Write out feed used by later stages
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    (OUT_DIR / "assistant_feed.json").write_text(
-        json.dumps(filtered, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-
-    # Persist back anything new we learned for next run
-    for it in filtered:
+        # Persist enrichment for included items
         known_items[it["tconst"]] = {
             "tmdb_id": it.get("tmdb_id"),
             "tmdb_media_type": it.get("tmdb_media_type") or ("movie" if (it.get("type") == "movie") else "tv"),
@@ -185,6 +231,24 @@ def build_catalog(env: Dict[str,str]) -> List[Dict[str,Any]]:
             "imdb_rating": it.get("imdb_rating"),
         }
 
+    # Write out the feed used by later stages
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    (OUT_DIR / "assistant_feed.json").write_text(
+        json.dumps(filtered, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    # Persist back anything new we learned for next run
     save_state("persistent_pool", {"items": known_items})
+
+    # Also persist a tiny “run meta” for debugging/stats if you want to read it elsewhere
+    run_meta = {
+        "updated_at": personal_state["updated_at"],
+        "region": region,
+        "subs_include": subs,
+        "candidates_after_filtering": len(filtered),
+        "downvoted_excluded": len(downvoted),
+        "user_profile_size": personal_state["user_profile_size"],
+    }
+    (OUT_DIR / "run_meta.json").write_text(json.dumps(run_meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
     return filtered
