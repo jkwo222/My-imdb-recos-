@@ -1,147 +1,153 @@
 # engine/feed.py
 from __future__ import annotations
+import os, json, pathlib, time
+from typing import List, Dict, Any, Callable, Tuple
+from rich import print as rprint
 
-import json, os, time, pathlib, random
-from typing import Dict, List, Any, Tuple
-
-from .rank import rank_items, DEFAULT_WEIGHTS
-from .provider_filter import any_allowed
+from .provider_filter import any_allowed, normalize_user_whitelist
 from .recency import should_skip, mark_shown
+from .rank import rank_items, DEFAULT_WEIGHTS
 from .taste import taste_boost_for
 
-OUT_LATEST = pathlib.Path("data/out/latest/assistant_feed.json")
-DEBUG_DIR  = pathlib.Path("data/debug")
-DAILY_DIR  = pathlib.Path("data/out/daily")
-
-def _now_slug() -> str:
-    return time.strftime("%Y-%m-%d", time.gmtime())
-
-def _ensure_dirs():
-    OUT_LATEST.parent.mkdir(parents=True, exist_ok=True)
-    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-    (DAILY_DIR / _now_slug()).mkdir(parents=True, exist_ok=True)
-
-def _parse_subs_env(val: Any) -> List[str]:
-    """
-    Accept CSV: netflix,prime_video,...
-           JSON list: ["netflix","hulu"]
-    """
-    if val is None:
+def _parse_subs_include_env() -> List[str]:
+    raw = os.environ.get("SUBS_INCLUDE", "").strip()
+    if not raw:
         return []
-    if isinstance(val, list):
-        return [str(x).strip() for x in val if str(x).strip()]
-    s = str(val).strip()
-    if not s:
-        return []
-    if s.startswith("[") and s.endswith("]"):
-        try:
-            arr = json.loads(s)
-            if isinstance(arr, list):
-                return [str(x).strip() for x in arr if str(x).strip()]
-        except Exception:
-            pass
-    return [x.strip() for x in s.split(",") if x.strip()]
+    # supports JSON list or CSV or Python-ish list
+    try:
+        import ast
+        if raw.startswith("["):
+            v = ast.literal_eval(raw)
+            if isinstance(v, list):
+                return [str(x) for x in v]
+    except Exception:
+        pass
+    if "," in raw:
+        return [s.strip() for s in raw.split(",") if s.strip()]
+    return [raw]
 
-def _load_weights() -> Dict[str, Any]:
-    path = pathlib.Path("data/weights_live.json")
-    if path.exists():
-        try:
-            w = json.load(open(path, "r"))
-            return {
-                "audience_weight": float(w.get("audience_weight", DEFAULT_WEIGHTS["audience_weight"])),
-                "critic_weight":   float(w.get("critic_weight",   DEFAULT_WEIGHTS["critic_weight"])),
-                "commitment_cost_scale": float(w.get("commitment_cost_scale", DEFAULT_WEIGHTS["commitment_cost_scale"])),
-                "novelty_weight":  float(w.get("novelty_weight", DEFAULT_WEIGHTS["novelty_weight"])),
-                "min_match_cut":   float(w.get("min_match_cut", DEFAULT_WEIGHTS["min_match_cut"])),
-            }
-        except Exception:
-            pass
-    return dict(DEFAULT_WEIGHTS)
+def _weights_from_env(base: Dict[str, Any]) -> Dict[str, Any]:
+    w = dict(base)
+    # let caller adjust audience>critic if desired via env
+    aw = os.environ.get("AUDIENCE_WEIGHT", "")
+    cw = os.environ.get("CRITIC_WEIGHT", "")
+    n  = os.environ.get("NOVELTY_WEIGHT", "")
+    cc = os.environ.get("COMMITMENT_COST_SCALE", "")
+    cut= os.environ.get("MIN_MATCH_CUT", "")
+    if aw:
+        try: w["audience_weight"] = float(aw)
+        except: pass
+    if cw:
+        try: w["critic_weight"] = float(cw)
+        except: pass
+    if n:
+        try: w["novelty_weight"] = float(n)
+        except: pass
+    if cc:
+        try: w["commitment_cost_scale"] = float(cc)
+        except: pass
+    if cut:
+        try: w["min_match_cut"] = float(cut)
+        except: pass
+    # normalize: keep sum <= 1 focus (ranker doesn’t require but nice to keep balanced)
+    s = w.get("audience_weight", 0.65) + w.get("critic_weight", 0.35)
+    if s > 1e-9:
+        w["audience_weight"] /= s
+        w["critic_weight"]   /= s
+    return w
 
-def _debug_write(name: str, payload: Any):
-    p = DEBUG_DIR / f"{_now_slug()}_{name}.json"
-    json.dump(payload, open(p, "w"), indent=2)
+def _ensure_out_paths() -> Tuple[pathlib.Path, pathlib.Path]:
+    latest = pathlib.Path("data/out/latest")
+    daily = pathlib.Path("data/out/daily") / time.strftime("%Y-%m-%d", time.gmtime())
+    latest.mkdir(parents=True, exist_ok=True)
+    daily.mkdir(parents=True, exist_ok=True)
+    return latest, daily
 
-def _apply_provider_filter(pool: List[Dict], subs_keep: List[str]) -> Tuple[List[Dict], Dict[str,int]]:
-    hits = []
-    kept = []
-    for it in pool:
-        ok = any_allowed(it.get("providers") or [], subs_keep)
-        if ok:
-            kept.append(it)
-            hits.append(it.get("providers") or [])
-    # summarize
-    agg: Dict[str,int] = {}
-    for row in hits:
-        for slug in row:
-            agg[slug] = agg.get(slug, 0) + 1
-    return kept, dict(sorted(agg.items(), key=lambda kv: (-kv[1], kv[0])))
-
-def _drop_recent(pool: List[Dict]) -> List[Dict]:
+def _drop_recents(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out = []
-    for it in pool:
+    for it in items:
         iid = (it.get("imdb_id") or "").strip()
         if iid and should_skip(iid, days=4):
             continue
         out.append(it)
     return out
 
-def build_feed(catalog: List[Dict],
-               seen_filter: callable,
-               taste_profile: Dict[str, float]) -> Dict[str, Any]:
-    _ensure_dirs()
+def _provider_filter(items: List[Dict[str, Any]], subs: List[str]) -> List[Dict[str, Any]]:
+    if not subs:
+        return items
+    wl = normalize_user_whitelist(subs)
+    out = []
+    for it in items:
+        providers = it.get("providers") or []
+        if any_allowed(providers, list(wl)):
+            out.append(it)
+    return out
 
-    subs_env = os.environ.get("SUBS_INCLUDE")
-    subs_keep = _parse_subs_env(subs_env)  # [] means “use default allow-list inside any_allowed”
-    weights = _load_weights()
+def build_feed(
+    catalog: List[Dict[str, Any]],
+    seen_filter: Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]],
+    taste_profile: Dict[str, float],
+) -> Dict[str, Any]:
+    # --- initial pool
+    initial_n = len(catalog)
 
-    # 1) provider filter (if we have a keep-list OR allow defaults)
-    pool0 = catalog or []
-    pool1, prov_stats = _apply_provider_filter(pool0, subs_keep or [])
-    _debug_write("step1_providers", {"in": len(pool0), "out": len(pool1), "subs_keep": subs_keep, "stats": prov_stats})
+    # --- providers
+    subs = _parse_subs_include_env()
+    kept = _provider_filter(catalog, subs)
+    providers_n = len(kept)
+    rprint(f"provider-filter keep={subs or '[ALL baseline]'} → {providers_n} items")
 
-    # 2) seen filter (by title/year & imdb id)
-    pool2 = seen_filter(pool1)
-    _debug_write("step2_unseen", {"in": len(pool1), "out": len(pool2)})
+    # --- seen
+    unseen = seen_filter(kept)
+    unseen_n = len(unseen)
+    rprint(f"unseen-only → {unseen_n} items")
 
-    # 3) recency filter (avoid re-showing for a few days)
-    pool3 = _drop_recent(pool2)
-    _debug_write("step3_recency", {"in": len(pool2), "out": len(pool3)})
+    # --- recency
+    fresh = _drop_recents(unseen)
+    fresh_n = len(fresh)
 
-    # 4) rank
-    def _taste_for(genres: List[str]) -> float:
+    # --- ranking
+    w = _weights_from_env(DEFAULT_WEIGHTS)
+    def tboost(genres: List[str]) -> float:
         return taste_boost_for(genres, taste_profile)
 
-    ranked = rank_items(pool3, weights, taste_for=_taste_for)
-    cut = float(weights.get("min_match_cut", 58.0))
-    strong = [r for r in ranked if r.get("match", 0.0) >= cut]
+    ranked = rank_items(fresh, w, taste_for=tboost)
 
-    # Fallbacks to avoid empty feeds
-    final: List[Dict]
-    if not strong and ranked:
-        # keep top 30 anyway
-        final = ranked[:30]
-    else:
-        final = strong[:50]
+    # Optional minimum match cut (default in DEFAULT_WEIGHTS)
+    min_cut = float(w.get("min_match_cut", 58.0))
+    final = [r for r in ranked if float(r.get("match", 0.0)) >= min_cut]
 
-    # Mark shown for recency shielding next time
-    mark_shown([ (r.get("imdb_id") or "").strip() for r in final ])
+    # If too strict and ends up empty, back off to top 20
+    if not final and ranked:
+        final = ranked[:20]
 
-    out_payload = {
+    # mark recency “shown”
+    mark_shown([ (it.get("imdb_id") or "") for it in final ])
+
+    latest_dir, daily_dir = _ensure_out_paths()
+    blob = {
         "generated_at": int(time.time()),
         "count": len(final),
         "items": final,
         "meta": {
-            "pool_sizes": {"initial": len(pool0), "providers": len(pool1), "unseen": len(pool2), "post_recency": len(pool3), "ranked": len(ranked)},
-            "provider_stats": prov_stats,
-            "weights": weights,
-            "subs_keep": subs_keep,
-        },
+            "pool_sizes": {
+                "initial": initial_n,
+                "providers": providers_n,
+                "unseen": unseen_n,
+                "fresh": fresh_n,
+                "final": len(final),
+            },
+            "weights": w,
+            "subs": subs,
+        }
     }
+    # write both locations (latest + daily)
+    latest_path = latest_dir / "assistant_feed.json"
+    daily_path  = daily_dir / "assistant_feed.json"
+    with open(latest_path, "w", encoding="utf-8") as f:
+        json.dump(blob, f, indent=2)
+    with open(daily_path, "w", encoding="utf-8") as f:
+        json.dump(blob, f, indent=2)
 
-    # Write latest + daily
-    json.dump(out_payload, open(OUT_LATEST, "w"), indent=2)
-    daily_path = DAILY_DIR / _now_slug() / "assistant_feed.json"
-    json.dump(out_payload, open(daily_path, "w"), indent=2)
-
-    return out_payload
+    rprint(f"[green]feed written[/green] → {latest_path}")
+    return blob
