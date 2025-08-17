@@ -2,7 +2,7 @@ name: nightly
 
 on:
   schedule:
-    - cron: "17 9 * * *"   # run daily; adjust as desired
+    - cron: "17 9 * * *"
   workflow_dispatch:
 
 jobs:
@@ -11,20 +11,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        attempt: [1, 2, 3, 4, 5, 6, 7]   # up to 7 runs is fine
+        attempt: [1, 2, 3, 4, 5, 6, 7]
     env:
       PYTHONUTF8: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
-      # --- Engine env defaults (can override in repo/env or Secrets) ---
       REGION: US
       ORIGINAL_LANGS: '["en"]'
-      # Expand pages searched per run:
-      DISCOVER_PAGES: "9"
-      # SUBS_INCLUDE can be overridden at repo/Org level; common set shown:
+      # Expand # of TMDB pages searched each run
+      DISCOVER_PAGES: "12"
       SUBS_INCLUDE: "netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus"
-      # Optional IMDb scraping of public ratings page:
-      IMDB_USER_ID: "${{ secrets.IMDB_USER_ID }}"
-      TMDB_ACCESS_TOKEN: "${{ secrets.TMDB_ACCESS_TOKEN }}"
+      IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
+      TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
 
     steps:
       - name: Checkout
@@ -41,15 +38,15 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: pip-${{ runner.os }}-py311-${{ hashFiles('**/requirements*.txt') }}
+          key: "pip-${{ runner.os }}-py311-${{ hashFiles('**/requirements*.txt') }}"
           restore-keys: |
             pip-${{ runner.os }}-py311-
 
       - name: Install deps
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # If your engine has an extra file:
           if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
 
       - name: Run pipeline (attempt ${{ matrix.attempt }})
@@ -57,29 +54,20 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-
-          # Make sure output dirs exist
-          mkdir -p data/out
-          mkdir -p data/cache
-
-          # Run your engine
+          mkdir -p data/out data/cache
           python -m engine.runner
-
-          echo "RUN_DONE=1" >> $GITHUB_OUTPUT
+          echo "RUN_DONE=1" >> "$GITHUB_OUTPUT"
 
       - name: Prepare 'latest' folder
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-
-          # Create a stable 'latest' pointer for artifacts
           if compgen -G "data/out/run_*" > /dev/null; then
             latest_dir="$(ls -dt data/out/run_* | head -n1)"
             rm -rf data/out/latest
             mkdir -p data/out
             cp -r "$latest_dir" "data/out/latest"
-
             echo "Latest run directory: $latest_dir"
             ls -al "data/out/latest" || true
           else
@@ -91,23 +79,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          rm -f debug-data.zip
           mkdir -p debug-bundle
           if [ -d "data/out/latest" ]; then
-            # copy only small, high-signal files
             cp -f data/out/latest/runner.log debug-bundle/ 2>/dev/null || true
             cp -f data/out/latest/assistant_feed.json debug-bundle/ 2>/dev/null || true
             cp -f data/out/latest/items.discovered.json debug-bundle/ 2>/dev/null || true
             cp -f data/out/latest/items.enriched.json debug-bundle/ 2>/dev/null || true
             cp -f data/out/latest/summary.md debug-bundle/ 2>/dev/null || true
           fi
-
-          # Add basic environment footprints helpful for debugging
-          echo "REGION=${REGION}" > debug-bundle/env.txt
-          echo "SUBS_INCLUDE=${SUBS_INCLUDE}" >> debug-bundle/env.txt
-          echo "ORIGINAL_LANGS=${ORIGINAL_LANGS}" >> debug-bundle/env.txt
-          echo "DISCOVER_PAGES=${DISCOVER_PAGES}" >> debug-bundle/env.txt
-
-          # Zip it
+          {
+            echo "REGION=${REGION}"
+            echo "SUBS_INCLUDE=${SUBS_INCLUDE}"
+            echo "ORIGINAL_LANGS=${ORIGINAL_LANGS}"
+            echo "DISCOVER_PAGES=${DISCOVER_PAGES}"
+          } > debug-bundle/env.txt
           (cd debug-bundle && zip -q -r ../debug-data.zip .) || true
           ls -lh debug-data.zip || true
 
@@ -125,33 +111,15 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: site-out-attempt-${{ matrix.attempt }}
-          path: data/out/latest/**
+          path: data/out/latest
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Cleanup (trim caches & old runs)
+      - name: Cleanup old run folders
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          # prune pip caches a bit
-          python - <<'PY'
-import os, shutil, pathlib
-base = pathlib.Path.home() / ".cache" / "pip" / "http"
-if base.exists():
-    # keep most recent 500 files
-    files = sorted((p for p in base.rglob("*") if p.is_file()), key=lambda p: p.stat().st_mtime, reverse=True)
-    for p in files[500:]:
-        try:
-            p.unlink()
-        except Exception:
-            pass
-PY
-          # keep only 5 newest run_* dirs (plus the 'latest' copy we made)
           if compgen -G "data/out/run_*" > /dev/null; then
-            mapfile -t runs < <(ls -dt data/out/run_* | tail -n +6 || true)
-            for r in "${runs[@]:-}"; do
-              echo "Removing old run dir: $r"
-              rm -rf "$r"
-            done
+            ls -dt data/out/run_* | tail -n +6 | xargs -r rm -rf --
           fi
