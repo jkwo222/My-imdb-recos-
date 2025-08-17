@@ -4,13 +4,13 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 import csv
+import time
 
 from .cache import load_state, save_state
 from .imdb_sync import (
     load_ratings_csv,
     fetch_user_ratings_web,
     merge_user_sources,
-    to_user_profile,
 )
 from .tmdb_detail import enrich_items_with_tmdb
 from .tmdb import (
@@ -29,6 +29,7 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 IMDB_BASICS = IMDB_CACHE / "title.basics.tsv"
 IMDB_RATINGS = IMDB_CACHE / "title.ratings.tsv"
 
+
 # ---------- IMDb TSV helpers --------------------------------------------------
 
 def _load_tsv(path: Path) -> List[Dict[str, str]]:
@@ -39,6 +40,7 @@ def _load_tsv(path: Path) -> List[Dict[str, str]]:
         reader = csv.DictReader(f, delimiter="\t")
         rows.extend(reader)
     return rows
+
 
 def _merge_basics_ratings(
     basics: List[Dict[str, str]],
@@ -76,9 +78,11 @@ def _merge_basics_ratings(
                 "year": year,
                 "genres": genres,
                 "imdb_rating": row.get("imdb_rating"),
+                "_origin_imdb_tsv": True,   # mark source
             }
         )
     return items
+
 
 # ---------- TMDB discover (always on) ----------------------------------------
 
@@ -123,6 +127,7 @@ def _seed_from_tmdb(env: Dict[str, str]) -> List[Dict[str, Any]]:
                     "title": title,
                     "year": year,
                     "type": "movie",
+                    "_origin_tmdb_discover": True,  # mark source
                 }
             )
 
@@ -147,10 +152,12 @@ def _seed_from_tmdb(env: Dict[str, str]) -> List[Dict[str, Any]]:
                     "title": title,
                     "year": year,
                     "type": "tvSeries",
+                    "_origin_tmdb_discover": True,  # mark source
                 }
             )
 
     return items
+
 
 # ---------- Merge helpers -----------------------------------------------------
 
@@ -165,8 +172,9 @@ def _key_for_item(it: Dict[str, Any]) -> Tuple[str, str]:
     media = (it.get("tmdb_media_type") or ("tv" if it.get("type") != "movie" else "movie")).strip()
     if tmdb_id:
         return ("tmdb", f"{media}:{tmdb_id}")
-    # Last resort: title+year+type (not great, but avoids total loss)
+    # Last resort: title+year+type (not ideal, but avoids total loss)
     return ("title", f"{(it.get('type') or '').lower()}|{(it.get('title') or '').strip()}|{it.get('year') or ''}")
+
 
 def _merge_sources(*sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -176,78 +184,91 @@ def _merge_sources(*sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if key not in merged:
                 merged[key] = dict(it)
             else:
-                # Shallow merge: prefer existing non-empty, fill blanks from new
                 cur = merged[key]
+                # Shallow merge: prefer existing non-empty, fill blanks from new
                 for k, v in it.items():
                     if k not in cur or cur[k] in (None, "", [], {}):
                         cur[k] = v
+                # keep source flags if any
+                for flag in ("_origin_imdb_tsv", "_origin_tmdb_discover", "_origin_persist"):
+                    if it.get(flag):
+                        cur[flag] = True
     return list(merged.values())
 
-# ---------- User profile (available for future scoring) ----------------------
-
-def _load_user_profile(env: Dict[str, str]) -> Dict[str, Dict]:
-    local = load_ratings_csv()  # data/user/ratings.csv (may be empty)
-    remote: List[Dict[str, str]] = []
-    uid = (env.get("IMDB_USER_ID") or "").strip()
-    if uid:
-        remote = fetch_user_ratings_web(uid)
-    merged = merge_user_sources(local, remote)
-    profile = to_user_profile(merged)
-    return profile
 
 # ---------- Public API --------------------------------------------------------
 
 def build_catalog(env: Dict[str, str]) -> List[Dict[str, Any]]:
     """
-    Build the daily candidate pool:
-      1) Load IMDb TSV items (if TSVs exist).
-      2) Load persistent pool from prior runs.
-      3) ALWAYS seed fresh items from TMDB Discover.
-      4) Merge + enrich via TMDB (adds imdb_id, vote averages, genres, providers).
-      5) Filter by SUBS_INCLUDE provider names.
-      6) Persist back a slim map so the pool grows over time.
-      7) Write assistant_feed.json and run_meta.json.
+    Build the daily candidate pool with telemetry.
     """
-    # (1) IMDb TSVs (optional)
+    t0 = time.time()
+
+    # (A) IMDb TSVs (optional)
     basics = _load_tsv(IMDB_BASICS)
     ratings = _load_tsv(IMDB_RATINGS)
     used_imdb = bool(basics and ratings)
     items_imdb: List[Dict[str, Any]] = _merge_basics_ratings(basics, ratings) if used_imdb else []
 
-    # (2) Persistent pool
+    # (B) Persistent pool
     persistent = load_state("persistent_pool", default={"items": {}})
     known_items_map: Dict[str, Any] = persistent.get("items", {})
     items_persist: List[Dict[str, Any]] = []
     for k, v in known_items_map.items():
-        items_persist.append(
-            {
-                "tconst": k,
-                "title": v.get("title"),
-                "type": v.get("type") or "movie",
-                "year": v.get("year"),
-                "genres": v.get("genres") or [],
-                "imdb_rating": v.get("imdb_rating"),
-                "tmdb_id": v.get("tmdb_id"),
-                "tmdb_media_type": v.get("tmdb_media_type"),
-                "providers": v.get("providers") or [],
-                "imdb_id": v.get("imdb_id") or k,  # in case we stored imdb_id instead of tconst
-            }
-        )
+        row = {
+            "tconst": k if k.startswith("tt") else v.get("imdb_id"),
+            "title": v.get("title"),
+            "type": v.get("type") or "movie",
+            "year": v.get("year"),
+            "genres": v.get("genres") or [],
+            "imdb_rating": v.get("imdb_rating"),
+            "tmdb_id": v.get("tmdb_id"),
+            "tmdb_media_type": v.get("tmdb_media_type"),
+            "providers": v.get("providers") or [],
+            "imdb_id": v.get("imdb_id") or k,
+            "_origin_persist": True,  # mark source
+        }
+        items_persist.append(row)
 
-    # (3) Fresh TMDB discover (always)
+    # (C) Fresh TMDB discover (always)
     items_tmdb = _seed_from_tmdb(env)
 
-    # (4a) Merge sources (IMDb TSVs + persisted + fresh discover)
+    # (D) Merge all sources
     items = _merge_sources(items_imdb, items_persist, items_tmdb)
 
-    # (4b) Enrich via TMDB (adds imdb_id/tconst mapping, providers, votes, genres…)
+    # (E) Enrich via TMDB (adds imdb_id/tconst mapping, providers, votes, genres…)
     region = (env.get("REGION") or "US").upper()
     api_key = env.get("TMDB_API_KEY") or ""
     if api_key and items:
         enrich_items_with_tmdb(items, api_key=api_key, region=region)
 
-    # (5) Provider filter using human-readable provider names
+    # (F) Exclude items from user's lists (ratings.csv + public IMDb list)
+    #     We count each exclusion reason separately.
+    local_rows = load_ratings_csv()  # may be empty
+    uid = (env.get("IMDB_USER_ID") or "").strip()
+    remote_rows = fetch_user_ratings_web(uid) if uid else []
+
+    # sets of imdb ids/tconsts
+    local_ids = {str(r.get("tconst") or r.get("imdb_id")).strip() for r in local_rows if (r.get("tconst") or r.get("imdb_id"))}
+    remote_ids = {str(r.get("tconst") or r.get("imdb_id")).strip() for r in remote_rows if (r.get("tconst") or r.get("imdb_id"))}
+
+    excl_local = 0
+    excl_remote = 0
+    remaining_after_user = []
+    for it in items:
+        tconst = (it.get("tconst") or it.get("imdb_id") or "").strip()
+        if tconst and tconst in local_ids:
+            excl_local += 1
+            continue
+        if tconst and tconst in remote_ids:
+            excl_remote += 1
+            continue
+        remaining_after_user.append(it)
+    items = remaining_after_user
+
+    # (G) Provider filter using human-readable provider names
     subs = [s.strip().lower() for s in (env.get("SUBS_INCLUDE") or "").split(",") if s.strip()]
+    excl_providers = 0
     filtered: List[Dict[str, Any]] = []
     for it in items:
         provs = it.get("providers") or []
@@ -255,10 +276,12 @@ def build_catalog(env: Dict[str, str]) -> List[Dict[str, Any]]:
             low = [p.lower() for p in provs]
             keep = any(any(s in p for p in low) for s in subs)
             if not keep:
+                excl_providers += 1
                 continue
         filtered.append(it)
 
-    # (6) Persist back a slim record so the pool grows
+    # (H) Persist back a slim record so the pool grows
+    pre_keys = set(known_items_map.keys())
     for it in filtered:
         # prefer tconst / imdb_id as map key if present
         tconst = (it.get("tconst") or it.get("imdb_id") or "").strip()
@@ -277,8 +300,17 @@ def build_catalog(env: Dict[str, str]) -> List[Dict[str, Any]]:
             "imdb_id": it.get("imdb_id") or it.get("tconst"),
         }
     save_state("persistent_pool", {"items": known_items_map})
+    post_keys = set(known_items_map.keys())
+    newly_added_to_pool = len(post_keys - pre_keys)
 
-    # (7) Write outputs
+    # (I) Count source usage among final candidates
+    src_counts = {
+        "from_imdb_tsv": sum(1 for it in filtered if it.get("_origin_imdb_tsv")),
+        "from_tmdb_discover": sum(1 for it in filtered if it.get("_origin_tmdb_discover")),
+        "from_persist": sum(1 for it in filtered if it.get("_origin_persist")),
+    }
+
+    # (J) Write outputs
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     (OUT_DIR / "assistant_feed.json").write_text(
         json.dumps({"items": filtered}, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -286,21 +318,38 @@ def build_catalog(env: Dict[str, str]) -> List[Dict[str, Any]]:
 
     meta = {
         "telemetry": {
-            "using_imdb": used_imdb,
-            "counts": {
-                "imdb_tsv": len(items_imdb),
-                "persist_prior": len(items_persist),
-                "tmdb_discover": len(items_tmdb),
-                "merged_total_before_filter": len(items),
-                "kept_after_filter": len(filtered),
-            },
             "region": region,
             "original_langs": env.get("ORIGINAL_LANGS") or None,
             "subs_include": subs,
+            "counts": {
+                "imdb_tsv_loaded": len(items_imdb),
+                "persist_loaded": len(items_persist),
+                "tmdb_discover_loaded": len(items_tmdb),
+                "merged_total_before_user_filter": len(_merge_sources(items_imdb, items_persist, items_tmdb)),
+                "excluded_user_ratings_csv": excl_local,
+                "excluded_public_imdb_list": excl_remote,
+                "after_user_filters": len(items),
+                "excluded_by_provider_filter": excl_providers,
+                "kept_after_filter": len(filtered),
+            },
+            "final_source_mix": src_counts,
+            "pool": {
+                "pool_size_after_save": len(known_items_map),
+                "newly_added_this_run": newly_added_to_pool,
+                "cached_reused_this_run": len(filtered) - newly_added_to_pool if len(filtered) >= newly_added_to_pool else 0,
+            },
+            "using_imdb_tsv": used_imdb,
+            "timing_sec": round(time.time() - t0, 2),
         }
     }
     (OUT_DIR / "run_meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+    # Clean transient flags so downstream consumers don’t rely on them
+    for it in filtered:
+        for flag in ("_origin_imdb_tsv", "_origin_tmdb_discover", "_origin_persist"):
+            if flag in it:
+                del it[flag]
 
     return filtered
