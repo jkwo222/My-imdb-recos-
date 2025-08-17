@@ -12,22 +12,38 @@ mkdir -p "$BUNDLE_DIR"
 
 # 1) Include most recent run outputs if present
 if [[ -d "data/out/latest" ]]; then
-  cp -f data/out/latest/runner.log         "$BUNDLE_DIR/" 2>/dev/null || true
-  cp -f data/out/latest/assistant_feed.json "$BUNDLE_DIR/" 2>/dev/null || true
+  cp -f data/out/latest/runner.log            "$BUNDLE_DIR/" 2>/dev/null || true
+  cp -f data/out/latest/assistant_feed.json   "$BUNDLE_DIR/" 2>/dev/null || true
   cp -f data/out/latest/items.discovered.json "$BUNDLE_DIR/" 2>/dev/null || true
   cp -f data/out/latest/items.enriched.json   "$BUNDLE_DIR/" 2>/dev/null || true
-  cp -f data/out/latest/summary.md         "$BUNDLE_DIR/" 2>/dev/null || true
-  cp -f data/out/latest/options.sanity.json "$BUNDLE_DIR/" 2>/dev/null || true
-  cp -f data/out/latest/links.sanity.json   "$BUNDLE_DIR/" 2>/dev/null || true
+  cp -f data/out/latest/summary.md            "$BUNDLE_DIR/" 2>/dev/null || true
+  cp -f data/out/latest/diag.json             "$BUNDLE_DIR/" 2>/dev/null || true
 fi
 
-# 2) Environment capture
+# 2) Environment capture (minimal + sanitized full)
 {
   echo "REGION=${REGION:-}"
   echo "SUBS_INCLUDE=${SUBS_INCLUDE:-}"
   echo "ORIGINAL_LANGS=${ORIGINAL_LANGS:-}"
   echo "DISCOVER_PAGES=${DISCOVER_PAGES:-}"
 } > "$BUNDLE_DIR/env.txt"
+
+{
+  # redact secrets but show presence
+  for k in TMDB_API_KEY OMDB_API_KEY IMDB_USER_ID IMDB_RATINGS_CSV_PATH; do
+    v="${!k:-}"
+    if [[ -n "${v}" ]]; then
+      echo "$k=<set>"
+    else
+      echo "$k=<missing>"
+    fi
+  done
+  # dump a few useful vars verbatim
+  echo "REGION=${REGION:-}"
+  echo "SUBS_INCLUDE=${SUBS_INCLUDE:-}"
+  echo "ORIGINAL_LANGS=${ORIGINAL_LANGS:-}"
+  echo "DISCOVER_PAGES=${DISCOVER_PAGES:-}"
+} > "$BUNDLE_DIR/env-sanitized.txt"
 
 # 3) Git state
 {
@@ -39,49 +55,37 @@ fi
   echo
   echo "== git remote -v =="
   git remote -v || true
-  echo
-  echo "== modified/untracked (head) =="
-  git ls-files -m -o --exclude-standard | sed -n '1,200p' || true
 } > "$BUNDLE_DIR/git.txt"
 
-# 4) Symlink + paths info
+# 4) Tree + listings
 {
-  echo "last_run_dir.txt:"
-  if [[ -f "data/out/last_run_dir.txt" ]]; then
-    cat data/out/last_run_dir.txt
-  else
-    echo "<missing>"
-  fi
+  echo "# REPO TREE (find .)"
+  find . -maxdepth 3 -printf "%y %M %u %g %8s %TY-%Tm-%Td %TH:%TM:%TS %p\n" 2>/dev/null || true
   echo
-  echo "data/out listing:"
+  echo "# data/out (top)"
   ls -alh "data/out" 2>/dev/null || echo "<no data/out>"
   echo
-  echo "latest details:"
+  echo "# data/out/latest (top)"
+  ls -alh "data/out/latest" 2>/dev/null || echo "<no latest>"
+  echo
+  echo "# data/cache (top)"
+  ls -alh "data/cache" 2>/dev/null || echo "<no cache>"
+} > "$BUNDLE_DIR/listings.txt"
+
+# 5) Symlink diagnostics
+{
+  echo "# SYMLINK TARGETS"
   if [[ -e "data/out/latest" ]]; then
-    echo "exists: yes"
     if [[ -L "data/out/latest" ]]; then
-      echo "is_symlink: yes"
-      echo -n "readlink: "; readlink "data/out/latest" || true
-      echo -n "realpath: "; realpath "data/out/latest" || true
+      echo -n "latest -> "; readlink "data/out/latest" || true
+      echo -n "latest realpath -> "; realpath "data/out/latest" || true
     else
-      echo "is_symlink: no"
-      echo "type: $(stat -c %F data/out/latest || echo '?')"
+      echo "data/out/latest is not a symlink"
     fi
   else
-    echo "exists: no"
+    echo "data/out/latest missing"
   fi
 } > "$BUNDLE_DIR/links.txt"
-
-# 5) File tree (compact)
-{
-  if command -v tree >/dev/null 2>&1; then
-    echo "== tree -a -L 3 . =="
-    tree -a -L 3 .
-  else
-    echo "== find (tree not available) =="
-    find . -maxdepth 3 -print
-  fi
-} > "$BUNDLE_DIR/listings.txt"
 
 # 6) Disk usage snapshot
 {
@@ -94,17 +98,15 @@ fi
 
 # 7) Python info
 {
-  echo "== python -V =="
+  echo "# Python info"
+  which python || true
   python -V 2>&1 || true
   echo
-  echo "== which python =="
-  which python || true
-  echo
-  echo "== pip freeze (top 100) =="
-  pip freeze | sed -n '1,100p' || true
+  echo "# pip freeze"
+  pip freeze || true
 } > "$BUNDLE_DIR/python.txt"
 
-# 8) Runner sanity (double-check latest points correctly)
+# 8) Runner latest sanity (double-check latest points correctly)
 {
   echo "== runner latest sanity =="
   if [[ -L "data/out/latest" ]]; then
