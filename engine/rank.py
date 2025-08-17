@@ -4,10 +4,10 @@ from typing import Dict, List, Any
 
 # Default: audience > critic
 DEFAULT_WEIGHTS = {
-    "audience_weight": 0.65,   # you care more about the audience score
+    "audience_weight": 0.65,   # audience emphasized
     "critic_weight":   0.35,
     "commitment_cost_scale": 1.0,
-    "novelty_weight":  0.15,   # small tie-breaker
+    "novelty_weight":  0.15,
     "min_match_cut":   58.0,
 }
 
@@ -46,7 +46,7 @@ def score_item(it: Dict[str, Any], w: Dict[str, Any], taste_boost: float = 0.0) 
     # audience (prefer imdb/audience -> tmdb)
     if it.get("audience") not in (None, ""):
         audience_01 = float(it["audience"])
-        if audience_01 > 1.0:  # if given as 0..10
+        if audience_01 > 1.0:
             audience_01 = _to_01(audience_01, 0.0, 10.0)
     elif it.get("imdb_rating") not in (None, ""):
         audience_01 = _to_01(it["imdb_rating"], 0.0, 10.0)
@@ -56,7 +56,7 @@ def score_item(it: Dict[str, Any], w: Dict[str, Any], taste_boost: float = 0.0) 
     # critic (prefer rt -> tmdb)
     if it.get("critic") not in (None, ""):
         critic_01 = float(it["critic"])
-        if critic_01 > 1.0:  # if given as %
+        if critic_01 > 1.0:
             critic_01 = _to_01(critic_01, 0.0, 100.0)
     elif it.get("rt") not in (None, ""):
         critic_01 = _to_01(it["rt"], 0.0, 100.0)
@@ -68,7 +68,7 @@ def score_item(it: Dict[str, Any], w: Dict[str, Any], taste_boost: float = 0.0) 
     bonus   = _novelty_bonus(it, nw)
     match = base + taste_boost + bonus - penalty
 
-    # map to 0..100 with neutral area ~50–65
+    # map to 0..100 with neutral ~50–65
     score = 60.0 + 20.0 * match
     return round(max(40.0, min(99.0, score)), 1)
 
@@ -93,3 +93,7 @@ def rank_items(items: List[Dict[str, Any]],
         out.append(row)
     out.sort(key=lambda r: r.get("match", 0.0), reverse=True)
     return out
+
+# --- Back-compat shim for older runner imports ---
+def rank_candidates(items: List[Dict[str, Any]], w: Dict[str, Any], taste_for: callable | None = None):
+    return rank_items(items, w, taste_for=taste_for)
