@@ -3,41 +3,27 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
-import os
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-def _load_json(p: Path) -> Any:
+# ---------- helpers ----------
+
+def _load_json(p: Optional[Path]) -> Any:
+    if not p:
+        return None
     try:
         return json.loads(p.read_text(encoding="utf-8", errors="replace"))
     except Exception:
         return None
 
-def _coerce_list(x) -> List[Any]:
+def _as_list(x) -> List[str]:
     if x is None:
         return []
     if isinstance(x, list):
-        return x
+        return [str(v) for v in x]
     if isinstance(x, str):
         return [s.strip() for s in x.split(",") if s.strip()]
-    return [x]
-
-def _audience_0_100(it: Dict[str, Any]) -> float:
-    # Prefer normalized audience if present; else coerce tmdb_vote (0..10) -> 0..100
-    aud = it.get("audience")
-    try:
-        a = float(aud)
-        return max(0.0, min(100.0, a if a > 10.0 else a * 10.0))
-    except Exception:
-        pass
-    tv = it.get("tmdb_vote")
-    try:
-        v = float(tv)
-        return max(0.0, min(100.0, v * 10.0 if v <= 10.0 else v))
-    except Exception:
-        pass
-    return 50.0
+    return [str(x)]
 
 def _score(it: Dict[str, Any]) -> float:
     try:
@@ -45,188 +31,206 @@ def _score(it: Dict[str, Any]) -> float:
     except Exception:
         return 0.0
 
+def _aud_0_100(it: Dict[str, Any]) -> float:
+    # Prefer normalized audience; else tmdb_vote (0..10) → 0..100
+    for k in ("audience", "tmdb_vote"):
+        v = it.get(k)
+        try:
+            f = float(v)
+        except Exception:
+            continue
+        if f <= 10.0:
+            f *= 10.0
+        return max(0.0, min(100.0, f))
+    return 50.0
+
 def _providers(it: Dict[str, Any]) -> List[str]:
-    provs = it.get("providers") or it.get("providers_slugs") or []
-    return [p for p in provs if isinstance(p, str)]
+    p = it.get("providers") or it.get("providers_slugs") or []
+    return [s for s in p if isinstance(s, str)]
+
+def _prettify_provider(slug: str) -> str:
+    # friendly names for common slugs; fallback to Title Case
+    MAP = {
+        "apple_tv_plus": "Apple TV+",
+        "prime_video": "Prime Video",
+        "disney_plus": "Disney+",
+        "paramount_plus": "Paramount+",
+        "max": "Max",
+        "netflix": "Netflix",
+        "hulu": "Hulu",
+        "peacock": "Peacock",
+        "peacock_premium": "Peacock Premium",
+        "starz": "STARZ",
+        "showtime": "Showtime",
+        "amc_plus": "AMC+",
+        "criterion_channel": "Criterion Channel",
+        "mubi": "MUBI",
+    }
+    if not isinstance(slug, str):
+        return str(slug)
+    s = slug.strip().lower()
+    if s in MAP: return MAP[s]
+    return " ".join(w.capitalize() for w in s.split("_"))
 
 def _fmt_providers(provs: List[str], maxn: int = 3) -> str:
     if not provs:
         return "—"
-    short = provs[:maxn]
-    if len(provs) > maxn:
-        return ", ".join(short) + "…"
-    return ", ".join(short)
+    friendly = [_prettify_provider(p) for p in provs]
+    short = friendly[:maxn]
+    return ", ".join(short) + ("…" if len(friendly) > maxn else "")
 
 def _imdb_link(it: Dict[str, Any]) -> Optional[str]:
     imdb = it.get("imdb_id")
-    if imdb and isinstance(imdb, str):
-        return f"https://www.imdb.com/title/{imdb}/"
-    return None
+    return f"https://www.imdb.com/title/{imdb}/" if isinstance(imdb, str) and imdb else None
 
 def _tmdb_link(it: Dict[str, Any]) -> Optional[str]:
     tid = it.get("tmdb_id")
-    mt = (it.get("media_type") or "").lower()
-    if not tid or not mt:
+    kind = (it.get("media_type") or "").lower()
+    if not tid or not kind:
         return None
-    if mt == "movie":
-        return f"https://www.themoviedb.org/movie/{int(tid)}"
-    return f"https://www.themoviedb.org/tv/{int(tid)}"
+    try:
+        tid = int(tid)
+    except Exception:
+        return None
+    return f"https://www.themoviedb.org/{'movie' if kind=='movie' else 'tv'}/{tid}"
 
-def _bullet_line(it: Dict[str, Any]) -> str:
+def _emoji_for_kind(kind: str) -> str:
+    kind = (kind or "").lower()
+    return "🍿" if kind == "movie" else "📺"
+
+def _bullet(it: Dict[str, Any]) -> str:
+    kind = it.get("media_type") or ""
+    emoji = _emoji_for_kind(kind)
     title = it.get("title") or it.get("name") or "—"
     year = it.get("year") or ""
     sc = _score(it)
-    aud = _audience_0_100(it)
+    aud = _aud_0_100(it)
     prov = _fmt_providers(_providers(it))
-    why = it.get("why") or ""
+    why = (it.get("why") or "").strip()
+
     links = []
     imdb = _imdb_link(it)
-    if imdb: links.append(f"[IMDb]({imdb})")
     tmdb = _tmdb_link(it)
+    if imdb: links.append(f"[IMDb]({imdb})")
     if tmdb: links.append(f"[TMDB]({tmdb})")
-    links_s = (" • ".join(links)) if links else ""
-    base = f"**{title}** ({year}) — **Match {sc:.0f}** | Audience {aud:.0f} | {prov}"
+    link_s = " • ".join(links)
+
+    main = f"{emoji} **{title}** ({year}) — **Match {sc:.0f}** | Audience {aud:.0f} | {prov}"
     if why:
-        base += f" — _{why}_"
-    if links_s:
-        base += f" — {links_s}"
-    return base
+        main += f" — _{why}_"
+    if link_s:
+        main += f" — {link_s}"
+    return f"- {main}"
 
-def _pick(items: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
+def _pick_top(items: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
     return sorted(items, key=_score, reverse=True)[:n]
-
-def _fresh_and_high(items: List[Dict[str, Any]], recent_year_min: int, min_aud: float, n: int) -> List[Dict[str, Any]]:
-    filt = [it for it in items if isinstance(it.get("year"), int) and it["year"] >= recent_year_min and _audience_0_100(it) >= min_aud]
-    return _pick(filt, n)
-
-def _on_services(items: List[Dict[str, Any]], subs: List[str], n: int) -> List[Dict[str, Any]]:
-    if not subs:
-        return []
-    s = {x.strip().lower() for x in subs}
-    filt = []
-    for it in items:
-        provs = [p.strip().lower() for p in _providers(it)]
-        if any(p in s for p in provs):
-            filt.append(it)
-    return _pick(filt, n)
-
-def _deep_cuts(items: List[Dict[str, Any]], min_match: float, max_aud: float, n: int) -> List[Dict[str, Any]]:
-    # Higher match but not overly popular (audience <= max_aud)
-    filt = [it for it in items if _score(it) >= min_match and _audience_0_100(it) <= max_aud]
-    return _pick(filt, n)
 
 def _read_ratings_csv(p: Path) -> Tuple[int, Dict[str, int]]:
     """
-    Return (rows, simple_genre_counter). The CSV column can be 'genres' (delimited by | or ,).
+    Read ratings.csv (optional). Return (row_count, simple genre counts) if a 'genres' column exists.
     """
     if not p.exists():
         return 0, {}
-    count = 0
-    genres: Dict[str, int] = {}
+    import re
+    sep = re.compile(r"[|,/;+]")
+    n, g = 0, {}
     with p.open("r", encoding="utf-8", errors="replace") as fh:
         reader = csv.DictReader(fh)
         for row in reader:
-            count += 1
+            n += 1
             gs = row.get("genres") or row.get("Genres") or ""
-            if gs:
-                parts = [g.strip() for g in re_split(gs)]
-                for g in parts:
-                    if g:
-                        genres[g] = genres.get(g, 0) + 1
-    return count, dict(sorted(genres.items(), key=lambda kv: kv[1], reverse=True))
+            for tok in (t.strip() for t in sep.split(gs)):
+                if tok:
+                    g[tok] = g.get(tok, 0) + 1
+    return n, dict(sorted(g.items(), key=lambda kv: kv[1], reverse=True))
 
-def re_split(s: str) -> List[str]:
-    # split on common separators
-    return [t for t in re_sep_split(s) if t]
-
-def re_sep_split(s: str) -> List[str]:
-    import re
-    return re.split(r"[|,/;+]", s)
+# ---------- digest builder ----------
 
 def build_digest(
     items: List[Dict[str, Any]],
-    diag_env: Dict[str, Any],
+    diag: Dict[str, Any],
     ratings_csv: Optional[Path],
-    top_n: int = 10
+    top_n: int = 12
 ) -> str:
-    """
-    Build a compact, comment-friendly markdown digest with sections:
-    - Top Picks (🎯)
-    - On Your Services (🎟️)
-    - Fresh & Highly Rated (🆕⭐)
-    - Deep Cuts / Underrated (🕵️)
-    """
-    subs = _coerce_list(diag_env.get("SUBS_INCLUDE"))
-    region = diag_env.get("REGION", "US")
-    now_year = 2025  # conservative fixed; runner doesn't export 'now'; adjust if needed
-    recent_year_min = now_year - 3
+    """Create a compact markdown digest with ONLY 'Top Picks' and a telemetry block."""
+    env = (diag or {}).get("env", {}) if isinstance(diag, dict) else {}
+    subs = _as_list(env.get("SUBS_INCLUDE"))
+    region = env.get("REGION", "US")
+    langs = env.get("ORIGINAL_LANGS", [])
+    pages = env.get("DISCOVER_PAGES", 0)
+    prov_map = env.get("PROVIDER_MAP", {})
+    prov_unmatched = env.get("PROVIDER_UNMATCHED", [])
+    pool_t = env.get("POOL_TELEMETRY", {}) or {}
+    ran_at = (diag or {}).get("ran_at_utc")
+    run_sec = (diag or {}).get("run_seconds")
 
-    # Selections
-    top_picks = _pick(items, top_n)
-    on_services = _on_services(items, subs, top_n)
-    fresh_high = _fresh_and_high(items, recent_year_min=recent_year_min, min_aud=75.0, n=top_n)
-    deep = _deep_cuts(items, min_match=60.0, max_aud=70.0, n=top_n)
+    discovered = env.get("DISCOVERED_COUNT", None)
+    eligible = env.get("ELIGIBLE_COUNT", None)
 
-    # Taste profile from ratings.csv (optional)
+    # selections
+    picks = _pick_top(items, top_n)
+
+    # taste profile (optional)
     ratings_rows, genre_counter = (0, {})
-    if ratings_csv:
+    if ratings_csv and ratings_csv.exists():
         try:
             ratings_rows, genre_counter = _read_ratings_csv(ratings_csv)
         except Exception:
             pass
 
     lines: List[str] = []
-    lines.append(f"### 🎬 Daily Picks ({region})")
-    lines.append("")
+    lines.append(f"### 🎬 Top Picks ({region})\n")
     if ratings_rows:
         top_gen = ", ".join([f"{g}×{c}" for g, c in list(genre_counter.items())[:6]])
-        lines.append(f"_Taste profile (from your ratings.csv, {ratings_rows} rows):_ {top_gen}")
-        lines.append("")
-    # Top picks
-    if top_picks:
-        lines.append("#### 🎯 Top Picks")
-        for it in top_picks:
-            lines.append(f"- {_bullet_line(it)}")
-        lines.append("")
+        lines.append(f"_Taste profile (from your ratings.csv, {ratings_rows} rows):_ {top_gen}\n")
 
-    # On your services
-    if on_services:
-        lines.append("#### 🎟️ On Your Services")
-        for it in on_services:
-            lines.append(f"- {_bullet_line(it)}")
+    if picks:
+        for it in picks:
+            lines.append(_bullet(it))
         lines.append("")
+    else:
+        lines.append("_No items to show._\n")
 
-    # Fresh & highly rated
-    if fresh_high:
-        lines.append("#### 🆕⭐ Fresh & Highly Rated")
-        for it in fresh_high:
-            lines.append(f"- {_bullet_line(it)}")
-        lines.append("")
-
-    # Deep cuts
-    if deep:
-        lines.append("#### 🕵️ Underrated Deep Cuts")
-        for it in deep:
-            lines.append(f"- {_bullet_line(it)}")
-        lines.append("")
-
-    # Telemetry footer (compact)
-    prov_map = diag_env.get("PROVIDER_MAP", {})
-    prov_unmatched = diag_env.get("PROVIDER_UNMATCHED", [])
-    lines.append("<sub>")
-    lines.append(f"Providers: `{json.dumps(prov_map, ensure_ascii=False)}`")
+    # Telemetry (expanded)
+    lines.append("### 📊 Telemetry")
+    if ran_at is not None:
+        lines.append(f"- Ran at (UTC): **{ran_at}**" + (f" — {run_sec:.1f}s" if isinstance(run_sec, (int, float)) else ""))
+    lines.append(f"- Region: **{region}**")
+    if langs:
+        lines.append(f"- Original languages: `{', '.join(langs)}`")
+    lines.append(f"- SUBS_INCLUDE: `{', '.join(subs) if subs else '—'}`")
+    lines.append(f"- Discover pages: **{pages}**")
+    if discovered is not None:
+        lines.append(f"- Discovered (raw): **{discovered}**")
+    if eligible is not None:
+        lines.append(f"- Eligible after exclusions: **{eligible}**")
+    lines.append(f"- Provider map: `{json.dumps(prov_map, ensure_ascii=False)}`")
     if prov_unmatched:
-        lines.append(f" Unmatched: `{prov_unmatched}`")
-    lines.append("</sub>")
-    return "\n".join(lines)
+        lines.append(f"- Provider slugs not matched: `{prov_unmatched}`")
+
+    if pool_t:
+        before = pool_t.get("file_lines_before")
+        after = pool_t.get("file_lines_after")
+        delta = (after - before) if isinstance(before, int) and isinstance(after, int) else None
+        lines.append(f"- Pool file lines: **{before} → {after}**" + (f" (Δ {delta:+})" if delta is not None else ""))
+        lines.append(f"- Appended this run: **{pool_t.get('appended_this_run')}**")
+        lines.append(f"- Loaded unique from pool: **{pool_t.get('loaded_unique')}** / max **{pool_t.get('pool_max_items')}**")
+        if pool_t.get("unique_keys_est") is not None:
+            lines.append(f"- Unique keys (est): **{pool_t.get('unique_keys_est')}**")
+        if pool_t.get("prune_at"):
+            lines.append(f"- Prune policy: prune_at={pool_t.get('prune_at')}, keep={pool_t.get('prune_keep')}")
+
+    return "\n".join(lines).strip() + "\n"
+
+# ---------- CLI ----------
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Build a compact digest-style summary.md from enriched items.")
+    ap = argparse.ArgumentParser(description="Produce a compact Top Picks digest into summary.md")
     ap.add_argument("--in", dest="inp", required=True, help="items.enriched.json (or assistant_feed.json)")
-    ap.add_argument("--diag", dest="diag", required=False, help="diag.json for env telemetry")
+    ap.add_argument("--diag", dest="diag", required=False, help="diag.json (runner telemetry)")
     ap.add_argument("--ratings", dest="ratings", required=False, help="data/user/ratings.csv (optional)")
-    ap.add_argument("--out", dest="out", required=True, help="output markdown path (summary.md)")
-    ap.add_argument("--top", dest="top", type=int, default=10, help="Top-N per bucket")
+    ap.add_argument("--out", dest="out", required=True, help="output markdown (summary.md)")
+    ap.add_argument("--top", dest="top", type=int, default=12, help="Top-N picks to list")
     args = ap.parse_args()
 
     inp = Path(args.inp)
@@ -237,10 +241,8 @@ def main() -> None:
     items = _load_json(inp) or []
     if not isinstance(items, list):
         items = []
-    diag = _load_json(diagp) if diagp and diagp.exists() else {}
-    env = (diag or {}).get("env", {})
-
-    body = build_digest(items, env, ratingsp if (ratingsp and ratingsp.exists()) else None, top_n=args.top)
+    diag = _load_json(diagp) if (diagp and diagp.exists()) else {}
+    body = build_digest(items, diag, ratingsp if (ratingsp and ratingsp.exists()) else None, top_n=args.top)
     outp.parent.mkdir(parents=True, exist_ok=True)
     outp.write_text(body, encoding="utf-8")
 
