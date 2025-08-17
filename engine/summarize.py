@@ -48,34 +48,37 @@ def _providers(it: Dict[str, Any]) -> List[str]:
     p = it.get("providers") or it.get("providers_slugs") or []
     return [s for s in p if isinstance(s, str)]
 
-def _prettify_provider(slug: str) -> str:
-    # friendly names for common slugs; fallback to Title Case
-    MAP = {
-        "apple_tv_plus": "Apple TV+",
-        "prime_video": "Prime Video",
-        "disney_plus": "Disney+",
-        "paramount_plus": "Paramount+",
-        "max": "Max",
-        "netflix": "Netflix",
-        "hulu": "Hulu",
-        "peacock": "Peacock",
-        "peacock_premium": "Peacock Premium",
-        "starz": "STARZ",
-        "showtime": "Showtime",
-        "amc_plus": "AMC+",
-        "criterion_channel": "Criterion Channel",
-        "mubi": "MUBI",
-    }
+# Icon + friendly-name label for providers
+def _provider_label(slug: str) -> str:
     if not isinstance(slug, str):
         return str(slug)
     s = slug.strip().lower()
-    if s in MAP: return MAP[s]
-    return " ".join(w.capitalize() for w in s.split("_"))
+    ICONS = {
+        "apple_tv_plus": "🍎 Apple TV+",
+        "prime_video":  "🟦 Prime Video",
+        "disney_plus":  "✨ Disney+",
+        "paramount_plus":"⛰️ Paramount+",
+        "max":          "🟪 Max",
+        "netflix":      "🟥 Netflix",
+        "hulu":         "🟩 Hulu",
+        "peacock":      "🦚 Peacock",
+        "peacock_premium":"🦚 Peacock Premium",
+        "starz":        "⭐ STARZ",
+        "showtime":     "🎞️ Showtime",
+        "amc_plus":     "🎬 AMC+",
+        "criterion_channel": "🎞️ Criterion Channel",
+        "mubi":         "🎥 MUBI",
+    }
+    if s in ICONS:
+        return ICONS[s]
+    # Fallback: Title Case with a camera emoji
+    t = " ".join(w.capitalize() for w in s.split("_"))
+    return f"🎬 {t}"
 
 def _fmt_providers(provs: List[str], maxn: int = 3) -> str:
     if not provs:
         return "—"
-    friendly = [_prettify_provider(p) for p in provs]
+    friendly = [_provider_label(p) for p in provs]
     short = friendly[:maxn]
     return ", ".join(short) + ("…" if len(friendly) > maxn else "")
 
@@ -191,7 +194,7 @@ def build_digest(
     else:
         lines.append("_No items to show._\n")
 
-    # Telemetry (expanded)
+    # Telemetry (expanded + pool growth deltas)
     lines.append("### 📊 Telemetry")
     if ran_at is not None:
         lines.append(f"- Ran at (UTC): **{ran_at}**" + (f" — {run_sec:.1f}s" if isinstance(run_sec, (int, float)) else ""))
@@ -211,10 +214,12 @@ def build_digest(
     if pool_t:
         before = pool_t.get("file_lines_before")
         after = pool_t.get("file_lines_after")
-        delta = (after - before) if isinstance(before, int) and isinstance(after, int) else None
-        lines.append(f"- Pool file lines: **{before} → {after}**" + (f" (Δ {delta:+})" if delta is not None else ""))
-        lines.append(f"- Appended this run: **{pool_t.get('appended_this_run')}**")
-        lines.append(f"- Loaded unique from pool: **{pool_t.get('loaded_unique')}** / max **{pool_t.get('pool_max_items')}**")
+        appended = pool_t.get("appended_this_run")
+        delta = (after - before) if isinstance(before, int) and isinstance(after, int) else appended
+        lines.append(f"- Pool growth: **{('+'+str(delta)) if isinstance(delta, int) else '—'} this run**")
+        lines.append(f"- Pool size (lines): **{before} → {after}**")
+        lines.append(f"- Appended records this run: **{appended}**")
+        lines.append(f"- Loaded unique from pool: **{pool_t.get('loaded_unique')}** / cap **{pool_t.get('pool_max_items')}**")
         if pool_t.get("unique_keys_est") is not None:
             lines.append(f"- Unique keys (est): **{pool_t.get('unique_keys_est')}**")
         if pool_t.get("prune_at"):
