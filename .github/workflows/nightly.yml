@@ -1,44 +1,23 @@
-name: Nightly
+name: Nightly Recs
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   schedule:
-    - cron: "28 3 * * *"  # run daily; adjust as you like
-  push:
-    branches: [ "main" ]
+    - cron: "32 0 * * *"  # adjust as you like
 
-permissions:
-  contents: read
-  actions: read
-  issues: write   # needed so the workflow can create/comment on an issue
+# Prevent overlapping runs on the same branch/ref.
+concurrency:
+  group: imdb-recos-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-
-    env:
-      # Engine config (already present in your repo; keep/edit as needed)
-      TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
-      OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
-      IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
-      IMDB_RATINGS_CSV_PATH: data/ratings.csv
-      REGION: US
-      ORIGINAL_LANGS: en
-      SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
-      TMDB_PAGES_MOVIE: 24
-      TMDB_PAGES_TV: 24
-      MAX_CATALOG: 10000
-      INCLUDE_TV_SEASONS: "true"
-      SKIP_WINDOW_DAYS: 4
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -46,126 +25,19 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -r requirements.txt
 
-      - name: Bootstrap dirs + pre-create log
-        run: |
-          set -euo pipefail
-          mkdir -p data/cache data/debug data/out/latest
-          echo "[bootstrap] $(date -u +"%F %T UTC") — workflow started" > data/debug/runner.log
-
-      - name: Try to recover previous artifact (catalog_store.json, etc.)
+      - name: Run
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+          REGION: US
+          ORIGINAL_LANGS: en
+          SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
         run: |
-          set -euo pipefail
-          ART_ID=$(gh api repos/${{ github.repository }}/actions/artifacts --jq '.artifacts[] | select(.name=="nightly-output") | .id' | head -n1 || true)
-          if [[ -n "${ART_ID:-}" ]]; then
-            echo "Downloading artifact id ${ART_ID}…"
-            gh api -H "Accept: application/vnd.github+json" -X GET repos/${{ github.repository }}/actions/artifacts/${ART_ID}/zip > nightly-output.zip || true
-            unzip -qo nightly-output.zip -d . || true
-          else
-            echo "No previous nightly-output artifact found; starting fresh store."
-          fi
+          python -m engine.runner
 
-      - name: Run engine (collect logs even on failure)
-        id: run_engine
-        run: |
-          set -euo pipefail
-          # Let the Python step fail without failing the job yet (we still want artifacts)
-          set +e
-          python -X dev -m engine.runner 2>&1 | tee -a data/debug/runner.log
-          EXIT=$?
-          set -e
-          echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
-
-          # quick inventory
-          {
-            echo "----- DIR LAYOUT (data/* up to depth 3) -----"
-            find data -maxdepth 3 -type f -printf "%p (%s bytes)\n" | sort
-          } >> data/debug/runner.log || true
-
-      - name: Build summary and detect results
-        id: collect
-        run: |
-          set -euo pipefail
-          FEED="data/out/latest/assistant_feed.json"
-          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          DATE_UTC="$(date -u +'%Y-%m-%d %H:%M UTC')"
-
-          echo "# Nightly Recommendations — ${DATE_UTC}" > summary.md
-
-          if [ -f "$FEED" ]; then
-            POOL=$(jq -r '.telemetry.counts.tmdb_pool // 0' "$FEED")
-            UNSEEN=$(jq -r '.telemetry.counts.eligible_unseen // 0' "$FEED")
-            SHORT=$(jq -r '.telemetry.counts.shortlist // 0' "$FEED")
-            SHOWN=$(jq -r '.telemetry.counts.shown // 0' "$FEED")
-
-            echo "" >> summary.md
-            echo "**Pool:** ${POOL}  •  **Unseen:** ${UNSEEN}  •  **Shortlist:** ${SHORT}  •  **Shown:** ${SHOWN}" >> summary.md
-            echo "" >> summary.md
-            echo "## Top 10" >> summary.md
-            echo "" >> summary.md
-            echo "| # | Title | Year | Type | Match |" >> summary.md
-            echo "|---:|---|---:|---|---:|" >> summary.md
-            jq -r '.top10[] | "| \(.rank) | \(.title|gsub("\\|";"\\|")) | \(.year//"") | \(.type) | \(.match) |"' "$FEED" >> summary.md
-            echo "" >> summary.md
-            echo "_Run logs & artifacts:_ ${RUN_URL}" >> summary.md
-
-            # Consider "has results" true if shown > 0
-            if [ "${SHOWN}" -gt 0 ]; then
-              echo "has_results=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "has_results=false" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            echo "" >> summary.md
-            echo "> No assistant_feed.json produced this run. See logs: ${RUN_URL}" >> summary.md
-            echo "" >> summary.md
-            echo "has_results=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Upload artifacts
+      - name: Upload artifacts (optional)
         uses: actions/upload-artifact@v4
         with:
-          name: nightly-output
-          path: |
-            data/**
-            summary.md
-          if-no-files-found: warn
-          overwrite: false
-
-      # 🔔 Post a comment to an issue ONLY when results exist — this triggers GitHub notifications
-      - name: Comment nightly summary to tracking issue (GitHub notification)
-        if: ${{ steps.collect.outputs.has_results == 'true' }}
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const fs = require('fs');
-            const title = 'Nightly Recommendations';
-            const body = fs.readFileSync('summary.md', 'utf8');
-            const {owner, repo} = context.repo;
-
-            // Ensure the tracking issue exists
-            const issues = await github.rest.issues.listForRepo({ owner, repo, state: 'open', per_page: 100 });
-            let issue = issues.data.find(i => i.title === title);
-            if (!issue) {
-              const created = await github.rest.issues.create({
-                owner, repo, title,
-                body: 'This issue will collect nightly recommendation summaries.'
-              });
-              issue = created.data;
-            }
-
-            // Comment the nightly summary (this generates a GitHub notification)
-            await github.rest.issues.createComment({
-              owner, repo, issue_number: issue.number, body
-            });
-
-      # If you want the whole job to fail when the engine step failed (but after artifacts were saved), enable this:
-      - name: Fail job if engine failed (optional)
-        if: ${{ steps.run_engine.outputs.exit_code != '0' }}
-        run: |
-          echo "Engine exited with code ${{ steps.run_engine.outputs.exit_code }}"
-          exit ${{ steps.run_engine.outputs.exit_code }}
+          name: out
+          path: data/out/latest
