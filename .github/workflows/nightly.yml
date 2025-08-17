@@ -1,246 +1,81 @@
 name: nightly
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "30 16 * * *"
-
-permissions:
-  contents: write
+    # run once daily at 3:30am ET (07:30 UTC) — adjust as you like
+    - cron: '30 7 * * *'
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-24.04
 
+    # Map config + secrets to the environment that the code expects
     env:
-      PYTHONUTF8: "1"
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      # App config
       REGION: US
       ORIGINAL_LANGS: '["en"]'
-      DISCOVER_PAGES: "12"
       SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
+      DISCOVER_PAGES: "12"
+
+      # TMDB auth: runner accepts EITHER v3 key or v4 bearer (or both).
+      TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}          # v3 key (query param)
+      TMDB_BEARER:  ${{ secrets.TMDB_ACCESS_TOKEN }}     # v4 access token (Authorization: Bearer ...)
+
+      # IMDb (optional — unseen filtering uses a CSV if present)
       IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
-      TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
+      # IMDB_RATINGS_CSV_PATH: data/ratings.csv          # uncomment if you commit a CSV
 
     steps:
-      - name: Checkout
+      - name: Check out repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ runner.os }}-py311-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
-          restore-keys: |
-            pip-${{ runner.os }}-py311-
-
       - name: Install dependencies
-        shell: bash
         run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          python -m pip install -U pip
+          pip install -r requirements.txt
 
-      - name: Run engine
-        shell: bash
+      # Simple presence check (booleans only; values remain masked)
+      - name: Env sanity (booleans only)
         run: |
-          set -euxo pipefail
+          python - <<'PY'
+          import os
+          print("HAS_TMDB_API_KEY:", bool(os.getenv("TMDB_API_KEY")))
+          print("HAS_TMDB_BEARER :", bool(os.getenv("TMDB_BEARER")))
+          print("HAS_IMDB_USER_ID:", bool(os.getenv("IMDB_USER_ID")))
+          PY
+
+      - name: Run recommendation engine
+        run: |
           mkdir -p data/out data/cache
-          echo "PYTHON_VERSION=$(python -V 2>&1)" >> $GITHUB_ENV
           python -m engine.runner
-          echo "RUN_DONE=1" >> "$GITHUB_OUTPUT"
 
-      - name: Stamp last run marker (fallback)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p data/out
-          if [ ! -f data/out/last_run_dir.txt ]; then
-            if compgen -G "data/out/run_*" > /dev/null; then
-              latest_dir="$(ls -dt data/out/run_* | head -n1)"
-              printf '%s\n' "$latest_dir" > data/out/last_run_dir.txt
-              rm -rf data/out/latest
-              ln -s "$latest_dir" data/out/latest 2>/dev/null || cp -r "$latest_dir" data/out/latest
-              echo "Stamped last_run_dir.txt with: $latest_dir"
-            else
-              echo "WARNING: no run_* dirs found; nothing to stamp"
-            fi
-          fi
+      - name: Make debug bundle
+        run: ./.github/scripts/make_debug_bundle.sh
 
-      - name: Prepare latest dir for upload
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p data/out
-          if [ -f data/out/last_run_dir.txt ]; then
-            latest_dir="$(cat data/out/last_run_dir.txt)"
-          elif compgen -G "data/out/run_*" > /dev/null; then
-            latest_dir="$(ls -dt data/out/run_* | head -n1)"
-          else
-            echo "No run_* directories found under data/out"
-            exit 0
-          fi
-          rm -rf data/out/latest
-          ln -s "$latest_dir" data/out/latest 2>/dev/null || cp -r "$latest_dir" data/out/latest
-          echo "Latest run directory: $latest_dir"
-          ls -al "data/out/latest" || true
-
-      - name: Upload site artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: site-out
-          path: data/out/latest
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Bundle debug data
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -f debug-data.zip
-          rm -rf debug-bundle
-          mkdir -p debug-bundle
-
-          if [ -d "data/out/latest" ]; then
-            cp -f data/out/latest/runner.log            debug-bundle/ 2>/dev/null || true
-            cp -f data/out/latest/assistant_feed.json   debug-bundle/ 2>/dev/null || true
-            cp -f data/out/latest/items.discovered.json debug-bundle/ 2>/dev/null || true
-            cp -f data/out/latest/items.enriched.json   debug-bundle/ 2>/dev/null || true
-            cp -f data/out/latest/summary.md            debug-bundle/ 2>/dev/null || true
-            cp -f data/out/latest/diag.json             debug-bundle/ 2>/dev/null || true
-            if [ -f data/out/latest/runner.log ]; then
-              tail -n 200 data/out/latest/runner.log > debug-bundle/runner-tail.txt || true
-            fi
-          fi
-
-          {
-            echo "REGION=${REGION}"
-            echo "SUBS_INCLUDE=${SUBS_INCLUDE}"
-            echo "ORIGINAL_LANGS=${ORIGINAL_LANGS}"
-            echo "DISCOVER_PAGES=${DISCOVER_PAGES}"
-          } > debug-bundle/env.txt
-
-          {
-            printenv | sort | sed \
-              -e 's/\(AUTH\|TOKEN\|SECRET\|PASSWORD\|KEY\)=.*/\1=***REDACTED***/I' \
-              -e 's/\(COOKIE\)=.*/\1=***REDACTED***/I'
-            if [ -n "${TMDB_ACCESS_TOKEN:-}" ]; then
-              echo "HINT_TMDB_ACCESS_TOKEN_LEN=${#TMDB_ACCESS_TOKEN}"
-            else
-              echo "HINT_TMDB_ACCESS_TOKEN_LEN=0"
-            fi
-            if [ -n "${IMDB_USER_ID:-}" ]; then
-              echo "HINT_IMDB_USER_ID_SET=1"
-            else
-              echo "HINT_IMDB_USER_ID_SET=0"
-            fi
-          } > debug-bundle/env-sanitized.txt
-
-          {
-            echo "# REPO TREE (find .)"
-            find . -mindepth 1 -maxdepth 6 -printf "%y %M %u %g %9s %TY-%Tm-%Td %TT %p\n" 2>/dev/null | sort || true
-            echo
-            echo "# DETAILED LISTING (ls -lR)"
-            ls -alR || true
-          } > debug-bundle/tree.txt
-
-          {
-            echo "# SYMLINK TARGETS"
-            echo "data/out/latest -> $(readlink -f data/out/latest 2>/dev/null || echo '<not a symlink or missing>')"
-            if [ -f data/out/last_run_dir.txt ]; then
-              echo "last_run_dir: $(cat data/out/last_run_dir.txt)"
-            else
-              echo "last_run_dir: <missing>"
-            fi
-          } > debug-bundle/links.txt
-
-          {
-            echo "# git rev"
-            git log -1 --oneline || true
-            echo
-            echo "# git status"
-            git status --porcelain=v1 || true
-            echo
-            echo "# git remotes"
-            git remote -v || true
-          } > debug-bundle/git.txt
-
-          {
-            echo "# Python info"
-            which python || true
-            python --version || true
-            echo
-            echo "# pip freeze"
-            pip freeze || true
-          } > debug-bundle/python.txt
-
-          {
-            echo "# sizes"
-            du -sh . 2>/dev/null || true
-            du -sh data/out 2>/dev/null || true
-            du -sh data/cache 2>/dev/null || true
-            echo
-            echo "# df (filesystem free space)"
-            df -h . || true
-          } > debug-bundle/dirs.txt
-
-          {
-            echo "# data/out (top)"
-            ls -al data/out 2>/dev/null || true
-            echo
-            echo "# data/out/latest (top)"
-            ls -al data/out/latest 2>/dev/null || true
-            echo
-            echo "# data/cache (top)"
-            ls -al data/cache 2>/dev/null || true
-            echo
-            echo "# data/cache/tmdb (top)"
-            ls -al data/cache/tmdb 2>/dev/null || true
-          } > debug-bundle/listings.txt
-
-          (cd debug-bundle && zip -q -r ../debug-data.zip .) || true
-          ls -lh debug-data.zip || true
-
-      - name: Upload debug artifact
+      - name: Upload debug bundle
         uses: actions/upload-artifact@v4
         with:
           name: debug-data
           path: debug-data.zip
           if-no-files-found: warn
-          retention-days: 14
 
-      - name: Bundle full repo snapshot
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          SNAP_DIR="repo-snapshot"
-          rm -rf "$SNAP_DIR" repo-snapshot.zip
-          mkdir -p "$SNAP_DIR"
-          rsync -a \
-            --exclude '.git/' \
-            --exclude '__pycache__/' \
-            --exclude '.mypy_cache/' \
-            --exclude 'debug-bundle/' \
-            --exclude 'repo-snapshot/' \
-            --exclude '*.zip' \
-            ./ "$SNAP_DIR/"
-          (cd "$SNAP_DIR" && zip -q -r ../repo-snapshot.zip .)
-          ls -lh repo-snapshot.zip || true
-
-      - name: Upload repo snapshot artifact
+      # (Optional) Upload latest outputs for quick download from Actions UI
+      - name: Upload latest run outputs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: repo-snapshot
-          path: repo-snapshot.zip
-          if-no-files-found: warn
-          retention-days: 14
+          name: latest-run
+          path: |
+            data/out/latest/runner.log
+            data/out/latest/assistant_feed.json
+            data/out/latest/items.discovered.json
+            data/out/latest/items.enriched.json
+            data/out/latest/summary.md
+            data/out/latest/diag.json
+          if-no-files-found: ignore
