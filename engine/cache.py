@@ -1,35 +1,28 @@
 # engine/cache.py
 from __future__ import annotations
-from typing import Dict, Iterable, List, Any, Tuple, Optional, Set
+from typing import Dict, Iterable, List, Any, Tuple, Optional
 from pathlib import Path
-import json, io, os, time, tempfile
+import json, io, os, time, tempfile, hashlib
 from datetime import datetime, timedelta
 
-# TMDB helpers (already provided in your engine/tmdb.py)
-from .tmdb import find_by_imdb_id, search_title_year, watch_providers
+import requests
 
+# ---------- Paths / dirs ----------
 BASE = Path(__file__).resolve().parents[1]
 CACHE_DIR = BASE / "data" / "cache"
-
-# Files/dirs that persist across runs
+TMDB_DIR = CACHE_DIR / "tmdb"
+IMDB_DIR = CACHE_DIR / "imdb"
+USER_DIR = CACHE_DIR / "user"
+FEEDBACK_DIR = CACHE_DIR / "feedback"
 STATE_DIR = CACHE_DIR / "state"
-TMDB_MAP_PATH = CACHE_DIR / "tmdb_map.json"          # imdb tconst -> {"media_type": "...", "tmdb_id": 123}
-TMDB_PROV_PATH = CACHE_DIR / "tmdb_providers.json"   # "movie:123" -> full payload from /watch/providers
-FEEDBACK_DIR = CACHE_DIR / "feedback"                # we mirror feedback here for runner-only executions
-USER_DIR = CACHE_DIR / "user"                        # misc user-derived caches
-PERSONAL_STATE_PATH = STATE_DIR / "personal.json"    # snapshot of genre weights & counts for summarize
 
 def ensure_dirs() -> None:
-    for p in [
-        CACHE_DIR,
-        CACHE_DIR / "tmdb",
-        CACHE_DIR / "imdb",
-        CACHE_DIR / "user",
-        CACHE_DIR / "feedback",
-        STATE_DIR,
-    ]:
+    for p in [CACHE_DIR, TMDB_DIR, IMDB_DIR, USER_DIR, FEEDBACK_DIR, STATE_DIR]:
         p.mkdir(parents=True, exist_ok=True)
 
+ensure_dirs()
+
+# ---------- Atomic IO ----------
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(delete=False, dir=str(path.parent)) as tmp:
@@ -49,7 +42,6 @@ def read_json(path: Path, default: Any) -> Any:
     except FileNotFoundError:
         return default
     except Exception:
-        # Corrupted? Return default rather than failing the run.
         return default
 
 def read_jsonl_indexed(path: Path, key: str) -> Dict[str, Any]:
@@ -71,9 +63,6 @@ def read_jsonl_indexed(path: Path, key: str) -> Dict[str, Any]:
     return out
 
 def upsert_jsonl(path: Path, key: str, rows: Iterable[Dict[str, Any]]) -> Tuple[int,int]:
-    """
-    Upsert rows into JSONL by 'key'. Returns (upserts, skipped).
-    """
     existing = read_jsonl_indexed(path, key)
     upserts = 0
     skipped = 0
@@ -87,7 +76,6 @@ def upsert_jsonl(path: Path, key: str, rows: Iterable[Dict[str, Any]]) -> Tuple[
         else:
             existing[k] = r
             upserts += 1
-    # write back
     buf = io.StringIO()
     for _, v in existing.items():
         buf.write(json.dumps(v, ensure_ascii=False))
@@ -95,6 +83,7 @@ def upsert_jsonl(path: Path, key: str, rows: Iterable[Dict[str, Any]]) -> Tuple[
     _atomic_write_bytes(path, buf.getvalue().encode("utf-8"))
     return (upserts, skipped)
 
+# ---------- Time helpers ----------
 def stale(ts_iso: str, ttl_days: int) -> bool:
     try:
         ts = datetime.fromisoformat(ts_iso.replace("Z","+00:00"))
@@ -105,14 +94,9 @@ def stale(ts_iso: str, ttl_days: int) -> bool:
 def touch_now(obj: Dict[str,Any]) -> None:
     obj["cached_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-
-# -----------------------------
-# Simple named state persistence
-# -----------------------------
-
+# ---------- Simple state blobs ----------
 def _state_path(name: str) -> Path:
-    ensure_dirs()
-    safe = name.replace("/", "_")
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in name)
     return STATE_DIR / f"{safe}.json"
 
 def load_state(name: str, default: Any = None) -> Any:
@@ -123,171 +107,88 @@ def save_state(name: str, obj: Any) -> None:
     path = _state_path(name)
     atomic_write_json(path, obj)
 
+# ---------- TMDB cached HTTP ----------
+_TMDB_API_BASE = "https://api.themoviedb.org/3"
+_DEFAULT_TIMEOUT = (5, 20)  # connect, read
+_DEFAULT_UA = "my-imdb-recos/1.0 (+github actions)"
 
-# -----------------------------------------
-# TMDB ID resolution + provider cache layer
-# -----------------------------------------
+def _tmdb_key() -> str:
+    key = os.getenv("TMDB_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("TMDB_API_KEY (v3) not set")
+    return key
 
-def _prov_key(media_type: str, tmdb_id: int) -> str:
-    media_type = "movie" if media_type == "movie" else "tv"
-    return f"{media_type}:{int(tmdb_id)}"
+def _hash_key(url: str, params: Dict[str, Any]) -> str:
+    blob = url + "?" + "&".join(f"{k}={params[k]}" for k in sorted(params.keys()))
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
 
-def resolve_tmdb_id(
-    *,
-    imdb_tconst: Optional[str] = None,
-    title: Optional[str] = None,
-    year: Optional[int] = None,
-    media_hint: str = "movie",   # 'movie'|'tv'
-) -> tuple[str, int] | None:
-    """
-    Returns ('movie'|'tv', tmdb_id) or None.
-    Strategy:
-      1) cache hit via imdb_tconst
-      2) TMDB /find/{tconst}
-      3) TMDB /search/{kind} using title/year
-    Caches the result back into tmdb_map.json.
-    """
+def _tmdb_cache_path(kind: str, url: str, params: Dict[str, Any]) -> Path:
+    h = _hash_key(url, params)
+    return TMDB_DIR / f"{kind}_{h}.json"
+
+def _tmdb_get_json_cached(kind: str, url: str, params: Dict[str, Any], *, ttl_days: int) -> Dict[str, Any]:
     ensure_dirs()
-    tmdb_map: Dict[str, Any] = read_json(TMDB_MAP_PATH, {})
+    path = _tmdb_cache_path(kind, url, params)
+    cached = read_json(path, default=None)
+    if isinstance(cached, dict) and "data" in cached and "cached_at" in cached and not stale(cached["cached_at"], ttl_days):
+        return cached["data"]
 
-    # 1) cache by tconst
-    if imdb_tconst:
-        entry = tmdb_map.get(imdb_tconst)
-        if entry and isinstance(entry.get("tmdb_id"), int):
-            mtype = entry.get("media_type") or media_hint
-            return (mtype, int(entry["tmdb_id"]))
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": _DEFAULT_UA,
+    }
 
-    # 2) /find by tconst
-    if imdb_tconst:
+    # inject API key param (v3 style)
+    params = dict(params)
+    params["api_key"] = _tmdb_key()
+
+    for attempt in range(3):
         try:
-            data = find_by_imdb_id(imdb_tconst)
-            for bucket, mtype in (("movie_results","movie"),("tv_results","tv")):
-                res = (data.get(bucket) or [])
-                if res:
-                    tmdb_id = int(res[0]["id"])
-                    tmdb_map[imdb_tconst] = {"media_type": mtype, "tmdb_id": tmdb_id}
-                    atomic_write_json(TMDB_MAP_PATH, tmdb_map)
-                    return (mtype, tmdb_id)
+            r = requests.get(url, params=params, headers=headers, timeout=_DEFAULT_TIMEOUT)
+            if r.status_code == 429:
+                time.sleep(2)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            wrapper = {"cached_at": datetime.utcnow().isoformat(timespec="seconds") + "Z", "data": data}
+            atomic_write_json(path, wrapper)
+            return data
         except Exception:
-            # fall through to search
-            pass
+            if attempt == 2:
+                raise
+            time.sleep(1 + attempt)
 
-    # 3) /search with title/year hint
-    if title:
-        try:
-            mtype = "movie" if media_hint == "movie" else "tv"
-            data = search_title_year(title, year, mtype)
-            results = data.get("results") or []
-            if results:
-                tmdb_id = int(results[0]["id"])
-                if imdb_tconst:
-                    tmdb_map[imdb_tconst] = {"media_type": mtype, "tmdb_id": tmdb_id}
-                    atomic_write_json(TMDB_MAP_PATH, tmdb_map)
-                return (mtype, tmdb_id)
-        except Exception:
-            return None
+    return {}
 
-    return None
+def _coerce_media_type(x: Optional[str], fallback: str) -> str:
+    x = (x or "").lower()
+    if x in ("movie", "tv"):
+        return x
+    return fallback
 
-def tmdb_providers_cached(
-    tmdb_id: Optional[int],
-    api_key: str,     # intentionally unused here; kept for signature compatibility
-    media_type: str,
-    *,
-    imdb_tconst: Optional[str] = None,
-    title: Optional[str] = None,
-    year: Optional[int] = None,
-) -> Dict[str, Any]:
-    """
-    Main entry used by catalog_builder:
-      - If tmdb_id present: return (cached) providers
-      - Else: resolve via imdb_tconst -> tmdb_id (then cache)
-      - Else: search(title/year) -> tmdb_id (then cache)
-
-    Returns the raw TMDB /watch/providers payload (with .results[REGION]...).
-    """
-    ensure_dirs()
-    prov_cache: Dict[str, Any] = read_json(TMDB_PROV_PATH, {})
-
-    # Ensure we have a TMDB id
-    if tmdb_id is None:
-        resolved = resolve_tmdb_id(
-            imdb_tconst=imdb_tconst,
-            title=title,
-            year=year,
-            media_hint=media_type,
-        )
-        if not resolved:
-            return {}
-        media_type, tmdb_id = resolved
-
-    key = _prov_key(media_type, int(tmdb_id))
-    if key in prov_cache:
-        return prov_cache[key]
-
-    try:
-        payload = watch_providers(media_type, int(tmdb_id))
-    except Exception:
+# ---------- Public TMDB cache APIs ----------
+def tmdb_find_by_imdb_cached(imdb_id: str, api_key: Optional[str] = None, *, ttl_days: int = 30) -> Dict[str, Any]:
+    if not imdb_id:
         return {}
+    _ = api_key or _tmdb_key()
+    url = f"{_TMDB_API_BASE}/find/{imdb_id}"
+    params = {"external_source": "imdb_id", "language": "en-US"}
+    return _tmdb_get_json_cached("find", url, params, ttl_days=ttl_days)
 
-    prov_cache[key] = payload
-    atomic_write_json(TMDB_PROV_PATH, prov_cache)
-    return payload
+def tmdb_details_cached(tmdb_id: int, media_type: str, api_key: Optional[str] = None, *, ttl_days: int = 30) -> Dict[str, Any]:
+    if not tmdb_id:
+        return {}
+    _ = api_key or _tmdb_key()
+    mtype = _coerce_media_type(media_type, "movie")
+    url = f"{_TMDB_API_BASE}/{mtype}/{tmdb_id}"
+    params = {"language": "en-US"}
+    return _tmdb_get_json_cached("details", url, params, ttl_days=ttl_days)
 
-
-# ----------------------------
-# Feedback / downvote helpers
-# ----------------------------
-
-def _feedback_file_candidates() -> List[Path]:
-    """
-    Where feedback may live. We read from both the repo path (data/feedback)
-    and the mirrored cache folder (CACHE_DIR/feedback). Lines are JSON objects.
-    """
-    repo_feedback = BASE / "data" / "feedback" / "downvotes.jsonl"
-    cache_feedback = FEEDBACK_DIR / "downvotes.jsonl"
-    return [p for p in [repo_feedback, cache_feedback] if p.exists()]
-
-def load_downvoted_set() -> Set[str]:
-    """
-    Returns a set of imdb tconsts that were downvoted.
-    Expected JSONL shape per line (minimal):
-      {"tconst":"tt1234567","action":"downvote","value":1}
-    Other shapes are tolerated if they include 'tconst'.
-    """
-    out: Set[str] = set()
-    for p in _feedback_file_candidates():
-        try:
-            with p.open("r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except Exception:
-                        continue
-                    tconst = str(obj.get("tconst") or obj.get("id") or "").strip()
-                    if not tconst:
-                        continue
-                    # consider only explicit downvotes if present; otherwise any 'value' < 0
-                    act = str(obj.get("action") or "").lower()
-                    val = obj.get("value")
-                    if act == "downvote" or (isinstance(val, (int, float)) and val < 0):
-                        out.add(tconst)
-        except Exception:
-            continue
-    return out
-
-
-# --------------------------------
-# Personalization snapshot helpers
-# --------------------------------
-
-def load_personal_state(default: Any = None) -> Any:
-    ensure_dirs()
-    return read_json(PERSONAL_STATE_PATH, default if default is not None else {})
-
-def save_personal_state(obj: Any) -> None:
-    ensure_dirs()
-    atomic_write_json(PERSONAL_STATE_PATH, obj)
+def tmdb_providers_cached(tmdb_id: int, api_key: Optional[str] = None, media_type: str = "movie", *, ttl_days: int = 7) -> Dict[str, Any]:
+    if not tmdb_id:
+        return {}
+    _ = api_key or _tmdb_key()
+    mtype = _coerce_media_type(media_type, "movie")
+    url = f"{_TMDB_API_BASE}/{mtype}/{tmdb_id}/watch/providers"
+    params = {}
+    return _tmdb_get_json_cached("providers", url, params, ttl_days=ttl_days)
