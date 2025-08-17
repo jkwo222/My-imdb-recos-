@@ -23,6 +23,7 @@ env:
 jobs:
   check:
     runs-on: ubuntu-24.04
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,7 +33,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: pip cache
+      - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -48,7 +49,8 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
 
-      - name: Run engine (quick)
+      - name: Run engine (quick CI) — skip if secrets unavailable
+        id: run
         shell: bash
         env:
           TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
@@ -56,11 +58,26 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p data/out data/cache
+
+          # If secrets aren't available (e.g., PR from a fork), skip gracefully.
+          if [ -z "${TMDB_ACCESS_TOKEN:-}" ]; then
+            echo "TMDB_ACCESS_TOKEN not present (likely a PR from a fork). Skipping engine run."
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           python -m engine.runner
+
+          # Record the actual run directory from the marker file
           if [[ -f data/out/last_run_dir.txt ]]; then
             run_dir="$(< data/out/last_run_dir.txt)"
-            rm -rf data/out/latest
-            cp -r "${run_dir}" data/out/latest
+            echo "RUN_DIR=${run_dir}" >> "$GITHUB_OUTPUT"
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+            echo "CI run_dir: ${run_dir}"
+          else
+            echo "No last_run_dir.txt found; nothing to upload."
+            echo "RUN_DIR=" >> "$GITHUB_OUTPUT"
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Upload debug (always)
@@ -69,20 +86,20 @@ jobs:
         with:
           name: ci-debug-${{ github.run_number }}
           path: |
-            data/out/latest/runner.log
-            data/out/latest/assistant_feed.json
-            data/out/latest/items.discovered.json
-            data/out/latest/items.enriched.json
-            data/out/latest/summary.md
+            ${{ steps.run.outputs.RUN_DIR }}/runner.log
+            ${{ steps.run.outputs.RUN_DIR }}/assistant_feed.json
+            ${{ steps.run.outputs.RUN_DIR }}/items.discovered.json
+            ${{ steps.run.outputs.RUN_DIR }}/items.enriched.json
+            ${{ steps.run.outputs.RUN_DIR }}/summary.md
             data/out/last_run_dir.txt
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Upload site (default branch only)
-        if: github.ref == 'refs/heads/main'
+      - name: Upload site (main only)
+        if: ${{ !fromJSON(steps.run.outputs.skipped || 'false') && github.ref == 'refs/heads/main' && steps.run.outputs.RUN_DIR != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: ci-site-${{ github.run_number }}
-          path: data/out/latest
+          path: ${{ steps.run.outputs.RUN_DIR }}
           if-no-files-found: warn
           retention-days: 3
