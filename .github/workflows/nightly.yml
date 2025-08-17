@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
-      TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }} # ← Read Access Token (v4)
+      TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }} # TMDB v4 "API Read Access Token"
       IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
       REGION: US
       ORIGINAL_LANGS: en
@@ -35,7 +35,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # --- NEW: grab IMDb TSVs nightly so we can cross-check and enrich ---
+      # Optional: fetch IMDb TSV datasets (they're large). Keep them OUT of the main "out" artifact.
       - name: Fetch IMDb TSV datasets
         run: |
           set -euxo pipefail
@@ -61,24 +61,55 @@ jobs:
           python -m engine.debug_pack
           ls -lh data/out/latest || true
 
-      # Upload outputs + caches/state for diagnosis
-      - name: Upload artifacts (outputs + debug/state + ratings.csv)
+      # ──────────────────────────────────────────────────────────────
+      # ARTIFACTS (split for usability)
+      # ──────────────────────────────────────────────────────────────
+
+      # 1) Main outputs: light & quick to download
+      - name: Upload artifact — out (light)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: out
           if-no-files-found: warn
           compression-level: 6
+          retention-days: 14
           path: |
-            data/out/latest
+            data/out/latest/assistant_feed.json
+            data/out/latest/assistant_ranked.json
+            data/out/latest/summary.md
             data/cache/state/personal_state.json
             data/cache/state/personal_history.json
             data/cache/state/persistent_pool.json
-            data/cache/feedback
-            data/cache/tmdb
-            data/cache/imdb
             data/user/ratings.csv
 
+      # 2) Debug-only: the zip you asked for, as a separate, tiny artifact
+      - name: Upload artifact — debug-data.zip
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-data
+          if-no-files-found: warn
+          # No compression needed (it's already a zip)
+          compression-level: 0
+          retention-days: 14
+          path: data/out/latest/debug-data.zip
+
+      # 3) Heavy caches (optional to grab): TMDB/IMDb caches and IMDb TSVs
+      - name: Upload artifact — caches (heavy)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: caches
+          if-no-files-found: warn
+          compression-level: 1
+          retention-days: 7
+          path: |
+            data/cache/tmdb
+            data/cache/imdb
+            data/cache/feedback
+
+      # Run summary into the job summary UI
       - name: Add summary to run
         if: always()
         run: |
