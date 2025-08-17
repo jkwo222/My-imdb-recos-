@@ -2,7 +2,7 @@
 from __future__ import annotations
 import json
 import os
-from typing import Any, Dict, Iterable, Iterator, Mapping, MutableMapping
+from typing import Any, Dict, Iterable, Iterator, Mapping, MutableMapping, List
 
 
 class Env(MutableMapping[str, Any]):
@@ -29,11 +29,14 @@ class Env(MutableMapping[str, Any]):
         """
         Build an Env from process environment variables.
         Handles ORIGINAL_LANGS given as JSON list (e.g. '["en","es"]')
-        or CSV (e.g. 'en,es').
+        or CSV (e.g. 'en,es'). Also supports legacy TMDB_PAGES_* names,
+        normalizing into DISCOVER_PAGES.
         """
         region = os.getenv("REGION", "US").strip() or "US"
 
+        # ORIGINAL_LANGS: JSON or CSV (fallback to ["en"])
         langs_raw = os.getenv("ORIGINAL_LANGS", "").strip()
+        langs: List[str]
         if langs_raw.startswith("[") and langs_raw.endswith("]"):
             try:
                 langs = [str(x).strip() for x in json.loads(langs_raw) if str(x).strip()]
@@ -44,17 +47,43 @@ class Env(MutableMapping[str, Any]):
         else:
             langs = [langs_raw] if langs_raw else ["en"]
 
-        subs_include = os.getenv("SUBS_INCLUDE", "").strip()
-        pages_raw = os.getenv("DISCOVER_PAGES", "").strip()
-        try:
-            pages = int(pages_raw) if pages_raw else 3
-        except Exception:
-            pages = 3
+        # SUBS_INCLUDE: CSV or JSON list -> list[str]
+        subs_raw = os.getenv("SUBS_INCLUDE", "").strip()
+        if subs_raw.startswith("["):
+            try:
+                subs_list = [str(x).strip() for x in json.loads(subs_raw)]
+            except Exception:
+                subs_list = []
+        else:
+            subs_list = [t.strip() for t in subs_raw.split(",") if t.strip()]
+
+        # DISCOVER_PAGES (with legacy compat)
+        pages_env = os.getenv("DISCOVER_PAGES", "").strip()
+        if not pages_env:
+            # Legacy inputs
+            movie_pages = os.getenv("TMDB_PAGES_MOVIE", "").strip()
+            tv_pages = os.getenv("TMDB_PAGES_TV", "").strip()
+            try:
+                cands = [int(x) for x in (movie_pages, tv_pages) if x]
+                pages = max(cands) if cands else 12
+            except Exception:
+                pages = 12
+        else:
+            try:
+                pages = int(pages_env)
+            except Exception:
+                pages = 12
+
+        # Normalize reasonable bounds
+        if pages < 1:
+            pages = 1
+        if pages > 50:
+            pages = 50
 
         return cls({
             "REGION": region,
             "ORIGINAL_LANGS": langs,
-            "SUBS_INCLUDE": subs_include,
+            "SUBS_INCLUDE": subs_list,
             "DISCOVER_PAGES": pages,
         })
 
