@@ -41,6 +41,23 @@ jobs:
       - name: Make debug bundle
         run: bash ./.github/scripts/make_debug_bundle.sh
 
+      - name: Make debug bundle
+        run: bash ./.github/scripts/make_debug_bundle.sh
+
+      - name: Upload debug bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-data
+          path: debug-data.zip
+          if-no-files-found: warn
+
+      - name: Upload repo snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo-snapshot
+          path: repo-snapshot.zip
+          if-no-files-found: warn
+
       - name: Upload debug bundle
         uses: actions/upload-artifact@v4
         with:
