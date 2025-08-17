@@ -1,70 +1,70 @@
 # engine/imdb_ingest.py
 from __future__ import annotations
-import csv, gzip, io, os, pathlib, time, urllib.request
-from typing import Dict, Tuple
+from dataclasses import dataclass
+from typing import List, Optional
+import requests
+from bs4 import BeautifulSoup
 
-IMDB_DUMP = "https://datasets.imdbws.com"
-CACHE_DIR = pathlib.Path("data/cache/imdb")
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+@dataclass
+class IMDbItem:
+    title: str
+    year: Optional[int]
+    imdb_id: str
 
-BASICS = CACHE_DIR / "title.basics.tsv.gz"
-RATINGS = CACHE_DIR / "title.ratings.tsv.gz"
-
-def _http_get(url: str, dest: pathlib.Path) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(url, timeout=60) as r:
-        data = r.read()
-    dest.write_bytes(data)
-
-def _maybe_fetch(fname: pathlib.Path, url: str, ttl_hours: int) -> None:
-    if fname.exists():
-        age = time.time() - fname.stat().st_mtime
-        if age < ttl_hours * 3600:
-            return
-    _http_get(url, fname)
-
-def load_imdb_maps(ttl_hours: int = 72) -> Tuple[Dict[str, Tuple[str, int, str]], Dict[str, Tuple[float, int]]]:
+def scrape_imdb_ratings(url: str, max_pages: int = 20, timeout: int = 20) -> List[IMDbItem]:
     """
-    Returns:
-      basics_map: tconst -> (primaryTitle, startYear, titleType)
-      ratings_map: tconst -> (averageRating, numVotes)
+    Minimal, best-effort scraper for a public IMDb ratings list URL.
+    Strictly optional; caller must tolerate failures.
+    This follows 'Next' pagination (if present) but caps pages.
     """
-    _maybe_fetch(BASICS, f"{IMDB_DUMP}/title.basics.tsv.gz", ttl_hours)
-    _maybe_fetch(RATINGS, f"{IMDB_DUMP}/title.ratings.tsv.gz", ttl_hours)
+    out: List[IMDbItem] = []
+    seen_pages = 0
+    next_url = url
 
-    basics_map: Dict[str, Tuple[str, int, str]] = {}
-    ratings_map: Dict[str, Tuple[float, int]] = {}
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (compatible; imdb-recos/1.0)",
+        "Accept-Language": "en-US,en;q=0.8",
+    })
 
-    # basics
-    with gzip.open(BASICS, "rb") as f:
-        tsv = io.TextIOWrapper(f, encoding="utf-8", errors="ignore")
-        rdr = csv.DictReader(tsv, delimiter="\t")
-        for r in rdr:
-            tid = (r.get("tconst") or "").strip()
-            if not tid: continue
-            title = (r.get("primaryTitle") or r.get("originalTitle") or "").strip()
-            tt = (r.get("titleType") or "").strip()
-            y = r.get("startYear") or ""
-            try:
-                yy = int(y) if y.isdigit() else 0
-            except:
-                yy = 0
-            basics_map[tid] = (title, yy, tt)
+    while next_url and seen_pages < max_pages:
+        seen_pages += 1
+        r = session.get(next_url, timeout=timeout)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "lxml")
 
-    # ratings
-    with gzip.open(RATINGS, "rb") as f:
-        tsv = io.TextIOWrapper(f, encoding="utf-8", errors="ignore")
-        rdr = csv.DictReader(tsv, delimiter="\t")
-        for r in rdr:
-            tid = (r.get("tconst") or "").strip()
-            if not tid: continue
-            try:
-                avg = float(r.get("averageRating") or 0.0)
-                nv = int(r.get("numVotes") or 0)
-            except:
-                avg, nv = 0.0, 0
-            ratings_map[tid] = (avg, nv)
+        # Each row often includes a link to the title page with /title/ttXXXXXXX/
+        for a in soup.select("a[href*='/title/tt']"):
+            href = a.get("href") or ""
+            # e.g. /title/tt4154796/?ref_=rt_li_tt
+            m = None
+            # find the tt id segment
+            parts = href.split("/")
+            for k in parts:
+                if k.startswith("tt") and k[2:].isdigit():
+                    m = k
+                    break
+            if not m:
+                continue
+            imdb_id = m
+            title = (a.get_text() or "").strip()
+            year: Optional[int] = None
+            # Try to find a nearby year span
+            yr = None
+            parent = a.find_parent()
+            if parent:
+                yr_span = parent.find(string=lambda s: s and s.strip().startswith("(") and s.strip()[1:5].isdigit())
+                if yr_span:
+                    try:
+                        yr = int(str(yr_span).strip()[1:5])
+                    except Exception:
+                        yr = None
+            year = yr
+            if title:
+                out.append(IMDbItem(title=title, year=year, imdb_id=imdb_id))
 
-    print(f"[IMDb TSV] basics loaded: {len(basics_map):,}")
-    print(f"[IMDb TSV] ratings loaded: {len(ratings_map):,}")
-    return basics_map, ratings_map
+        # pagination: anchor text contains 'Next' or rel=next
+        n = soup.select_one("a[rel='next']") or soup.find("a", string=lambda s: s and "Next" in s)
+        next_url = (("https://www.imdb.com" + n.get("href")) if n and n.get("href") else None)
+
+    return out
