@@ -9,11 +9,13 @@ OUT_DIR = ROOT / "data" / "out" / "latest"
 FEED_JSON = OUT_DIR / "assistant_feed.json"
 SUMMARY_MD = OUT_DIR / "summary.md"
 
+
 def _fmt_float(x: Any, nd: int = 1) -> str:
     try:
         return f"{float(x):.{nd}f}"
     except Exception:
         return "—"
+
 
 def _pick_top(items: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
     # keep only non-hidden scored items
@@ -21,15 +23,16 @@ def _pick_top(items: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
     cand.sort(key=lambda it: (it.get("score", 0), it.get("imdb_rating", 0)), reverse=True)
     return cand[:max(0, int(limit))]
 
+
 def _render_taste_table(genre_weights: Dict[str, float]) -> str:
     if not genre_weights:
         return "_(No personalized genre signals available yet.)_\n"
-    # show top 8 by weight
     top = sorted(genre_weights.items(), key=lambda kv: kv[1], reverse=True)[:8]
     lines = ["| Genre | Weight |", "|---|---:|"]
     for g, w in top:
         lines.append(f"| {g} | {_fmt_float(w, 2)} |")
     return "\n".join(lines) + "\n"
+
 
 def _render_pick_row(i: int, it: Dict[str, Any]) -> str:
     title = it.get("title") or "Untitled"
@@ -38,24 +41,25 @@ def _render_pick_row(i: int, it: Dict[str, Any]) -> str:
     imdb = _fmt_float(it.get("imdb_rating"), 1)
     tmdb = _fmt_float(it.get("tmdb_rating"), 1)
     providers_str = ", ".join(it.get("providers", [])[:10]) if it.get("providers") else "—"
-    tconst = it.get("tconst") or ""
-    extra = []
+
+    extra_bits = []
     if it.get("penalties"):
         p = it["penalties"]
-        # show the parts that are non-zero
-        bits = []
+        parts = []
         if p.get("title", 0) > 0:
-            bits.append(f"title −{_fmt_float(p['title'], 0)}")
+            parts.append(f"title −{_fmt_float(p['title'], 0)}")
         if p.get("genre", 0) > 0:
-            bits.append(f"genre −{_fmt_float(p['genre'], 0)}")
-        if bits:
-            extra.append(f"penalties: {', '.join(bits)}")
+            parts.append(f"genre −{_fmt_float(p['genre'], 0)}")
+        if parts:
+            extra_bits.append(f"penalties: {', '.join(parts)}")
+
     line1 = f"{i}. **{title}** ({year}) — {kind}"
     line2 = f"   *score —  •  IMDb {imdb}  •  {providers_str}*"
     line3 = f"   > IMDb {imdb}; TMDB {tmdb}; {year}"
-    if extra:
-        line3 += f"  •  _{'; '.join(extra)}_"
+    if extra_bits:
+        line3 += f"  •  _{'; '.join(extra_bits)}_"
     return "\n".join([line1, line2, line3])
+
 
 def write_summary_md(env: Dict[str, str], genre_weights: Dict[str, float] | None = None, picks_limit: int = 15) -> None:
     """
@@ -63,7 +67,6 @@ def write_summary_md(env: Dict[str, str], genre_weights: Dict[str, float] | None
     using data/out/latest/assistant_feed.json.
     """
     genre_weights = genre_weights or {}
-
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     if not FEED_JSON.exists():
@@ -80,6 +83,7 @@ def write_summary_md(env: Dict[str, str], genre_weights: Dict[str, float] | None
     subs = (env.get("SUBS_INCLUDE") or "—").strip()
 
     kept = sum(1 for it in items if it.get("score", 0) >= 0)
+    hidden = sum(1 for it in items if it.get("score", -1) < 0 and it.get("hidden_reason") == "downvoted")
     top = _pick_top(items, picks_limit)
 
     parts: List[str] = []
@@ -87,7 +91,7 @@ def write_summary_md(env: Dict[str, str], genre_weights: Dict[str, float] | None
     parts.append("")
     parts.append(f"*Region*: **{region}**  •  *Original langs*: **{langs}**")
     parts.append(f"*Subscriptions filtered*: **{subs}**")
-    parts.append(f"*Candidates after filtering*: **{kept}**")
+    parts.append(f"*Candidates after filtering*: **{kept}**" + (f"  •  *Hidden via downvotes*: **{hidden}**" if hidden else ""))
     parts.append("")
     parts.append("## Your taste snapshot")
     parts.append("")
