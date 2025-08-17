@@ -121,9 +121,10 @@ report = {
   "vote_stats": {"count": len(votes), "min": min(votes) if votes else None, "median": (statistics.median(votes) if votes else None), "max": max(votes) if votes else None},
   "match_stats": {"count": len(matches), "min": min(matches) if matches else None, "median": (statistics.median(matches) if matches else None), "max": max(matches) if matches else None},
   "provider_map": (env_diag or {}).get("PROVIDER_MAP", {}),
+  "provider_unmatched": (env_diag or {}).get("PROVIDER_UNMATCHED", []),
 }
 (B/"analysis.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-(B/"analysis.md").write_text("# Diagnostics\\n\\n````json\\n"+json.dumps(report, indent=2)+"\\n````\\n", encoding="utf-8")
+(B/"analysis.md").write_text("# Diagnostics\n\n````json\n"+json.dumps(report, indent=2)+"\n````\n", encoding="utf-8")
 print("Wrote analysis into debug-bundle/analysis.{md,json}")
 PY
 
