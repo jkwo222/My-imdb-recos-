@@ -15,10 +15,10 @@ jobs:
     env:
       PYTHONUTF8: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
-      REGION: US
+      REGION: "US"
       ORIGINAL_LANGS: '["en"]'
       DISCOVER_PAGES: "12"
-      SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
+      SUBS_INCLUDE: "netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus"
       IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
       TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
 
@@ -50,29 +50,35 @@ jobs:
           if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
 
       - name: Run engine
+        id: run
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p data/out data/cache
-          echo "PYTHON_VERSION=$(python -V 2>&1)" >> $GITHUB_ENV
+          echo "PYTHON_VERSION=$(python -V 2>&1)" >> "$GITHUB_ENV"
           python -m engine.runner
           echo "RUN_DONE=1" >> "$GITHUB_OUTPUT"
+          if [[ -f data/out/last_run_dir.txt ]]; then
+            run_dir="$(< data/out/last_run_dir.txt)"
+            echo "RUN_DIR=${run_dir}" >> "$GITHUB_OUTPUT"
+          else
+            echo "RUN_DIR=" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Stamp last run marker (fallback)
+        if: steps.run.outputs.RUN_DIR == ''
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p data/out
-          if [ ! -f data/out/last_run_dir.txt ]; then
-            if compgen -G "data/out/run_*" > /dev/null; then
-              latest_dir="$(ls -dt data/out/run_* | head -n1)"
-              printf '%s\n' "$latest_dir" > data/out/last_run_dir.txt
-              rm -rf data/out/latest
-              ln -s "$latest_dir" data/out/latest 2>/dev/null || cp -r "$latest_dir" data/out/latest
-              echo "Stamped last_run_dir.txt with: $latest_dir"
-            else
-              echo "WARNING: no run_* dirs found; nothing to stamp"
-            fi
+          if compgen -G "data/out/run_*" > /dev/null; then
+            latest_dir="$(ls -dt data/out/run_* | head -n1)"
+            printf '%s\n' "$latest_dir" > data/out/last_run_dir.txt
+            rm -rf data/out/latest || true
+            ln -s "$latest_dir" data/out/latest 2>/dev/null || cp -r "$latest_dir" data/out/latest
+            echo "Stamped last_run_dir.txt with: $latest_dir"
+          else
+            echo "WARNING: no run_* dirs found; nothing to stamp"
           fi
 
       - name: Prepare latest dir for upload
@@ -88,7 +94,7 @@ jobs:
             echo "No run_* directories found under data/out"
             exit 0
           fi
-          rm -rf data/out/latest
+          rm -rf data/out/latest || true
           ln -s "$latest_dir" data/out/latest 2>/dev/null || cp -r "$latest_dir" data/out/latest
           echo "Latest run directory: $latest_dir"
           ls -al "data/out/latest" || true
@@ -101,7 +107,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Bundle debug data (with highlights)
+      - name: Bundle debug data
         shell: bash
         run: |
           set -euo pipefail
@@ -117,7 +123,6 @@ jobs:
             cp -f data/out/latest/items.enriched.json   debug-bundle/ 2>/dev/null || true
             cp -f data/out/latest/summary.md            debug-bundle/ 2>/dev/null || true
             cp -f data/out/latest/diag.json             debug-bundle/ 2>/dev/null || true
-            # Tail of runner.log for quick view
             if [ -f data/out/latest/runner.log ]; then
               tail -n 200 data/out/latest/runner.log > debug-bundle/runner-tail.txt || true
             fi
@@ -140,7 +145,6 @@ jobs:
               echo "HINT_TMDB_ACCESS_TOKEN_LEN=${#TMDB_ACCESS_TOKEN}"
             else
               echo "HINT_TMDB_ACCESS_TOKEN_LEN=0"
-            end_if_marker=1
             fi
             if [ -n "${IMDB_USER_ID:-}" ]; then
               echo "HINT_IMDB_USER_ID_SET=1"
@@ -149,7 +153,7 @@ jobs:
             fi
           } > debug-bundle/env-sanitized.txt
 
-          # 4) Repo tree + detailed listing
+          # 4) Repo tree + detailed listing (GNU find is available on ubuntu runners)
           {
             echo "# REPO TREE (find .)"
             find . -mindepth 1 -maxdepth 6 -printf "%y %M %u %g %9s %TY-%Tm-%Td %TT %p\n" 2>/dev/null | sort || true
@@ -217,69 +221,12 @@ jobs:
             ls -al data/cache/tmdb 2>/dev/null || true
           } > debug-bundle/listings.txt
 
-          # 10) Highlights (key lines from runner.log) + JSON quick summaries
-          {
-            echo "==== RUN HIGHLIGHTS ===="
-            if [ -f data/out/latest/runner.log ]; then
-              echo
-              echo ">> Key log lines:"
-              grep -E '^\s*\|\s*catalog:begin|^\s*\|\s*catalog:end|^\s*\|\s*results:|\[catalog\]|\[seen\]|\[enrich\]' data/out/latest/runner.log || echo "<no key lines found>"
-            else
-              echo "<runner.log missing>"
-            fi
-
-            echo
-            echo "==== QUICK JSON STATS ===="
-            # Prefer jq; fallback to Python
-            if command -v jq >/dev/null 2>&1; then
-              if [ -f data/out/latest/items.discovered.json ]; then
-                echo "items.discovered.json length: $(jq 'length' data/out/latest/items.discovered.json)"
-              fi
-              if [ -f data/out/latest/items.enriched.json ]; then
-                echo "items.enriched.json length: $(jq 'length' data/out/latest/items.enriched.json)"
-                echo "Top 3 titles (match desc where present):"
-                jq -r 'map({title, match, vote_average}) | .[:3][] | "- \(.title) | match=\(.match // "n/a") | vote=\(.vote_average // "n/a")"' data/out/latest/items.enriched.json
-              fi
-              if [ -f data/out/latest/assistant_feed.json ]; then
-                echo "assistant_feed.json length: $(jq 'length' data/out/latest/assistant_feed.json)"
-              fi
-              if [ -f data/out/latest/diag.json ]; then
-                echo "diag.json snapshot:"
-                jq -c '.' data/out/latest/diag.json
-              fi
-            else
-              python - <<'PY'
-import json, os, sys
-def load(p):
-    try:
-        with open(p, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception:
-        return None
-paths = {
-    "disc": "data/out/latest/items.discovered.json",
-    "enr":  "data/out/latest/items.enriched.json",
-    "feed": "data/out/latest/assistant_feed.json",
-    "diag": "data/out/latest/diag.json",
-}
-disc = load(paths["disc"]); enr = load(paths["enr"]); feed = load(paths["feed"]); diag = load(paths["diag"])
-print(f"items.discovered.json length: {len(disc) if isinstance(disc, list) else 'n/a'}")
-print(f"items.enriched.json length: {len(enr) if isinstance(enr, list) else 'n/a'}")
-if isinstance(enr, list):
-    top = enr[:3]
-    for it in top:
-        print(f"- {it.get('title')} | match={it.get('match','n/a')} | vote={it.get('vote_average','n/a')}")
-print(f"assistant_feed.json length: {len(feed) if isinstance(feed, list) else 'n/a'}")
-print("diag.json snapshot:", json.dumps(diag, ensure_ascii=False) if isinstance(diag, dict) else "n/a")
-PY
-            fi
-          } > debug-bundle/highlights.txt
-
-          # 11) Zip up
+          # 10) Zip up
           (cd debug-bundle && zip -q -r ../debug-data.zip .) || true
           ls -lh debug-data.zip || true
 
       - name: Upload debug artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: debug-data
