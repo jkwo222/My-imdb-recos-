@@ -1,7 +1,8 @@
 # engine/taste.py
+from __future__ import annotations
 import os, json, pathlib
 from typing import Dict, List
-from .catalog_builder import _omdb_enrich
+from . import imdb_bulk
 
 PROFILE = pathlib.Path("data/taste_profile.json")
 
@@ -11,21 +12,26 @@ def _norm_rating(your: float) -> float:
 
 def build_taste(rows: List[Dict]) -> Dict[str, float]:
     """
-    Build per-genre/tag affinities from your rated titles.
-    Uses OMDb (cached) to fetch genres for rated items if needed.
+    Build per-genre affinities from your rated titles using IMDb TSV genres.
     """
     if not rows:
         return json.load(open(PROFILE,"r")) if PROFILE.exists() else {}
 
+    imdb_bulk.load()
     sums, counts = {}, {}
     for r in rows:
-        your = float(r.get("your_rating") or 0.0)
-        if your <= 0: continue
+        try:
+            your = float(r.get("your_rating") or 0.0)
+        except Exception:
+            continue
+        if your <= 0: 
+            continue
         imdb_id = (r.get("imdb_id") or "").strip()
-        title = r.get("title",""); year = int(r.get("year") or 0)
-        e = _omdb_enrich(title, year, "tv" if "tv" in (r.get("type") or "") else "movie", imdb_id=imdb_id)
-        genres = e.get("genres") or []
-        if not genres: continue
+        if not imdb_id:
+            continue
+        genres = imdb_bulk.get_genres(imdb_id) or []
+        if not genres:
+            continue
         val = _norm_rating(your)
         for g in genres:
             sums[g] = sums.get(g, 0.0) + val
