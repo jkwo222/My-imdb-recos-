@@ -5,23 +5,22 @@ import json
 import os
 from typing import Dict, List, Tuple, Any
 
-# Import TMDB helpers
 from .tmdb import (
     discover_movie_page,
     discover_tv_page,
     providers_from_env,
 )
 
-# ---------- small utilities ----------
+# ========== helpers ==========
 
 def _env_str(name: str, default: str) -> str:
     v = os.getenv(name)
-    return v if v is not None and v != "" else default
+    return v if v not in (None, "") else default
 
 def _env_int(name: str, default: int) -> int:
     v = os.getenv(name)
     try:
-        return int(v) if v is not None and v != "" else default
+        return int(v) if v not in (None, "") else default
     except Exception:
         return default
 
@@ -29,149 +28,167 @@ def _env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
     if v is None:
         return default
-    v = v.strip().lower()
-    if v in ("1", "true", "yes", "y", "on"):
+    s = v.strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
         return True
-    if v in ("0", "false", "no", "n", "off"):
+    if s in ("0", "false", "no", "n", "off"):
         return False
     return default
 
 def _cfg_get(cfg: Any, key: str, default: Any) -> Any:
-    """
-    Safe accessor that prefers cfg.<key> if present, else env var,
-    else default. This avoids AttributeError when Config is missing keys.
-    Converts to correct types based on 'default' type.
-    """
     # 1) try attribute on cfg
     if cfg is not None and hasattr(cfg, key):
         try:
             return getattr(cfg, key)
         except Exception:
             pass
-
-    # 2) env var (we map pythonic key -> ENV_STYLE)
+    # 2) env fallback (key uppercased)
     env_key = key.upper()
     if isinstance(default, bool):
         return _env_bool(env_key, default)
     if isinstance(default, int):
         return _env_int(env_key, default)
-    # strings / others
     return _env_str(env_key, default)
 
+# ---------- persistent files ----------
 
 def _store_path() -> str:
     return os.path.join("data", "catalog_store.json")
 
+def _cursor_path() -> str:
+    return os.path.join("data", "catalog_cursor.json")
 
 def _load_store() -> List[Dict]:
-    path = _store_path()
-    if not os.path.exists(path):
+    p = _store_path()
+    if not os.path.exists(p):
         return []
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(p, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, list):
-            return data
-        # tolerate older dict-shaped stores
-        return data.get("items", [])
+        return data if isinstance(data, list) else data.get("items", [])
     except Exception:
         return []
-
 
 def _save_store(items: List[Dict]) -> None:
     os.makedirs("data", exist_ok=True)
     with open(_store_path(), "w", encoding="utf-8") as f:
         json.dump(items, f, ensure_ascii=False)
 
+def _load_cursor() -> Dict[str, int]:
+    p = _cursor_path()
+    if not os.path.exists(p):
+        return {"movie_next": 1, "tv_next": 1}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            c = json.load(f)
+        if not isinstance(c, dict):
+            return {"movie_next": 1, "tv_next": 1}
+        # sanity defaults
+        c.setdefault("movie_next", 1)
+        c.setdefault("tv_next", 1)
+        return c
+    except Exception:
+        return {"movie_next": 1, "tv_next": 1}
+
+def _save_cursor(cursor: Dict[str, int]) -> None:
+    os.makedirs("data", exist_ok=True)
+    with open(_cursor_path(), "w", encoding="utf-8") as f:
+        json.dump(cursor, f, ensure_ascii=False)
+
+# ---------- list ops ----------
 
 def _dedupe(items: List[Dict]) -> List[Dict]:
-    """
-    Deduplicate by (type, tmdb_id). Keep the first occurrence.
-    """
     seen = set()
     out = []
     for it in items:
-        t = it.get("type")
-        i = it.get("tmdb_id")
-        k = (t, i)
+        k = (it.get("type"), it.get("tmdb_id"))
         if k in seen:
             continue
         seen.add(k)
         out.append(it)
     return out
 
-
 def _trim(items: List[Dict], max_catalog: int) -> List[Dict]:
-    """
-    Keep at most max_catalog items. Simple heuristic:
-    - prefer keeping items with higher popularity first if available
-    - otherwise just keep first N
-    """
     def popkey(it: Dict) -> float:
-        # Higher popularity first; default 0.0
         return float(it.get("popularity", 0.0))
+    return sorted(items, key=popkey, reverse=True)[:max_catalog]
 
-    # sort descending by popularity, stable
-    items_sorted = sorted(items, key=popkey, reverse=True)
-    return items_sorted[:max_catalog]
+# ---------- paging plan ----------
 
+# TMDB caps discover at 500 pages
+_TMDB_MAX_PAGES = 500
 
-# ---------- TMDB fetch plan ----------
+def _page_window(start: int, count: int) -> List[int]:
+    """
+    Return a list of 'count' pages starting at 'start', wrapping after 500.
+    Pages are 1-based.
+    """
+    if count <= 0:
+        return []
+    pages = []
+    p = max(1, min(start, _TMDB_MAX_PAGES))
+    for _ in range(count):
+        pages.append(p)
+        p += 1
+        if p > _TMDB_MAX_PAGES:
+            p = 1
+    return pages
 
-def _make_page_plan(cfg: Any) -> Dict[str, int]:
-    # default pages
-    movie_pages = _cfg_get(cfg, "tmdb_pages_movie", 24)
-    tv_pages    = _cfg_get(cfg, "tmdb_pages_tv", 24)
-
-    # hard floor
-    if movie_pages < 0: movie_pages = 0
-    if tv_pages    < 0: tv_pages    = 0
-
-    return {"movie_pages": int(movie_pages), "tv_pages": int(tv_pages)}
-
+# ---------- fetch ----------
 
 def _fetch_all_tmdb(cfg: Any) -> Tuple[List[Dict], Dict]:
+    # subscriptions / filters
     subs_csv = _cfg_get(
         cfg, "subs_include",
-        "netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus",
+        _env_str("SUBS_INCLUDE", "netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus"),
     )
     region = _cfg_get(cfg, "watch_region", _env_str("REGION", "US"))
-    langs = _cfg_get(cfg, "original_langs", _env_str("ORIGINAL_LANGS", "en"))
-    include_tv_seasons = _cfg_get(cfg, "include_tv_seasons", True)
+    langs  = _cfg_get(cfg, "original_langs", _env_str("ORIGINAL_LANGS", "en"))
 
-    plan = _make_page_plan(cfg)
-    mpages = plan["movie_pages"]
-    tpages = plan["tv_pages"]
+    # pages per run
+    movie_pages_per_run = int(_cfg_get(cfg, "tmdb_pages_movie", _env_int("TMDB_PAGES_MOVIE", 24)))
+    tv_pages_per_run    = int(_cfg_get(cfg, "tmdb_pages_tv",    _env_int("TMDB_PAGES_TV", 24)))
+
+    # paging cursor (advances each run)
+    cursor = _load_cursor()
+    movie_start = int(cursor.get("movie_next", 1))
+    tv_start    = int(cursor.get("tv_next", 1))
+
+    movie_pages = _page_window(movie_start, movie_pages_per_run)
+    tv_pages    = _page_window(tv_start, tv_pages_per_run)
 
     provider_ids = providers_from_env(subs_csv, region)
 
     fresh: List[Dict] = []
+
     # Movies
-    for p in range(1, mpages + 1):
+    for p in movie_pages:
         items, _ = discover_movie_page(
-            p,
-            region=region,
-            provider_ids=provider_ids,
-            original_langs=langs,
+            p, region=region, provider_ids=provider_ids, original_langs=langs
         )
         fresh.extend(items)
 
     # TV
-    for p in range(1, tpages + 1):
+    for p in tv_pages:
         items, _ = discover_tv_page(
-            p,
-            region=region,
-            provider_ids=provider_ids,
-            original_langs=langs,
-            include_seasons=include_tv_seasons,
+            p, region=region, provider_ids=provider_ids, original_langs=langs
         )
         fresh.extend(items)
 
+    # advance and persist cursor for next run
+    next_movie = movie_pages[-1] + 1 if movie_pages else movie_start
+    next_tv    = tv_pages[-1] + 1 if tv_pages else tv_start
+    if next_movie > _TMDB_MAX_PAGES: next_movie = 1
+    if next_tv    > _TMDB_MAX_PAGES: next_tv    = 1
+    _save_cursor({"movie_next": next_movie, "tv_next": next_tv})
+
     meta = {
         "counts": {
-            "tmdb_pool": len(fresh),
-            "movie_pages": mpages,
-            "tv_pages": tpages,
+            "tmdb_pool": len(fresh),      # fresh batch this run
+            "movie_pages_fetched": len(movie_pages),
+            "tv_pages_fetched": len(tv_pages),
+            "movie_start_page": movie_start,
+            "tv_start_page": tv_start,
         },
         "filters": {
             "region": region,
@@ -179,70 +196,57 @@ def _fetch_all_tmdb(cfg: Any) -> Tuple[List[Dict], Dict]:
             "providers_env": subs_csv,
             "provider_ids": provider_ids,
         },
+        "cursor_after": {"movie_next": next_movie, "tv_next": next_tv},
     }
     return fresh, meta
 
+# ---------- simple ranking placeholder ----------
 
-# ---------- Ranking placeholder ----------
-# Keep simple; your runner computes shortlist/shown later.
 def _rank(unseen: List[Dict], critic_weight: float, audience_weight: float) -> List[Dict]:
-    # Very basic score: vote_average (0..10) scaled
     for it in unseen:
-        va = float(it.get("vote_average", 0.0))
+        va  = float(it.get("vote_average", 0.0))  # 0..10
         pop = float(it.get("popularity", 0.0))
-        # lightweight blend; you can wire your profile DNA upstream into this later
         score = (critic_weight * va * 10.0) + (audience_weight * min(pop, 100.0) * 0.1)
         it["match"] = round(score, 1)
-    # sort descending by match
     return sorted(unseen, key=lambda x: x.get("match", 0.0), reverse=True)
 
-
-# ---------- main entry called by runner ----------
+# ---------- entrypoint ----------
 
 def build_pool(cfg: Any) -> Tuple[List[Dict], Dict]:
     """
-    Returns (pool, meta)
-
-    Behavior:
-    - fetch fresh TMDB results using env/cfg
-    - merge with previous store (on disk) to make a cumulative catalog
-    - trim to MAX_CATALOG, then return as the pool
-    - write the merged store back to disk
-    - meta contains 'counts.tmdb_pool' (fresh only) and 'counts.cumulative'
+    - Fetch next window of TMDB pages (cursorized) for both movies & TV
+    - Merge with previous cumulative store
+    - Trim to MAX_CATALOG
+    - Save store and return the cumulative pool
     """
     print("[hb] | catalog:begin", flush=True)
 
-    max_catalog = _cfg_get(cfg, "max_catalog", _env_int("MAX_CATALOG", 10000))
+    max_catalog = int(_cfg_get(cfg, "max_catalog", _env_int("MAX_CATALOG", 10000)))
 
-    # Get fresh batch from TMDB
     fresh, meta = _fetch_all_tmdb(cfg)
     fresh = _dedupe(fresh)
 
-    # Load previous
     prev = _load_store()
-
-    # Merge previous + fresh (union by (type, tmdb_id))
     merged = _dedupe(prev + fresh)
-
-    # Trim to cap
     merged = _trim(merged, max_catalog)
-
-    # Persist cumulative store
     _save_store(merged)
 
-    # The pool we feed downstream is the cumulative set
     pool = merged
 
-    # Enrich meta for telemetry
+    # telemetry
     meta.setdefault("counts", {})
     meta["counts"]["cumulative"] = len(merged)
-    meta["counts"]["eligible_unseen"] = len(pool)  # if you later exclude seen, adjust here
+    # keep this equal to pool unless/ until you exclude already-seen here
+    meta["counts"]["eligible_unseen"] = len(pool)
 
-    # Optional weights for ranking later (fall back to sensible defaults if absent)
+    # weights (defaults if not provided)
     meta["weights"] = {
         "critic_weight": float(_cfg_get(cfg, "critic_weight", 0.6)),
         "audience_weight": float(_cfg_get(cfg, "audience_weight", 0.4)),
     }
 
-    print(f"[hb] | catalog:end pool={len(pool)} movie={meta['counts'].get('movie_pages', 0)*20} tv={meta['counts'].get('tv_pages', 0)*20}", flush=True)
+    # basic movie/tv counts for the pretty log line (approximation: pages*20)
+    movie_pages_fetched = int(meta["counts"].get("movie_pages_fetched", 0))
+    tv_pages_fetched    = int(meta["counts"].get("tv_pages_fetched", 0))
+    print(f"[hb] | catalog:end pool={len(pool)} movie={movie_pages_fetched*20} tv={tv_pages_fetched*20}", flush=True)
     return pool, meta
