@@ -1,139 +1,123 @@
-# engine/runner.py
+# FILE: engine/runner.py
 from __future__ import annotations
-import json, os, pathlib, time, datetime
-from typing import Any, Dict, List
+import os, json, time, pathlib
+from typing import Dict, List, Tuple
 
-from rich import print as rprint
-
-from .ratings_ingest import load_user_ratings_combined
-from .imdb_ingest import load_imdb_maps
-from .catalog_builder import build_catalog
-from .seen_index import filter_unseen, load_seen_index
-from .taste import build_taste
+from .catalog_builder import build_catalog, ensure_imdb_cache
 from .feed import filter_by_providers, score_items, top10_by_type, to_markdown
-from .store import load_store, save_store, remember
-from .weights import load_weights, update_from_ratings
+from .store import PersistentPool
 
-OUT_ROOT = pathlib.Path("data/out")
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+OUT_LATEST = ROOT / "data" / "out" / "latest"
+OUT_DAILY_DIR = ROOT / "data" / "out" / "daily"
+DEBUG_DIR = ROOT / "data" / "debug"
 
-def _env_list(name: str, default: str) -> List[str]:
-    raw = os.environ.get(name, default)
-    return [s.strip() for s in (raw or "").split(",") if s.strip()]
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+def _weights_path() -> pathlib.Path:
+    return ROOT / "data" / "weights_live.json"
+
+def _default_weights() -> Dict[str, float]:
+    # You can tweak these; runner never hard-fails if file missing
+    return {"critic_weight": 0.35, "audience_weight": 0.65, "commitment_cost_scale": 1.0, "novelty_weight": 0.15}
+
+def load_weights() -> Dict[str, float]:
+    p = _weights_path()
+    if p.exists():
+        try:
+            return json.load(open(p, "r", encoding="utf-8"))
+        except Exception:
+            pass
+    return _default_weights()
+
+def _min_match_cut() -> float:
+    try:
+        return float(os.environ.get("MIN_MATCH_CUT", "58.0"))
+    except Exception:
+        return 58.0
+
+def _subs_include() -> List[str]:
+    raw = os.environ.get("SUBS_INCLUDE","").strip()
+    if not raw: return []
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+def _write_json(path: pathlib.Path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    json.dump(data, open(path, "w", encoding="utf-8"), indent=2)
+
+def _write_text(path: pathlib.Path, text: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
 
 def main():
-    rprint(" | catalog:begin")
+    print(" | catalog:begin")
+    weights = load_weights()
 
-    # Ratings (local + public scrape)
-    rows, meta = load_user_ratings_combined()
-    rprint(f"IMDb ratings loaded → rows={len(rows)} meta={meta}")
+    # Ensure IMDb TSV cache exists/updated (weekly datasets, cached to disk)
+    ensure_imdb_cache()
 
-    # Weights
-    w = load_weights()
-    # Nudge from ratings
-    try:
-        w = update_from_ratings(rows)
-    except Exception:
-        pass
-    # keep novelty weight if already present
-    if "novelty_weight" not in w:
-        w["novelty_weight"] = float(os.environ.get("NOVELTY_WEIGHT","0.15"))
-    rprint(f"weights → {w}")
+    # Build a fresh batch (TMDB discover + details + providers + IMDb ratings join)
+    pool = build_catalog()
 
-    # IMDb TSV aggregates (cached weekly via Actions cache)
-    basics_map, ratings_map = load_imdb_maps(ttl_hours=72)
+    print(f"catalog built → {len(pool)} items")
 
-    # Build pool from TMDB; attach imdb aggregates when ids present
-    pool = build_catalog(basics_map, ratings_map)
-    rprint(f"catalog built → {len(pool)} items")
+    allowed = _subs_include()
+    kept = filter_by_providers(pool, allowed)
+    print(f"provider-filter keep={allowed} → {len(kept)} items")
 
-    # Provider filter
-    subs = _env_list("SUBS_INCLUDE", "netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus")
-    keep = filter_by_providers(pool, subs)
-    rprint(f"provider-filter keep={subs} → {len(keep)} items")
+    # Merge into persistent pool (accumulate over time)
+    store = PersistentPool(ROOT / "data" / "cache" / "pool.json")
+    merged = store.merge_and_save(kept)
+    # merged is the current full memory of all known items
+    print(f"persistent-pool size → {len(merged)} items (accumulated)")
 
-    # Unseen (title/year fuzzy or imdb id)
-    seen_idx = load_seen_index(os.environ.get("IMDB_RATINGS_CSV_PATH","data/ratings.csv"))
-    unseen = filter_unseen(keep, seen_idx)
-    rprint(f"unseen-only → {len(unseen)} items")
+    # Score the *current* candidates (today's kept batch) using weights
+    scored_today = score_items(kept, weights)
 
-    # Taste profile (from ratings)
-    taste = build_taste(rows)
-    rprint(f"taste profile → {len(taste)} genres")
+    # Cut by min_match
+    mincut = _min_match_cut()
+    scored_today = [r for r in scored_today if r.get("match", 0) >= mincut]
+    movies, series = top10_by_type(scored_today)
 
-    # Score, cut, top10s
-    scored = score_items(unseen, w)
-    min_cut = float(os.environ.get("MIN_MATCH_CUT","58.0"))
-    scored = [x for x in scored if float(x.get("match") or 0.0) >= min_cut]
-    movies, series = top10_by_type(scored)
+    meta = {
+        "pool_sizes": {
+            "today_initial": len(pool),
+            "today_kept": len(kept),
+            "today_scored_kept": len(scored_today),
+            "accumulated_total": len(merged),
+        },
+        "weights": weights,
+        "subs": allowed,
+    }
 
-    # Persist long-lived store
-    store = load_store()
-    store = remember(store, pool)          # grows over time
-    save_store(store)
-
-    # Output files
-    today = datetime.date.today().isoformat()
-    day_dir = OUT_ROOT / "daily" / today
-    latest_dir = OUT_ROOT / "latest"
-    day_dir.mkdir(parents=True, exist_ok=True)
-    latest_dir.mkdir(parents=True, exist_ok=True)
-
-    # Full assistant feed (up to 99 like before)
+    # Export latest dir
+    OUT_LATEST.mkdir(parents=True, exist_ok=True)
     feed = {
         "generated_at": int(time.time()),
-        "count": len(scored[:99]),
-        "items": scored[:99],
-        "meta": {
-            "pool_sizes": {
-                "initial": len(pool),
-                "providers": len(keep),
-                "unseen": len(unseen),
-                "fresh": len(scored),
-                "final": len(scored[:99]),
-            },
-            "weights": {
-                "audience_weight": round(w.get("audience_weight",0.5),2),
-                "critic_weight": round(w.get("critic_weight",0.5),2),
-                "commitment_cost_scale": w.get("commitment_cost_scale",1.0),
-                "novelty_weight": w.get("novelty_weight",0.15),
-                "min_match_cut": min_cut,
-            },
-            "subs": subs
-        }
+        "count": len(scored_today),
+        "items": scored_today,
+        "meta": meta,
     }
-    for dest in (day_dir/"assistant_feed.json", latest_dir/"assistant_feed.json"):
-        json.dump(feed, open(dest,"w"), indent=2)
+    _write_json(OUT_LATEST / "assistant_feed.json", feed)
+    _write_json(OUT_LATEST / "top10.json", {"movies": movies, "series": series, "meta": meta})
 
-    # Top 10s export
-    top10 = {
-        "generated_at": int(time.time()),
-        "movies": movies,
-        "series": series,
-    }
-    for dest in (day_dir/"top10.json", latest_dir/"top10.json"):
-        json.dump(top10, open(dest,"w"), indent=2)
+    md = to_markdown(movies, series, weights, meta)
+    _write_text(OUT_LATEST / "summary.md", md)
 
-    # Markdown summary for GitHub notifications (issues / step summary)
-    md = []
-    md.append(f"## Daily Recs — {today}")
-    md.append("")
-    md.append(f"- Pool: initial={len(pool)} | providers={len(keep)} | unseen={len(unseen)} | cut≥{min_cut} → {len(scored)}")
-    md.append(f"- Subs: {', '.join(subs)}")
-    md.append("")
-    md.append("—")
-    md.append("")
-    md.append(to_markdown(movies, series, taste))
-    md.append("")
-    md_text = "\n".join(md)
-    (day_dir/"summary.md").write_text(md_text, encoding="utf-8")
-    (latest_dir/"summary.md").write_text(md_text, encoding="utf-8")
+    # Also export into dated daily folder
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    daily_dir = OUT_DAILY_DIR / day
+    _write_json(daily_dir / "assistant_feed.json", feed)
+    _write_json(daily_dir / "top10.json", {"movies": movies, "series": series, "meta": meta})
+    _write_text(daily_dir / "summary.md", md)
 
-    # Print summary to STDOUT so your workflow can pick it up (and you see it in logs)
-    print("\n==== BEGIN SUMMARY ====\n")
-    print(md_text)
-    print("\n==== END SUMMARY ====\n")
+    # Optional debug dump
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    _write_json(DEBUG_DIR / "last_pool.json", pool)
 
-    rprint(f" | catalog:end pool={len(pool)} feed={len(scored[:99])} → {day_dir/'assistant_feed.json'}")
+    print(f" | catalog:end kept={len(kept)} scored_cut={len(scored_today)} → {OUT_LATEST / 'assistant_feed.json'}")
 
 if __name__ == "__main__":
     main()
