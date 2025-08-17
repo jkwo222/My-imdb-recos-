@@ -3,7 +3,7 @@ name: nightly
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 16 * * *"  # daily @ 16:30 UTC
+    - cron: "30 16 * * *"
 
 permissions:
   contents: write
@@ -17,7 +17,7 @@ jobs:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       REGION: US
       ORIGINAL_LANGS: '["en"]'
-      DISCOVER_PAGES: "12"  # expanded pages
+      DISCOVER_PAGES: "12"
       SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
       IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
       TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
@@ -54,10 +54,11 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p data/out data/cache
+          # Optional: export Python version/env hints for diag
+          echo "PYTHON_VERSION=$(python -V 2>&1)" >> $GITHUB_ENV
           python -m engine.runner
           echo "RUN_DONE=1" >> "$GITHUB_OUTPUT"
 
-      # ---- Fallback stamping if runner didn't write last_run_dir.txt ----
       - name: Stamp last run marker (fallback)
         shell: bash
         run: |
@@ -75,7 +76,7 @@ jobs:
             fi
           fi
 
-      - name: Prepare latest dir for upload (robust)
+      - name: Prepare latest dir for upload
         shell: bash
         run: |
           set -euo pipefail
@@ -101,7 +102,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # ---- Rich, compact debug bundle with file/link tree & diagnostics ----
       - name: Bundle debug data
         shell: bash
         run: |
@@ -110,16 +110,21 @@ jobs:
           rm -rf debug-bundle
           mkdir -p debug-bundle
 
-          # 1) Copy primary outputs if they exist
+          # 1) Copy primary outputs if present
           if [ -d "data/out/latest" ]; then
-            cp -f data/out/latest/runner.log           debug-bundle/ 2>/dev/null || true
-            cp -f data/out/latest/assistant_feed.json  debug-bundle/ 2>/dev/null || true
+            cp -f data/out/latest/runner.log            debug-bundle/ 2>/dev/null || true
+            cp -f data/out/latest/assistant_feed.json   debug-bundle/ 2>/dev/null || true
             cp -f data/out/latest/items.discovered.json debug-bundle/ 2>/dev/null || true
-            cp -f data/out/latest/items.enriched.json  debug-bundle/ 2>/dev/null || true
-            cp -f data/out/latest/summary.md           debug-bundle/ 2>/dev/null || true
+            cp -f data/out/latest/items.enriched.json   debug-bundle/ 2>/dev/null || true
+            cp -f data/out/latest/summary.md            debug-bundle/ 2>/dev/null || true
+            cp -f data/out/latest/diag.json             debug-bundle/ 2>/dev/null || true
+            # Tail of runner.log for quick view
+            if [ -f data/out/latest/runner.log ]; then
+              tail -n 200 data/out/latest/runner.log > debug-bundle/runner-tail.txt || true
+            fi
           fi
 
-          # 2) Minimal, explicit env snapshot (already present)
+          # 2) Minimal env snapshot
           {
             echo "REGION=${REGION}"
             echo "SUBS_INCLUDE=${SUBS_INCLUDE}"
@@ -127,13 +132,11 @@ jobs:
             echo "DISCOVER_PAGES=${DISCOVER_PAGES}"
           } > debug-bundle/env.txt
 
-          # 3) Sanitized full env (mask common secret-like vars)
-          # We avoid printing token values; we only show presence/length for a few.
+          # 3) Sanitized full env
           {
             printenv | sort | sed \
               -e 's/\(AUTH\|TOKEN\|SECRET\|PASSWORD\|KEY\)=.*/\1=***REDACTED***/I' \
               -e 's/\(COOKIE\)=.*/\1=***REDACTED***/I'
-            # Add derived hints (lengths only, not values)
             if [ -n "${TMDB_ACCESS_TOKEN:-}" ]; then
               echo "HINT_TMDB_ACCESS_TOKEN_LEN=${#TMDB_ACCESS_TOKEN}"
             else
@@ -146,9 +149,7 @@ jobs:
             fi
           } > debug-bundle/env-sanitized.txt
 
-          # 4) Repo tree and symlink-aware listings (no file contents)
-          #    - find + stat-like info via ls -lR
-          #    - symlink resolutions where applicable
+          # 4) Repo tree + detailed listing
           {
             echo "# REPO TREE (find .)"
             find . -mindepth 1 -maxdepth 6 -printf "%y %M %u %g %9s %TY-%Tm-%Td %TT %p\n" 2>/dev/null | sort || true
@@ -157,6 +158,7 @@ jobs:
             ls -alR || true
           } > debug-bundle/tree.txt
 
+          # 5) Symlink targets
           {
             echo "# SYMLINK TARGETS"
             echo "data/out/latest -> $(readlink -f data/out/latest 2>/dev/null || echo '<not a symlink or missing>')"
@@ -167,7 +169,7 @@ jobs:
             fi
           } > debug-bundle/links.txt
 
-          # 5) Git context
+          # 6) Git context
           {
             echo "# git rev"
             git log -1 --oneline || true
@@ -179,7 +181,7 @@ jobs:
             git remote -v || true
           } > debug-bundle/git.txt
 
-          # 6) Python environment
+          # 7) Python environment
           {
             echo "# Python info"
             which python || true
@@ -189,7 +191,7 @@ jobs:
             pip freeze || true
           } > debug-bundle/python.txt
 
-          # 7) Directory sizes and free space
+          # 8) Directory sizes & free space
           {
             echo "# sizes"
             du -sh . 2>/dev/null || true
@@ -200,7 +202,7 @@ jobs:
             df -h . || true
           } > debug-bundle/dirs.txt
 
-          # 8) Focused listings of interesting dirs
+          # 9) Focus listings
           {
             echo "# data/out (top)"
             ls -al data/out 2>/dev/null || true
@@ -215,7 +217,7 @@ jobs:
             ls -al data/cache/tmdb 2>/dev/null || true
           } > debug-bundle/listings.txt
 
-          # 9) Zip up
+          # 10) Zip up
           (cd debug-bundle && zip -q -r ../debug-data.zip .) || true
           ls -lh debug-data.zip || true
 
