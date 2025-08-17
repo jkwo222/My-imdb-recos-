@@ -2,8 +2,8 @@ name: nightly
 
 on:
   schedule:
-    - cron: "15 2 * * *"   # 02:15 UTC daily
-  workflow_dispatch:
+    - cron: "0 3 * * *"   # 3:00 UTC daily
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -12,62 +12,79 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
-
-    # Map secrets -> env, then use env.* in if:
     env:
       TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
       REGION: US
       ORIGINAL_LANGS: en
       SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
-      MIN_MATCH_CUT: "58.0"
-      # OPTIONAL: put an issue number (e.g. "1") in this repo secret
-      RECS_ISSUE_NUMBER: ${{ secrets.RECS_ISSUE_NUMBER }}
-
+      MIN_MATCH_CUT: 58.0
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run recommender
+      - name: Run engine
         run: |
+          set -e
           python -m engine.runner
 
-      - name: Upload latest artifacts
+      - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: out
           path: data/out/latest
           if-no-files-found: warn
 
-      - name: Append summary to job summary
-        if: ${{ hashFiles('data/out/latest/SUMMARY.md') != '' }}
-        shell: bash
+      - name: Add summary to run
+        if: always()
         run: |
-          echo "## Assistant Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          cat data/out/latest/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+          echo "## Daily recommendations" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f data/out/latest/summary.md ]; then
+            cat data/out/latest/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_No summary produced (data/out/latest/summary.md missing)._ " >> "$GITHUB_STEP_SUMMARY"
+          fi
 
-      # Optional: comment the summary to a GitHub Issue (uses GITHUB_TOKEN)
-      - name: Comment summary to issue
-        if: ${{ env.RECS_ISSUE_NUMBER != '' && hashFiles('data/out/latest/SUMMARY.md') != '' }}
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const fs = require('fs');
-            const body = fs.readFileSync('data/out/latest/SUMMARY.md', 'utf8');
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: parseInt(process.env.RECS_ISSUE_NUMBER, 10),
-              body
-            });
+      - name: Ensure gh CLI
+        if: always()
+        run: |
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "gh CLI missing."; exit 0
+          fi
+
+      - name: Create/find 'Daily Recommendations' issue and comment results
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TITLE="Daily Recommendations"
+          BODY="No summary produced for this run."
+          if [ -f data/out/latest/summary.md ]; then
+            BODY="$(cat data/out/latest/summary.md)"
+          fi
+
+          # find open issue by title
+          ISSUE_NUMBER=$(gh api -X GET repos/${{ github.repository }}/issues --paginate -q \
+            '.[] | select(.state=="open" and .title=="'"$TITLE"'") | .number' | head -n1)
+
+          # create if missing
+          if [ -z "$ISSUE_NUMBER" ]; then
+            ISSUE_NUMBER=$(gh api -X POST repos/${{ github.repository }}/issues \
+              -f title="$TITLE" -f body="Tracking thread for daily recommendation digests." -q '.number')
+          fi
+
+          # post comment
+          gh api -X POST repos/${{ github.repository }}/issues/$ISSUE_NUMBER/comments \
+            -f body="$BODY" >/dev/null
+
+          echo "Commented to issue #$ISSUE_NUMBER"
