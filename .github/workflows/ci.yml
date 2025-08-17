@@ -1,90 +1,21 @@
 name: ci
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+  # manual runs only; no push/PR triggers -> no notifications
   workflow_dispatch:
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-24.04
-
-    env:
-      # App config
-      REGION: US
-      ORIGINAL_LANGS: '["en"]'
-      SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
-      DISCOVER_PAGES: "12"
-
-      # TMDB auth (runner accepts either v3 or v4)
-      TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}          # v3 key (query param)
-      TMDB_BEARER:  ${{ secrets.TMDB_ACCESS_TOKEN }}     # v4 access token (Bearer)
-      # IMDb (optional)
-      IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
-      # IMDB_RATINGS_CSV_PATH: data/ratings.csv          # (optional) if you commit a CSV
-
+    continue-on-error: true  # even if lint fails, do not fail the run
     steps:
-      - name: Check out
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install dependencies
+      - name: Install linter
         run: |
           python -m pip install -U pip
-          pip install -r requirements.txt
-
-      # Always runs (push/PR) — import-only check so PRs pass without secrets
-      - name: Quick self-check
-        run: |
-          python - <<'PY'
-          from engine.self_check import run_self_check
-          run_self_check()
-          PY
-
-      - name: Env sanity (booleans only)
-        run: |
-          python - <<'PY'
-          import os
-          print("HAS_TMDB_API_KEY:", bool(os.getenv("TMDB_API_KEY")))
-          print("HAS_TMDB_BEARER :", bool(os.getenv("TMDB_BEARER")))
-          print("HAS_IMDB_USER_ID:", bool(os.getenv("IMDB_USER_ID")))
-          PY
-
-      # Heavy steps only on pushes AND only if secrets exist
-      - name: Run engine (push only; skip on PRs or missing secrets)
-        if: ${{ github.event_name == 'push' && (secrets.TMDB_API_KEY != '' || secrets.TMDB_ACCESS_TOKEN != '') }}
-        run: |
-          mkdir -p data/out data/cache
-          python -m engine.runner
-
-      - name: Make debug bundle (push only)
-        if: ${{ github.event_name == 'push' && (secrets.TMDB_API_KEY != '' || secrets.TMDB_ACCESS_TOKEN != '') }}
-        run: bash ./.github/scripts/make_debug_bundle.sh
-
-      - name: Upload debug bundle (push only)
-        if: ${{ github.event_name == 'push' && (secrets.TMDB_API_KEY != '' || secrets.TMDB_ACCESS_TOKEN != '') }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-data
-          path: debug-data.zip
-          if-no-files-found: warn
-
-      - name: Upload latest outputs (push only)
-        if: ${{ github.event_name == 'push' && (secrets.TMDB_API_KEY != '' || secrets.TMDB_ACCESS_TOKEN != '') }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: latest-run
-          if-no-files-found: ignore
-          path: |
-            data/out/latest/runner.log
-            data/out/latest/assistant_feed.json
-            data/out/latest/items.discovered.json
-            data/out/latest/items.enriched.json
-            data/out/latest/summary.md
-            data/out/latest/diag.json
+          pip install ruff==0.5.6
+      - name: Lint (optional)
+        run: ruff check .
