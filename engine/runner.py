@@ -1,152 +1,241 @@
+# engine/runner.py
 from __future__ import annotations
 import json
 import os
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Dict, List
 
+# Local imports
 from .env import Env
 from .catalog_builder import build_catalog
-from .scoring import load_seen_index, filter_unseen, score_items
 from .self_check import run_self_check
 
-ROOT = Path(__file__).resolve().parents[1]
-OUT_DIR = ROOT / "data" / "out"
+# Optional scoring pieces (keep the import loose so runner still finishes if scoring changes)
+try:
+    from .scoring import load_seen_index, filter_unseen, score_items
+except Exception:  # pragma: no cover
+    load_seen_index = None  # type: ignore
+    filter_unseen = None    # type: ignore
+    score_items = None      # type: ignore
 
-def _install_safe_unraisable_hook() -> None:
+OUT_ROOT = Path("data/out")
+CACHE_ROOT = Path("data/cache")
+
+
+def _stamp_last_run(run_dir: Path) -> None:
     """
-    Some libs raise unraisable exceptions during interpreter teardown
-    (e.g., when sys.stderr has already been detached). Make the hook
-    resilient so it never propagates or crashes.
+    Write data/out/last_run_dir.txt and refresh data/out/latest -> run_dir.
+    Symlink when possible, otherwise copy.
     """
-    def _safe_hook(unraisable):
-        try:
-            # Best-effort log; swallow any error if stderr is gone.
-            msg = f"[shutdown] Unraisable: {getattr(unraisable, 'exc_type', type(None)).__name__}: {getattr(unraisable, 'exc_value', '')}"
-            try:
-                print(msg, file=sys.stderr, flush=True)
-            except Exception:
-                pass
-        except Exception:
-            # Never let this raise.
-            pass
+    OUT_ROOT.mkdir(parents=True, exist_ok=True)
+    marker = OUT_ROOT / "last_run_dir.txt"
+    marker.write_text(str(run_dir), encoding="utf-8")
+
+    latest = OUT_ROOT / "latest"
+    if latest.exists():
+        if latest.is_symlink() or latest.is_file():
+            latest.unlink()
+        else:
+            # remove old directory
+            import shutil
+            shutil.rmtree(latest, ignore_errors=True)
+    # Try a symlink first for speed; fall back to copy on platforms that disallow it
     try:
-        sys.unraisablehook = _safe_hook  # type: ignore[attr-defined]
+        latest.symlink_to(run_dir, target_is_directory=True)
     except Exception:
-        # Python <3.8 or restricted env; ignore.
-        pass
+        import shutil
+        shutil.copytree(run_dir, latest)
+
+
+def _safe_json_dump(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
 
 def _env_from_os() -> Env:
-    # Allow ORIGINAL_LANGS as JSON-ish (["en","es"]) or CSV ("en,es").
-    langs_raw = os.getenv("ORIGINAL_LANGS", "").strip()
+    """
+    Build Env from OS environment with safe coercions.
+    The Env class supports dict-like access (get) and attributes.
+    """
+    # REGION
+    region = os.getenv("REGION", "US").strip() or "US"
+
+    # ORIGINAL_LANGS can arrive as a JSON-looking string '["en"]' or CSV like 'en,es'
+    raw_langs = os.getenv("ORIGINAL_LANGS", '["en"]').strip()
     langs: List[str]
-    if langs_raw.startswith("[") and langs_raw.endswith("]"):
+    if raw_langs.startswith("["):
         try:
-            parsed = json.loads(langs_raw)
+            parsed = json.loads(raw_langs)
             langs = [str(x).strip() for x in parsed if str(x).strip()]
         except Exception:
             langs = ["en"]
-    elif "," in langs_raw:
-        langs = [t.strip() for t in langs_raw.split(",") if t.strip()]
     else:
-        langs = [langs_raw] if langs_raw else ["en"]
+        langs = [x.strip() for x in raw_langs.split(",") if x.strip()]
+        if not langs:
+            langs = ["en"]
 
+    # SUBS_INCLUDE arrives as CSV (preferred), but allow JSON array too
+    raw_subs = os.getenv("SUBS_INCLUDE", "").strip()
+    if raw_subs.startswith("["):
+        try:
+            subs_list = [str(x).strip() for x in json.loads(raw_subs)]
+        except Exception:
+            subs_list = []
+    else:
+        subs_list = [x.strip() for x in raw_subs.split(",") if x.strip()]
+
+    # DISCOVER_PAGES
+    try:
+        pages = int(os.getenv("DISCOVER_PAGES", "12").strip())
+    except Exception:
+        pages = 12
+
+    # Compose Env
     return Env.from_mapping({
-        "REGION": os.getenv("REGION", "US").strip() or "US",
+        "REGION": region,
         "ORIGINAL_LANGS": langs,
-        "SUBS_INCLUDE": os.getenv("SUBS_INCLUDE", ""),
-        # default to 12 pages; can be overridden in workflow env
-        "DISCOVER_PAGES": int(os.getenv("DISCOVER_PAGES", "12") or "12"),
+        "SUBS_INCLUDE": subs_list,
+        "DISCOVER_PAGES": pages,
     })
 
-def _write_json(p: Path, obj: Any) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
 
-def _timestamp_dir() -> Path:
-    ts = time.strftime("run_%Y%m%d_%H%M%S", time.gmtime())
-    return OUT_DIR / ts
+def _build_run_dir() -> Path:
+    OUT_ROOT.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    rd = OUT_ROOT / f"run_{ts}"
+    rd.mkdir(parents=True, exist_ok=True)
+    return rd
+
+
+def _summarize(items_scored: List[Dict[str, Any]], env: Env) -> str:
+    # Minimal human summary for summary.md
+    discovered = int(env.get("DISCOVERED_COUNT", 0))
+    eligible = int(env.get("ELIGIBLE_COUNT", 0))
+    above_cut = int(env.get("ABOVE_CUT_COUNT", 0))
+    subs = env.get("SUBS_INCLUDE", [])
+    region = env.get("REGION", "US")
+    pages = env.get("DISCOVER_PAGES", 1)
+    lines = []
+    lines.append("# Daily recommendations\n")
+    lines.append("## Telemetry\n")
+    lines.append(f"- Region: **{region}**")
+    lines.append(f"- SUBS_INCLUDE: `{','.join(subs)}`" if subs else "- SUBS_INCLUDE: _none_")
+    lines.append(f"- Discover pages: **{pages}**")
+    lines.append(f"- Discovered (raw): **{discovered}**")
+    lines.append(f"- Eligible after exclusions: **{eligible}**")
+    lines.append(f"- Above match cut (≥ 58.0): **{above_cut}**\n")
+    # simple list of top few
+    top = items_scored[:30]
+    lines.append(json.dumps(top, ensure_ascii=False, indent=2))
+    return "\n".join(lines)
+
 
 def main() -> None:
-    _install_safe_unraisable_hook()
-    run_self_check()
+    # Self-check (tmdb discover functions present, etc.)
+    try:
+        run_self_check()
+    except SystemExit as e:
+        # Ensure a readable failure
+        print(str(e), file=sys.stderr, flush=True)
+        raise
 
+    # Prepare dirs
+    OUT_ROOT.mkdir(parents=True, exist_ok=True)
+    CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+
+    # Create a new run directory
+    run_dir = _build_run_dir()
+    log_path = run_dir / "runner.log"
+    log_lines: List[str] = []
+    def _log(line: str) -> None:
+        print(line, flush=True)
+        log_lines.append(line)
+
+    # Build Env
     env = _env_from_os()
 
-    print(" | catalog:begin", flush=True)
-    t0 = time.time()
-    items = build_catalog(env)
-    kept = len(items)
-    print(f" | catalog:end kept={kept}", flush=True)
-
-    # Load "seen" index (ratings.csv and/or public IMDb if IMDB_USER_ID is set)
-    seen_idx = load_seen_index(str(ROOT / "data" / "ratings.csv"))
-    eligible = filter_unseen(items, seen_idx)
-
-    # Score
-    scored = score_items(env, eligible)
-
-    # Basic counters for the logs
-    discovered = len(items)
-    elig_cnt = len(eligible)
-    above_cut = sum(1 for r in scored if r.get("match", 0) >= 58.0)
-    print(f" | results: discovered={discovered} eligible={elig_cnt} above_cut={above_cut}", flush=True)
-
-    # Persist run artifacts
-    run_dir = _timestamp_dir()
-    run_dir.mkdir(parents=True, exist_ok=True)
-    _write_json(run_dir / "items.discovered.json", items)
-    _write_json(run_dir / "items.enriched.json", eligible)  # after exclusion but before scoring details
-    _write_json(run_dir / "assistant_feed.json", scored)
-
-    # Tiny markdown summary for the site step (compat with your previous format)
-    summary_lines = [
-        "# Daily recommendations",
-        "",
-        "## Telemetry",
-        f"- Region: **{env.get('REGION', 'US')}**",
-        f"- SUBS_INCLUDE: `{env.get('SUBS_INCLUDE', '')}`",
-        f"- Discover pages: **{env.get('DISCOVER_PAGES', 0)}**",
-        f"- Discovered (raw): **{discovered}**",
-        f"- Eligible after exclusions: **{elig_cnt}**",
-        f"- Above match cut (≥ 58.0): **{above_cut}**",
-        "",
-        "## Your profile: genre weights",
-        "_No genre weights computed (no ratings.csv?)._",
-        "",
-        ("_No items above cut today._" if above_cut == 0 else ""),
-        "",
-    ]
-    (run_dir / "summary.md").write_text("\n".join(summary_lines), encoding="utf-8")
-
-    # Maintain 'latest' copy for upload step
-    latest = OUT_DIR / "latest"
-    if latest.exists():
-        try:
-            if latest.is_symlink() or latest.is_file():
-                latest.unlink()
-            else:
-                import shutil
-                shutil.rmtree(latest)
-        except Exception:
-            pass
-    import shutil
-    shutil.copytree(run_dir, latest)
-
-    # Done; explicit clean exit for CI
-    elapsed = time.time() - t0
+    # Discover pool
+    _log(" | catalog:begin")
     try:
-        print(f" | done in {elapsed:.2f}s", flush=True)
-    except Exception:
-        pass
+        items = build_catalog(env)  # list of dicts
+    except Exception as ex:
+        _log(f"[catalog] FAILED: {ex!r}")
+        traceback.print_exc()
+        items = []
 
-    # On GitHub Actions, force a clean zero even if some atexit/unraisable nonsense fires later.
-    if os.getenv("GITHUB_ACTIONS", "").lower() == "true" or os.getenv("RUNNER_HARD_EXIT", "1") == "1":
-        os._exit(0)  # noqa: PLE1142
-    else:
-        sys.exit(0)
+    kept = len(items)
+    _log(f" | catalog:end kept={kept}")
+
+    # Default telemetry
+    discovered = kept
+    eligible = kept
+    above_cut = 0
+
+    # Write discovered
+    _safe_json_dump(run_dir / "items.discovered.json", items)
+
+    # Apply exclusions and scoring if available
+    final_list: List[Dict[str, Any]] = items
+    try:
+        # Exclusions: local ratings.csv + optional IMDb public
+        seen_idx = {}
+        if callable(load_seen_index):
+            ratings_csv = Path("data/ratings.csv")
+            seen_idx = load_seen_index(str(ratings_csv))
+        if callable(filter_unseen):
+            final_list = filter_unseen(final_list, seen_idx)  # type: ignore
+        eligible = len(final_list)
+
+        # Scoring
+        if callable(score_items):
+            ranked = score_items(env, final_list)  # type: ignore
+        else:
+            # Fallback trivial ranking if scoring not wired
+            ranked = list(final_list)
+        # Decide cut
+        def _get_match(d: Dict[str, Any]) -> float:
+            # allow both our score_items output and raw
+            v = d.get("match")
+            if isinstance(v, (int, float)):
+                return float(v)
+            # proxy from TMDB vote_average
+            va = d.get("vote_average")
+            try:
+                return float(va) * 10.0 if va is not None else 0.0
+            except Exception:
+                return 0.0
+
+        ranked.sort(key=_get_match, reverse=True)
+        above_cut = sum(1 for r in ranked if _get_match(r) >= 58.0)
+
+        # Persist enriched/scored lists
+        _safe_json_dump(run_dir / "items.enriched.json", ranked)
+
+        # Assistant feed (what your site likely consumes)
+        _safe_json_dump(run_dir / "assistant_feed.json", ranked)
+
+        # Summary
+        env["DISCOVERED_COUNT"] = discovered
+        env["ELIGIBLE_COUNT"] = eligible
+        env["ABOVE_CUT_COUNT"] = above_cut
+        (run_dir / "summary.md").write_text(_summarize(ranked, env), encoding="utf-8")
+
+    except Exception as ex:
+        _log(f"[scoring] FAILED: {ex!r}")
+        traceback.print_exc()
+
+    _log(f" | results: discovered={discovered} eligible={eligible} above_cut={above_cut}")
+
+    # Write log file and stamp last run files/links
+    try:
+        log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+    finally:
+        _stamp_last_run(run_dir)
+
 
 if __name__ == "__main__":
     main()
