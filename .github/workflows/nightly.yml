@@ -14,12 +14,14 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+      TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }} # ← Read Access Token (v4)
       IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
       REGION: US
       ORIGINAL_LANGS: en
       SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
-      MIN_MATCH_CUT: "58"
-      DISCOVER_PAGES: "3"
+      MIN_MATCH_CUT: 58
+      DISCOVER_PAGES: 3
+
     steps:
       - uses: actions/checkout@v4
 
@@ -33,18 +35,34 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # --- NEW: grab IMDb TSVs nightly so we can cross-check and enrich ---
+      - name: Fetch IMDb TSV datasets
+        run: |
+          set -euxo pipefail
+          mkdir -p data/cache/imdb
+          pushd data/cache/imdb
+          wget -q https://datasets.imdbws.com/title.basics.tsv.gz -O title.basics.tsv.gz
+          wget -q https://datasets.imdbws.com/title.ratings.tsv.gz -O title.ratings.tsv.gz
+          wget -q https://datasets.imdbws.com/title.akas.tsv.gz -O title.akas.tsv.gz
+          gunzip -f title.basics.tsv.gz || true
+          gunzip -f title.ratings.tsv.gz || true
+          gunzip -f title.akas.tsv.gz || true
+          popd
+
       - name: Run engine
         run: |
           set -e
           python -m engine.runner
 
-      - name: Create debug pack
+      - name: Make debug bundle
         if: always()
         run: |
+          set -e
           python -m engine.debug_pack
           ls -lh data/out/latest || true
 
-      - name: Upload artifacts (outputs + debug/state)
+      # Upload outputs + caches/state for diagnosis
+      - name: Upload artifacts (outputs + debug/state + ratings.csv)
         if: always()
         uses: actions/upload-artifact@v4
         with:
