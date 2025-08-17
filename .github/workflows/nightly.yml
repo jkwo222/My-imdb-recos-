@@ -50,6 +50,11 @@ jobs:
           set -e
           python -m engine.runner
 
+      - name: Make debug-data.zip
+        if: always()
+        run: |
+          python -m engine.debug_pack
+
       # Upload outputs + debug/state so we can analyze each run
       - name: Upload artifacts (outputs + debug/state)
         if: always()
