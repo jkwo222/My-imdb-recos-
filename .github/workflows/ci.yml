@@ -39,7 +39,7 @@ jobs:
           python -m pip install -U pip
           pip install -r requirements.txt
 
-      # Always runs on push/PR; fast import-only validation
+      # Always runs (push/PR) — import-only check so PRs pass without secrets
       - name: Quick self-check
         run: |
           python - <<'PY'
@@ -56,7 +56,7 @@ jobs:
           print("HAS_IMDB_USER_ID:", bool(os.getenv("IMDB_USER_ID")))
           PY
 
-      # Run the heavy engine only on pushes (not PRs) AND only if we have TMDB secrets
+      # Heavy steps only on pushes AND only if secrets exist
       - name: Run engine (push only; skip on PRs or missing secrets)
         if: ${{ github.event_name == 'push' && (secrets.TMDB_API_KEY != '' || secrets.TMDB_ACCESS_TOKEN != '') }}
         run: |
