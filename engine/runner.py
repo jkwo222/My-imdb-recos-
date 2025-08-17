@@ -1,69 +1,65 @@
+# engine/runner.py
 from __future__ import annotations
 
 import json
-import os
 import sys
-import time
-from typing import Any, Dict, List, Tuple
+from datetime import datetime
+from typing import Dict, Any, List
 
-from .catalog import build_pool
 from .config import load_config
+from .catalog import build_pool
+from .rank import rank_pool
+from .feed import build_feed
 
-LOCK_PATH = os.path.join("data", "run.lock")
-LOCK_STALE_SECONDS = 25 * 60  # consider a lock stale after 25 minutes
 
-def _log(msg: str) -> None:
-    print(msg, flush=True)
+def _log(msg: str):
+    print(f"[hb] | {msg}", flush=True)
 
-def _acquire_lock() -> bool:
-    os.makedirs("data", exist_ok=True)
-    now = time.time()
-    # if lock exists but is stale, remove it
-    if os.path.exists(LOCK_PATH):
-        try:
-            mtime = os.path.getmtime(LOCK_PATH)
-            if now - mtime > LOCK_STALE_SECONDS:
-                os.remove(LOCK_PATH)
-            else:
-                return False
-        except Exception:
-            # if we can't stat, try to remove; otherwise fail closed
-            try:
-                os.remove(LOCK_PATH)
-            except Exception:
-                return False
+
+def main():
+    cfg = load_config()
+
+    _log("catalog:begin")
+    pool, catalog_meta = build_pool(cfg)  # must return (List[dict], Dict)
+    _log(f"catalog:end pool={len(pool)} movie={catalog_meta.get('movie_count', '?')} tv={catalog_meta.get('tv_count', '?')}")
+
+    # Shortlist before ranking to keep the job fast & API-friendly
+    shortlist_size = max(10, int(cfg.shortlist_size))
+    shortlist = pool[:shortlist_size]
+
+    ranked, rank_meta = rank_pool(shortlist, cfg, meta=catalog_meta)
+
+    # Build and write the feed artifacts (always write, even if empty)
+    items, feed_meta = build_feed(ranked, cfg, catalog_meta, rank_meta)
+
+    # Mirror the earlier "Counts/Weights/Output" style diagnostic
+    counts_line = f"Counts: tmdb_pool={len(pool)}, eligible_unseen={len(pool)}, shortlist={len(shortlist)}, shown={len(items)}"
+    print(counts_line, flush=True)
+    weights_line = f"Weights: critic={cfg.weight_critic}, audience={cfg.weight_audience}"
+    print(weights_line, flush=True)
+    print(f"Output: data/out/daily/{datetime.utcnow().date().isoformat()}", flush=True)
+
+    # Also drop a run_meta for easy debugging
+    run_meta = {
+        "counts": {
+            "pool": len(pool),
+            "shortlist": len(shortlist),
+            "shown": len(items),
+        },
+        "weights": {"critic": cfg.weight_critic, "audience": cfg.weight_audience},
+        "timestamps": {"utc": datetime.utcnow().isoformat() + "Z"},
+    }
     try:
-        with open(LOCK_PATH, "w", encoding="utf-8") as f:
-            f.write(json.dumps({"pid": os.getpid(), "ts": int(now)}))
-        return True
-    except Exception:
-        return False
-
-def _release_lock() -> None:
-    try:
-        if os.path.exists(LOCK_PATH):
-            os.remove(LOCK_PATH)
+        with open("data/debug/runner_meta.json", "w", encoding="utf-8") as f:
+            json.dump(run_meta, f, indent=2, ensure_ascii=False)
     except Exception:
         pass
 
-def main() -> None:
-    _log("[bootstrap] runner starting")
-    if not _acquire_lock():
-        _log("[bootstrap] another run appears to be in progress; exiting.")
-        return
-    try:
-        cfg = load_config()
-        pool, meta = build_pool(cfg)
-
-        # minimal telemetry dump (optional)
-        out_dir = os.path.join("data", "out", "latest")
-        os.makedirs(out_dir, exist_ok=True)
-        with open(os.path.join(out_dir, "assistant_feed.json"), "w", encoding="utf-8") as f:
-            json.dump({"pool_count": len(pool), "meta": meta}, f, ensure_ascii=False)
-
-        _log("[bootstrap] runner finished")
-    finally:
-        _release_lock()
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # Ensure CI logs show the error clearly
+        print(f"[runner] FATAL: {e}", file=sys.stderr, flush=True)
+        raise
