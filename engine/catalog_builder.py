@@ -3,6 +3,7 @@ from __future__ import annotations
 import os, time, json, gzip, io, pathlib, hashlib
 from typing import Dict, List, Tuple, Optional
 import requests
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 TMDB = "https://api.themoviedb.org/3"
 IMDB_BASE = "https://datasets.imdbws.com"
@@ -13,9 +14,31 @@ IMDB_CACHE = CACHE_ROOT / "imdb"
 for p in (TMDB_CACHE, IMDB_CACHE):
     p.mkdir(parents=True, exist_ok=True)
 
-def _tmdb_headers():
-    key = os.environ.get("TMDB_API_KEY","").strip()
-    return {"Authorization": f"Bearer {key}"} if key else {}
+def _tmdb_auth():
+    """
+    Returns a tuple (use_v3_key: bool, v3_key: str, headers: dict)
+    We support either:
+      - v3 key via query param (?api_key=...)
+      - v4 token via Authorization: Bearer ...
+    Priority: if TMDB_V4_TOKEN is present, use it; else fall back to TMDB_API_KEY as v3.
+    """
+    v4 = os.environ.get("TMDB_V4_TOKEN", "").strip()
+    if v4:
+        return (False, "", {"Authorization": f"Bearer {v4}"})
+    v3 = os.environ.get("TMDB_API_KEY", "").strip()
+    if v3:
+        return (True, v3, {})
+    return (False, "", {})  # no auth; requests will 401
+
+def _with_api_key(url: str, key: str) -> str:
+    """
+    Append ?api_key=... (or &api_key=...) safely.
+    """
+    u = urlparse(url)
+    q = dict(parse_qsl(u.query, keep_blank_values=True))
+    q["api_key"] = key
+    new_q = urlencode(q)
+    return urlunparse((u.scheme, u.netloc, u.path, u.params, new_q, u.fragment))
 
 def _h(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
@@ -43,11 +66,19 @@ def _get_json_cached(url: str, hours: int, bucket: pathlib.Path, headers=None):
     json.dump(data, open(path,"w",encoding="utf-8"))
     return data
 
+def _tmdb_get(url: str, cache_hours: int):
+    """
+    Fetch from TMDB supporting v3 api_key OR v4 bearer.
+    """
+    use_v3, key, headers = _tmdb_auth()
+    final_url = _with_api_key(url, key) if use_v3 and key else url
+    return _get_json_cached(final_url, cache_hours, TMDB_CACHE, headers=headers)
+
 def _collect_tmdb_ids(media_type: str, pages: int) -> List[int]:
     ids = []
     for page in range(1, pages+1):
         url = f"{TMDB}/discover/{media_type}?page={page}&sort_by=popularity.desc"
-        data = _get_json_cached(url, 6, TMDB_CACHE, headers=_tmdb_headers())
+        data = _tmdb_get(url, 6)
         for r in (data.get("results") or []) if data else []:
             try:
                 ids.append(int(r.get("id")))
@@ -57,7 +88,7 @@ def _collect_tmdb_ids(media_type: str, pages: int) -> List[int]:
 
 def _tmdb_details(media_type: str, tmdb_id: int) -> Optional[dict]:
     url = f"{TMDB}/{media_type}/{tmdb_id}?append_to_response=external_ids,watch/providers"
-    return _get_json_cached(url, 48, TMDB_CACHE, headers=_tmdb_headers())
+    return _tmdb_get(url, 48)
 
 def _providers_from_tmdb(d: dict, region="US") -> List[str]:
     out = set()
@@ -108,11 +139,6 @@ def _read_tsv_gz(path: pathlib.Path):
             yield dict(zip(header, cells))
 
 def _imdb_maps() -> Tuple[Dict[str, float], Dict[str, Tuple[str,int]]]:
-    """
-    Returns:
-      ratings_map: tconst -> averageRating(float 0..10)
-      basics_map:  tconst -> (primaryTitle, startYear)
-    """
     ratings_map: Dict[str, float] = {}
     basics_map: Dict[str, Tuple[str,int]] = {}
     rpath = IMDB_CACHE / "title.ratings.tsv.gz"
@@ -147,7 +173,6 @@ def _to_item(media_type: str, d: dict, imdb_ratings: Dict[str,float], imdb_basic
     imdb_rating = 0.0
     if imdb_id and imdb_id in imdb_ratings:
         imdb_rating = float(imdb_ratings.get(imdb_id, 0.0))
-        # prefer IMDb basics for year/title if available and missing
         if year == 0:
             by = imdb_basics.get(imdb_id)
             if by:
@@ -163,9 +188,9 @@ def _to_item(media_type: str, d: dict, imdb_ratings: Dict[str,float], imdb_basic
         "seasons": seasons,
         "tmdb_vote": tmdb_vote,
         "providers": providers,
-        "critic": 0.0,           # rt not available here
-        "audience": 0.0,         # legacy field (unused)
-        "imdb_rating": imdb_rating,  # primary audience signal
+        "critic": 0.0,
+        "audience": 0.0,
+        "imdb_rating": imdb_rating,
     }
 
 def build_catalog() -> List[Dict]:
@@ -174,12 +199,11 @@ def build_catalog() -> List[Dict]:
     include_tv  = (os.environ.get("INCLUDE_TV_SEASONS","true").lower() in ("1","true","yes"))
     hard_cap    = int(os.environ.get("MAX_CATALOG","6000"))
 
-    # load IMDb maps
     imdb_ratings, imdb_basics = _imdb_maps()
 
     movie_ids = _collect_tmdb_ids("movie", pages_movie)
     tv_ids    = _collect_tmdb_ids("tv", pages_tv) if include_tv else []
-    ids = [("movie", i) for i in movie_ids] + [("tv", i) for i in tv_ids]
+    ids = [("movie", i) for i in movie_ids] + [("tv", i) for i in tv_ids)]
 
     out: List[Dict] = []
     for media_type, tid in ids:
@@ -188,18 +212,4 @@ def build_catalog() -> List[Dict]:
         if it:
             out.append(it)
             if len(out) >= hard_cap: break
-
-    # Optional: restrict to English original language if you want
-    langs = (os.environ.get("ORIGINAL_LANGS","en").lower().split(",") if os.environ.get("ORIGINAL_LANGS") else [])
-    if langs:
-        keep = []
-        for media_type, tid in ids:
-            d = _tmdb_details(media_type, tid)
-            if not d: 
-                continue
-            ol = (d.get("original_language") or "").lower()
-            if not ol or ol in langs:
-                # We already appended a matching item for this tid above
-                pass
-        # We already constructed `out`—no further filter here since we used details above
     return out
