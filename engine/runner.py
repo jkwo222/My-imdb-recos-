@@ -97,20 +97,23 @@ def _env_from_os() -> Env:
     pages = _int_env("DISCOVER_PAGES", 12)
     pages = max(1, min(50, pages))
 
-    # New pool knobs
+    # Pool knobs
     pool_max = _int_env("POOL_MAX_ITEMS", 20000)
     prune_at = _int_env("POOL_PRUNE_AT", 0)
     prune_keep = _int_env("POOL_PRUNE_KEEP", max(0, prune_at - 5000) if prune_at > 0 else 0)
+
+    # Provider enrichment knob
+    enrich_top_n = _int_env("ENRICH_PROVIDERS_TOP_N", 150)
 
     return Env.from_mapping({
         "REGION": os.getenv("REGION", "US").strip() or "US",
         "ORIGINAL_LANGS": langs,
         "SUBS_INCLUDE": subs_list,
         "DISCOVER_PAGES": pages,
-        # Pool knobs (propagate into build_catalog via env)
         "POOL_MAX_ITEMS": pool_max,
         "POOL_PRUNE_AT": prune_at,
         "POOL_PRUNE_KEEP": prune_keep,
+        "ENRICH_PROVIDERS_TOP_N": enrich_top_n,
     })
 
 
@@ -143,7 +146,6 @@ def _markdown_summary(items: List[Dict[str, Any]], env: Env, top_n: int = 25) ->
     lines.append(f"- Discover pages: **{pages}**")
     lines.append(f"- Discovered (raw): **{discovered}**")
     lines.append(f"- Eligible after exclusions: **{eligible}**")
-    # Pool telemetry
     if pool_t:
         lines.append(f"- Pool: file_lines_before={pool_t.get('file_lines_before')} → file_lines_after={pool_t.get('file_lines_after')}, "
                      f"unique_keys_est={pool_t.get('unique_keys_est')}, loaded_unique={pool_t.get('loaded_unique')}, "
@@ -151,38 +153,9 @@ def _markdown_summary(items: List[Dict[str, Any]], env: Env, top_n: int = 25) ->
         if pool_t.get("prune_at", 0):
             lines.append(f"- Pool prune policy: prune_at={pool_t.get('prune_at')}, keep={pool_t.get('prune_keep')}")
     lines.append("")
-
-    def _fmt_providers(p):
-        if not p: return "_unknown_"
-        if isinstance(p, list): return ", ".join(p[:6])
-        return str(p)
-
-    lines.append("## Top picks")
-    header = "| # | Title | Match | Audience | Year | Providers | Why |"
-    sep = "|---:|---|---:|---:|---:|---|---|"
-    lines.append(header); lines.append(sep)
-    for idx, it in enumerate(items[:top_n], start=1):
-        title = it.get("title") or it.get("name") or "—"
-        match = it.get("score", it.get("match", 0.0))
-        aud = it.get("audience", it.get("tmdb_vote", 0.0))
-        try:
-            audv = float(aud)
-            if audv <= 10.0: audv *= 10.0
-        except Exception:
-            audv = 0.0
-        year = it.get("year") or ""
-        provs = it.get("providers") or it.get("providers_slugs") or []
-        why = it.get("why") or ""
-        lines.append(f"| {idx} | {title} | {match:.1f} | {audv:.1f} | {year} | {_fmt_providers(provs)} | {why} |")
-
-    lines.append("\n<details><summary>Raw top items (JSON)</summary>\n\n")
-    lines.append("```json")
-    lines.append(json.dumps(items[:top_n], ensure_ascii=False, indent=2))
-    lines.append("```\n\n</details>")
     return "\n".join(lines)
 
-
-def _enrich_top_providers(items: List[Dict[str, Any]], env: Env, top_n: int = 30) -> None:
+def _enrich_top_providers(items: List[Dict[str, Any]], env: Env, top_n: int = 150) -> None:
     if tmdb is None:
         return
     region = env.get("REGION", "US")
@@ -264,7 +237,11 @@ def main() -> None:
         _log(f"[exclusions] FAILED: {ex!r}")
         traceback.print_exc()
 
-    _enrich_top_providers(items, env, top_n=40)
+    # Enrich more titles with providers so the later service filter has data
+    try:
+        _enrich_top_providers(items, env, top_n=int(env.get("ENRICH_PROVIDERS_TOP_N", 150)))
+    except Exception as ex:
+        _log(f"[providers] enrichment failed: {ex!r}")
 
     ranked: List[Dict[str, Any]] = items
     try:
@@ -286,33 +263,7 @@ def main() -> None:
     _safe_json_dump(run_dir / "items.enriched.json", ranked)
     _safe_json_dump(run_dir / "assistant_feed.json", ranked)
 
-    # CSV export of top 100
-    try:
-        with (exports_dir / "top.csv").open("w", encoding="utf-8", newline="") as fh:
-            w = csv.writer(fh)
-            w.writerow(["rank","title","year","media_type","match","audience","tmdb_vote","imdb_id","tmdb_id","providers","why"])
-            for i, it in enumerate(ranked[:100], start=1):
-                try:
-                    aud = float(it.get("audience", it.get("tmdb_vote", 0.0)))
-                    if aud <= 10.0: aud *= 10.0
-                except Exception:
-                    aud = ""
-                w.writerow([
-                    i,
-                    it.get("title") or it.get("name") or "",
-                    it.get("year") or "",
-                    it.get("media_type") or "",
-                    _score_of(it),
-                    aud,
-                    it.get("tmdb_vote", ""),
-                    it.get("imdb_id", ""),
-                    it.get("tmdb_id", ""),
-                    ",".join(it.get("providers") or it.get("providers_slugs") or []),
-                    it.get("why",""),
-                ])
-    except Exception as ex:
-        _log(f"[export] CSV failed: {ex!r}")
-
+    # Quick markdown telemetry (the digest email is built later by engine.summarize)
     try:
         (run_dir / "summary.md").write_text(_markdown_summary(ranked, env, top_n=25), encoding="utf-8")
     except Exception as ex:
