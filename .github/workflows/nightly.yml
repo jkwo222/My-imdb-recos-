@@ -18,9 +18,11 @@ jobs:
       REGION: US
       ORIGINAL_LANGS: '["en"]'
       SUBS_INCLUDE: apple_tv_plus,netflix,max,paramount_plus,disney_plus,peacock,hulu
-      DISCOVER_PAGES: "12"
-      DISCOVER_PAGING_MODE: rolling        # rolling | random
-      DISCOVER_PAGE_MAX: "200"
+
+      # Discovery breadth + random page sampling
+      DISCOVER_PAGES: "16"                 # widen a bit
+      DISCOVER_PAGING_MODE: random         # random page sampling
+      DISCOVER_PAGE_MAX: "500"             # max page to sample from
 
       # -------- TMDB / IMDb auth --------
       TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
@@ -38,17 +40,17 @@ jobs:
       POOL_PRUNE_KEEP: "0"
 
       # -------- Enrichment knobs --------
-      ENRICH_PROVIDERS_TOP_N: "220"
-      ENRICH_SCORING_TOP_N: "260"
-      ENRICH_EXTERNALIDS_EXCL_TOP_N: "800"
-      ENRICH_EXTERNALIDS_TOP_N: "60"
-      ENRICH_PROVIDERS_FINAL_TOP_N: "400"
+      ENRICH_PROVIDERS_TOP_N: "400"        # raise to reduce “no provider” drops
+      ENRICH_SCORING_TOP_N: "320"
+      ENRICH_EXTERNALIDS_EXCL_TOP_N: "1000"
+      ENRICH_EXTERNALIDS_TOP_N: "100"
+      ENRICH_PROVIDERS_FINAL_TOP_N: "800"
 
       # -------- IMDb scraping (with cache) --------
       IMDB_SCRAPE_ENABLE: "true"
-      IMDB_SCRAPE_TOP_N: "120"
-      IMDB_SCRAPE_KEYWORDS_TOP_N: "80"
-      IMDB_SCRAPE_KEYWORDS_MAX: "30"
+      IMDB_SCRAPE_TOP_N: "160"             # more details for sparse items
+      IMDB_SCRAPE_KEYWORDS_TOP_N: "140"    # expand keyword grafting
+      IMDB_SCRAPE_KEYWORDS_MAX: "40"
       IMDB_SCRAPE_CACHE_DIR: data/cache/imdb
       IMDB_SCRAPE_CACHE_TTL_SECONDS: "1209600"     # 14 days
 
@@ -57,6 +59,7 @@ jobs:
       DECAY_HALF_LIFE_DAYS: "270"
       AUDIENCE_PRIOR_LAMBDA: "0.3"
       PROVIDER_PREF_LAMBDA: "0.5"
+      SUBGENRE_WEIGHT: "1.0"               # NEW: sub-genre signal strength
 
       # People weights (director boost reduced)
       ACTOR_WEIGHT: "2.2"
@@ -68,7 +71,7 @@ jobs:
       # Anime / Kids penalties
       PENALIZE_KIDS: "true"
       PENALIZE_ANIME: "true"
-      KIDS_CARTOON_PENALTY: "25"
+      KIDS_CARTOON_PENALTY: "30"
       ANIME_PENALTY: "20"
       KIDS_MOVIE_MIN_RUNTIME: "70"
 
@@ -81,8 +84,8 @@ jobs:
 
       # TV commitment penalties
       COMMITMENT_ENABLED: "true"
-      COMMITMENT_UNSEEN_THRESHOLD: "1"   # start penalizing after S1 if unseen
-      COMMITMENT_SEEN_THRESHOLD: "4"     # gentler if already following
+      COMMITMENT_UNSEEN_THRESHOLD: "1"
+      COMMITMENT_SEEN_THRESHOLD: "4"
       COMMITMENT_SEASON_PENALTY: "3.0"
       COMMITMENT_MAX_PENALTY: "18.0"
 
@@ -97,7 +100,7 @@ jobs:
       # Email layout & gating
       EMAIL_TOP_MOVIES: "10"
       EMAIL_TOP_TV: "10"
-      EMAIL_SCORE_MIN: "30"                  # lowered to avoid empty sections
+      EMAIL_SCORE_MIN: "30"
       EMAIL_INCLUDE_TELEMETRY: "true"
       EMAIL_EXCLUDE_ANIME: "true"
       EMAIL_NETWORK_FALLBACK: "true"
@@ -105,10 +108,11 @@ jobs:
       EMAIL_INCLUDE_NEW_SERIES_LABEL: "true"
       EMAIL_INCLUDE_NEW_SEASON_LABEL: "true"
 
-      # Email backfill (second pass if sections aren’t full)
+      # Email backfill (2nd pass if sections aren’t full)
       EMAIL_BACKFILL: "true"
-      EMAIL_BACKFILL_MIN: "25"
+      EMAIL_BACKFILL_MIN: "20"             # a bit more forgiving
       EMAIL_BACKFILL_ALLOW_ROTATE: "true"
+      EMAIL_BACKFILL_FETCH_PROVIDERS: "true" # NEW: try fetching providers on-demand for backfill
 
       # Rotation (cooldown) in email selection
       ROTATION_ENABLE: "true"
@@ -153,7 +157,6 @@ jobs:
           python -m pip install -U pip
           pip install -r requirements.txt
 
-      # Restore persistent caches so the pool truly grows + reuse IMDb/TMDB caches
       - name: Restore caches
         id: cache-restore
         uses: actions/cache/restore@v4
@@ -178,7 +181,6 @@ jobs:
           chmod +x ./.github/scripts/make_debug_bundle.sh || true
           bash ./.github/scripts/make_debug_bundle.sh
 
-      # Export the exact picks for per-title feedback comments
       - name: Export picks for feedback (picks.json)
         run: |
           python - <<'PY'
@@ -233,7 +235,6 @@ jobs:
             try { body = fs.readFileSync('data/out/latest/summary.md', 'utf8'); }
             catch { body = 'No summary.md found. Check debug bundle.'; }
 
-            // Find or create issue
             const { data: issues } = await github.rest.issues.listForRepo({
               owner, repo, state: 'open', labels: 'daily-recos', per_page: 100
             });
@@ -243,7 +244,6 @@ jobs:
             } else {
               await github.rest.issues.update({ owner, repo, issue_number: issue.number, body });
             }
-
             const mention = process.env.NOTIFY_USER ? ` cc @${process.env.NOTIFY_USER}` : '';
             await github.rest.issues.createComment({
               owner, repo, issue_number: issue.number,
@@ -260,19 +260,16 @@ jobs:
             const repo = context.repo.repo;
             const title = 'Daily Recommendations';
 
-            // read picks
             let picks;
             try { picks = JSON.parse(fs.readFileSync('data/out/latest/picks.json', 'utf8')); }
             catch { return core.info('No picks.json; skipping per-title feedback comments'); }
 
-            // find issue
             const { data: issues } = await github.rest.issues.listForRepo({
               owner, repo, state: 'open', labels: 'daily-recos', per_page: 100
             });
             const issue = issues.find(i => i.title === title);
             if (!issue) { return core.warning('Daily Recommendations issue not found'); }
 
-            // fetch existing comments to upsert by marker
             const all = await github.paginate(github.rest.issues.listComments, {
               owner, repo, issue_number: issue.number, per_page: 100
             });
@@ -344,7 +341,6 @@ jobs:
             data/out/latest/diag.json
             data/out/latest/picks.json
 
-      # Save caches so next run restores an ever-growing pool
       - name: Save caches
         if: always()
         uses: actions/cache/save@v4
