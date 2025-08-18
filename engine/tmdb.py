@@ -1,6 +1,7 @@
 # engine/tmdb.py
 from __future__ import annotations
-import os
+import os, time, json, hashlib
+from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional
 import requests
 
@@ -13,17 +14,56 @@ TMDB_BEARER = (
 _API_BASE = "https://api.themoviedb.org/3"
 _TIMEOUT = 25
 
+# Simple on-disk cache (helps avoid 429s, makes email not empty)
+CACHE_DIR = Path("data/cache/tmdb")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+TTL_SECONDS = int(os.getenv("TMDB_CACHE_TTL_SECONDS", "259200"))  # 3 days
+
+def _cache_path(kind: str, key: str) -> Path:
+    h = hashlib.sha1(key.encode("utf-8")).hexdigest()
+    p = CACHE_DIR / kind
+    p.mkdir(parents=True, exist_ok=True)
+    return p / f"{h}.json"
+
+def _cache_read(kind: str, key: str) -> Optional[dict]:
+    p = _cache_path(kind, key)
+    if not p.exists(): return None
+    try:
+        if (time.time() - p.stat().st_mtime) > TTL_SECONDS:
+            return None
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+def _cache_write(kind: str, key: str, data: dict) -> None:
+    try:
+        _cache_path(kind, key).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
 def _tmdb_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    url = path if path.startswith("http") else f"{_API_BASE.rstrip('/')}/{path.lstrip('/')}"
-    headers: Dict[str, str] = {}
+    url = f"{_API_BASE}/{path.lstrip('/')}"
+    headers = {"Accept": "application/json"}
     if TMDB_BEARER:
         headers["Authorization"] = f"Bearer {TMDB_BEARER}"
     q = dict(params or {})
     if TMDB_KEY and "api_key" not in q and not TMDB_BEARER:
         q["api_key"] = TMDB_KEY
-    r = requests.get(url, headers=headers, params=q, timeout=_TIMEOUT)
-    r.raise_for_status()
-    return r.json()
+
+    # tiny retry/backoff for 429/5xx
+    for attempt in range(4):
+        try:
+            r = requests.get(url, headers=headers, params=q, timeout=_TIMEOUT)
+            if r.status_code == 429:
+                time.sleep(0.5 + attempt * 0.5)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException:
+            if attempt == 3:
+                raise
+            time.sleep(0.5 + attempt * 0.5)
+    return {}
 
 def _slugify_provider_name(name: str) -> str:
     n = (name or "").strip().lower()
@@ -73,95 +113,13 @@ def providers_from_env(subs: List[str], region: str) -> Tuple[List[int], Dict[st
     ids = sorted({i for i in ids if isinstance(i, int)})
     return ids, used_map
 
-def _common_discover_params(region: str, langs: List[str], provider_ids: List[int]) -> Dict[str, Any]:
-    params: Dict[str, Any] = {
-        "watch_region": (region or "US").upper(),
-        "with_watch_monetization_types": "flatrate,ads",
-        "sort_by": "popularity.desc",
-        "include_adult": "false",
-    }
-    if langs:
-        params["with_original_language"] = ",".join(langs)
-    if provider_ids:
-        params["with_watch_providers"] = ",".join(str(i) for i in provider_ids)
-    return params
-
-def _to_year(date_s: str) -> Optional[int]:
-    if not date_s: return None
-    try:
-        return int((date_s or "")[:4])
-    except Exception:
-        return None
-
-def _shape_movie_result(rec: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "media_type": "movie",
-        "tmdb_id": rec.get("id"),
-        "title": rec.get("title") or rec.get("original_title"),
-        "year": _to_year(rec.get("release_date")),
-        "tmdb_vote": rec.get("vote_average"),
-        "popularity": rec.get("popularity"),
-        "original_language": (rec.get("original_language") or "").lower(),
-    }
-
-def _shape_tv_result(rec: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "media_type": "tv",
-        "tmdb_id": rec.get("id"),
-        "name": rec.get("name") or rec.get("original_name"),
-        "title": rec.get("name") or rec.get("original_name"),
-        "year": _to_year(rec.get("first_air_date")),
-        "tmdb_vote": rec.get("vote_average"),
-        "popularity": rec.get("popularity"),
-        "original_language": (rec.get("original_language") or "").lower(),
-    }
-
-def discover_movie_page(page: int, region: str, langs: List[str], provider_ids: List[int], slot: int = 0):
-    params = _common_discover_params(region, langs, provider_ids)
-    params.update({"page": max(1, int(page)), "vote_count.gte": 50 if (page % 3) else 100})
-    data = _tmdb_get("discover/movie", params)
-    results = [_shape_movie_result(r) for r in (data or {}).get("results", [])]
-    diag = {"page": page, "total_pages": (data or {}).get("total_pages"), "count": len(results)}
-    return results, diag
-
-def discover_tv_page(page: int, region: str, langs: List[str], provider_ids: List[int], slot: int = 0):
-    params = _common_discover_params(region, langs, provider_ids)
-    params.update({"page": max(1, int(page)), "vote_count.gte": 50 if (page % 2) else 100})
-    data = _tmdb_get("discover/tv", params)
-    results = [_shape_tv_result(r) for r in (data or {}).get("results", [])]
-    diag = {"page": page, "total_pages": (data or {}).get("total_pages"), "count": len(results)}
-    return results, diag
-
-def trending(kind: str, period: str = "day") -> List[Dict[str, Any]]:
-    kind = (kind or "movie").lower()
-    if kind not in ("movie","tv"): kind = "movie"
-    period = "week" if period == "week" else "day"
-    data = _tmdb_get(f"trending/{kind}/{period}")
-    shaped: List[Dict[str, Any]] = []
-    for r in (data or {}).get("results", []) or []:
-        shaped.append(_shape_movie_result(r) if kind == "movie" else _shape_tv_result(r))
-    return shaped
-
-def get_external_ids(kind: str, tmdb_id: int) -> Dict[str, Any]:
-    kind = (kind or "").lower()
-    if kind not in ("movie","tv") or not tmdb_id: return {}
-    data = _tmdb_get(f"{kind}/{int(tmdb_id)}/external_ids")
-    return {"imdb_id": data.get("imdb_id")}
-
-def find_by_imdb(imdb_id: str) -> Dict[str, Any]:
-    imdb_id = (imdb_id or "").strip()
-    if not imdb_id: return {}
-    data = _tmdb_get(f"find/{imdb_id}", {"external_source": "imdb_id"})
-    for bucket, kind in (("movie_results","movie"), ("tv_results","tv")):
-        arr = (data or {}).get(bucket) or []
-        if arr:
-            rid = arr[0].get("id")
-            return {"media_type": kind, "tmdb_id": rid}
-    return {}
-
+# ---- Common detail fetchers with cache ----
 def get_details(kind: str, tmdb_id: int) -> Dict[str, Any]:
     kind = (kind or "").lower()
     if kind not in ("movie","tv") or not tmdb_id: return {}
+    key = f"details:{kind}:{int(tmdb_id)}"
+    cached = _cache_read("details", key)
+    if cached is not None: return cached
     data = _tmdb_get(f"{kind}/{int(tmdb_id)}")
     out: Dict[str, Any] = {
         "original_language": (data.get("original_language") or "").lower(),
@@ -179,49 +137,78 @@ def get_details(kind: str, tmdb_id: int) -> Dict[str, Any]:
         out["number_of_episodes"] = data.get("number_of_episodes")
         out["first_air_date"] = data.get("first_air_date")
         out["last_air_date"] = data.get("last_air_date")
+    _cache_write("details", key, out)
     return out
 
 def get_credits(kind: str, tmdb_id: int) -> Dict[str, Any]:
     kind = (kind or "").lower()
     if kind not in ("movie","tv") or not tmdb_id: return {}
+    key = f"credits:{kind}:{int(tmdb_id)}"
+    cached = _cache_read("credits", key)
+    if cached is not None: return cached
     data = _tmdb_get(f"{kind}/{int(tmdb_id)}/credits")
-    directors, writers, cast = [], [], []
-    try:
-        for c in (data.get("crew") or []):
-            if not isinstance(c, dict): continue
-            job = (c.get("job") or "").lower()
-            name = c.get("name")
-            if not name: continue
-            if job == "director": directors.append(name)
-            elif job in {"writer","screenplay","story"}: writers.append(name)
-    except Exception:
-        pass
-    try:
-        for c in (data.get("cast") or [])[:8]:
-            if isinstance(c, dict) and c.get("name"): cast.append(c.get("name"))
-    except Exception:
-        pass
-    return {"directors": directors, "writers": writers, "cast": cast}
+    directors = []
+    writers = []
+    cast = []
+    for c in (data.get("crew") or []):
+        dep = (c.get("department") or "").lower()
+        job = (c.get("job") or "").lower()
+        nm = c.get("name")
+        if not nm: continue
+        if "direct" in job or dep == "directing": directors.append(nm)
+        if "writer" in job or dep == "writing": writers.append(nm)
+    for a in (data.get("cast") or [])[:12]:
+        nm = a.get("name")
+        if nm: cast.append(nm)
+    out = {"directors": list(dict.fromkeys(directors)),
+           "writers": list(dict.fromkeys(writers)),
+           "cast": list(dict.fromkeys(cast))}
+    _cache_write("credits", key, out)
+    return out
+
+def get_external_ids(kind: str, tmdb_id: int) -> Dict[str, Any]:
+    kind = (kind or "").lower()
+    if kind not in ("movie","tv") or not tmdb_id: return {}
+    key = f"external_ids:{kind}:{int(tmdb_id)}"
+    cached = _cache_read("xids", key)
+    if cached is not None: return cached
+    data = _tmdb_get(f"{kind}/{int(tmdb_id)}/external_ids")
+    out = {"imdb_id": data.get("imdb_id")}
+    _cache_write("xids", key, out)
+    return out
 
 def get_keywords(kind: str, tmdb_id: int) -> List[str]:
     kind = (kind or "").lower()
     if kind not in ("movie","tv") or not tmdb_id: return []
+    key = f"keywords:{kind}:{int(tmdb_id)}"
+    cached = _cache_read("keywords", key)
+    if cached is not None: return cached.get("keywords", [])
     data = _tmdb_get(f"{kind}/{int(tmdb_id)}/keywords")
     raw = data.get("keywords") if kind == "movie" else data.get("results")
     kws = []
     for kw in raw or []:
         name = kw.get("name")
         if isinstance(name, str) and name.strip(): kws.append(name.strip().lower())
-    return list(dict.fromkeys(kws))
+    out = {"keywords": list(dict.fromkeys(kws))}
+    _cache_write("keywords", key, out)
+    return out["keywords"]
 
 def get_title_watch_providers(kind: str, tmdb_id: int, region: str = "US") -> List[str]:
     kind = (kind or "").lower()
     if kind not in ("movie","tv") or not tmdb_id: return []
+    region = (region or "US").upper()
+    key = f"providers:{kind}:{int(tmdb_id)}:{region}"
+    cached = _cache_read("providers", key)
+    if cached is not None:
+        return cached.get("providers", [])
+    # tiny retry/backoff built into _tmdb_get
     data = _tmdb_get(f"{kind}/{int(tmdb_id)}/watch/providers")
-    by_region = (data or {}).get("results", {}).get((region or "US").upper()) or {}
+    by_region = (data or {}).get("results", {}).get(region) or {}
     slugs = set()
-    for bucket in ("flatrate","ads"):
+    for bucket in ("flatrate","ads","free"):
         for offer in by_region.get(bucket, []) or []:
             slug = _slugify_provider_name(offer.get("provider_name", ""))
             if slug: slugs.add(slug)
-    return sorted(slugs)
+    out = sorted(slugs)
+    _cache_write("providers", key, {"providers": out})
+    return out
