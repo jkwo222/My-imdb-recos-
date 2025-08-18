@@ -16,9 +16,6 @@ def _bool(n:str,d:bool)->bool:
 def _int(n:str,d:int)->int:
     try: return int(os.getenv(n,"") or d)
     except Exception: return d
-def _float(n:str,d:float)->float:
-    try: return float(os.getenv(n,"") or d)
-    except Exception: return d
 
 # -------- email layout knobs --------
 EMAIL_TOP_MOVIES        = _int("EMAIL_TOP_MOVIES", 10)
@@ -39,12 +36,12 @@ REC_TV_LAST_WINDOW      = _int("RECENCY_TV_LAST_WINDOW", 120)
 # Rotation / cooldown knobs
 ROTATION_ENABLE         = _bool("ROTATION_ENABLE", True)
 ROTATION_COOLDOWN_DAYS  = _int("ROTATION_COOLDOWN_DAYS", 5)
-ROTATION_EXEMPT_SCORE   = _float("ROTATION_EXEMPT_SCORE", 90.0)
+# Exempt handled in scoring; selection-level rotation still applies
 
-# -------- provider display map --------
+# Provider display map (HBO Max label)
 DISPLAY_PROVIDER = {
     "netflix": "Netflix",
-    "max": "HBO Max",           # <- changed from "Max"
+    "max": "HBO Max",
     "paramount_plus": "Paramount+",
     "disney_plus": "Disney+",
     "apple_tv_plus": "Apple TV+",
@@ -53,7 +50,6 @@ DISPLAY_PROVIDER = {
     "prime_video": "Prime Video",
 }
 _NON = re.compile(r"[^a-z0-9]+")
-
 def _norm(s:str)->str: return _NON.sub(" ", (s or "").strip().lower()).strip()
 
 def _parse_ymd(s: Optional[str]) -> Optional[date]:
@@ -66,12 +62,10 @@ def _parse_ymd(s: Optional[str]) -> Optional[date]:
         try: return date(int(s[:4]),1,1)
         except Exception: return None
     return None
-
 def _days_since(d: Optional[date]) -> Optional[int]:
     if not d: return None
     try: return (date.today()-d).days
     except Exception: return None
-
 def _audience_pct(it: Dict[str, Any]) -> Optional[int]:
     v = it.get("audience") or it.get("tmdb_vote")
     try:
@@ -85,7 +79,6 @@ def _normalize_slug(s: str) -> str:
     s = (s or "").strip().lower()
     if s in {"hbo","hbomax","hbo_max"}: return "max"
     return s
-
 def _slugify_provider_name(name: str) -> str:
     n=(name or "").strip().lower()
     if not n: return ""
@@ -103,7 +96,6 @@ def _providers_for_item(it: Dict[str, Any], allowed: Iterable[str]) -> List[str]
     allowed_set = {_normalize_slug(x) for x in (allowed or [])}
     provs = it.get("providers") or it.get("providers_slugs") or []
     provs = {_normalize_slug(str(p)) for p in provs}
-    # Fallback via TV network names -> provider slugs
     if not provs and EMAIL_NETWORK_FALLBACK and (it.get("media_type") or "").lower() == "tv":
         for net in it.get("networks") or []:
             slug = _slugify_provider_name(str(net))
@@ -129,19 +121,16 @@ def _is_anime_like(it: Dict[str, Any]) -> bool:
 
 def _recency_label(it: Dict[str, Any]) -> Optional[str]:
     mt=(it.get("media_type") or "").lower()
-    if mt=="movie" and LAB_NEW_MOVIE:
+    if mt=="movie":
         d=_days_since(_parse_ymd(it.get("release_date")))
         if d is not None and d<=REC_MOVIE_WINDOW:
             return "New Movie"
     if mt=="tv":
-        seasons=0
-        try: seasons=int(it.get("number_of_seasons") or 0)
-        except Exception: seasons=0
-        if LAB_NEW_SERIES:
-            df=_days_since(_parse_ymd(it.get("first_air_date")))
-            if df is not None and df<=REC_TV_FIRST_WINDOW:
-                return "New Series"
-        if LAB_NEW_SEASON and seasons>=2:
+        seasons=int(it.get("number_of_seasons") or 0)
+        df=_days_since(_parse_ymd(it.get("first_air_date")))
+        if df is not None and df<=REC_TV_FIRST_WINDOW:
+            return "New Series"
+        if seasons>=2:
             dl=_days_since(_parse_ymd(it.get("last_air_date")))
             if dl is not None and dl<=REC_TV_LAST_WINDOW:
                 return "New Season"
@@ -173,45 +162,23 @@ def _fmt_title_line(it: Dict[str, Any]) -> str:
     return " ".join(bits)
 
 def _fmt_meta_line(it: Dict[str, Any], providers: List[str]) -> str:
-    match=it.get("score")
+    try: match=int(round(float(it.get("score",0) or 0)))
+    except Exception: match=None
     aud=_audience_pct(it)
     prov_md=", ".join(f"**{p}**" for p in providers) if providers else "_Not on your services_"
     rt=_fmt_runtime(it)
     director = (it.get("directors") or [None])[0]
     parts=[]
-    if isinstance(match,(int,float)): parts.append(f"Match {int(round(match))}")
+    if isinstance(match,(int,float)): parts.append(f"Match {int(match)}")
     if isinstance(aud,int): parts.append(f"Audience {aud}")
     parts.append(prov_md)
     if rt: parts.append(rt)
     if director: parts.append(f"Dir. {director}")
     return " • ".join(parts)
 
-# --- "why" cleaning / enhancement ---
-_DROP_PATTERNS = (
-    "imdb details augmented",
-    "imdb keywords augmented",
-    "long-run",
-    "anime",
-    "kids",
-    "penalty",
-    "old",
-    "b&w",
-    "black and white",
-    "provider",
-)
-_KEEP_HINTS = (
-    "new movie",
-    "new series",
-    "new season",
-    "actor", "cast", "star",
-    "director",
-    "writer",
-    "genre",
-    "franchise",
-    "sequel",
-    "because you liked",
-    "similar to",
-)
+# why-line cleaner (keep meaningful; drop filler)
+_DROP_PATTERNS = ("imdb details augmented","imdb keywords augmented","penalty","black & white","b&w","old","provider","anime","kids","long-run")
+_KEEP_HINTS = ("new movie","new series","new season","actor","cast","star","director","writer","genre","keyword","because you liked","similar")
 
 def _clean_why(raw: str, recency_lab: Optional[str]) -> Optional[str]:
     parts=[p.strip() for p in (raw or "").split(";") if p.strip()]
@@ -220,63 +187,50 @@ def _clean_why(raw: str, recency_lab: Optional[str]) -> Optional[str]:
         out.append(recency_lab.lower())
     for p in parts:
         low=p.lower()
-        if any(x in low for x in _DROP_PATTERNS):
+        if any(x in low for x in _DROP_PATTERNS): 
+            # we drop the literal text, but keep overall reason set minimal & helpful
             continue
         if any(x in low for x in _KEEP_HINTS):
             out.append(p)
     if not out:
         return None
-    # collapse duplicates, keep short
     out2=list(dict.fromkeys(out))[:3]
     return "; ".join(out2)
-
-def _audience_pct(it: Dict[str, Any]) -> Optional[int]:
-    v = it.get("audience") or it.get("tmdb_vote")
-    try:
-        f = float(v)
-        if f <= 10.0: f *= 10.0
-        return int(round(max(0.0, min(100.0, f))))
-    except Exception:
-        return None
-
-def _rotation_skip(it: Dict[str, Any]) -> bool:
-    if not ROTATION_ENABLE: return False
-    try:
-        score=float(it.get("score",0) or 0)
-    except Exception:
-        score=0.0
-    if score>=ROTATION_EXEMPT_SCORE: return False
-    key=recency.key_for_item(it)
-    return recency.should_skip_key(key, cooldown_days=ROTATION_COOLDOWN_DAYS)
 
 def render_email(
     ranked_items: List[Dict[str, Any]],
     *,
     region: str = "US",
     allowed_provider_slugs: Optional[List[str]] = None,
-    seen_index: Optional[Dict[str, Any]] = None,
-    seen_tv_roots: Optional[List[str]] = None,
+    env_extra: Optional[Dict[str, Any]] = None,
     diag: Optional[Dict[str, Any]] = None,
 ) -> str:
     allowed = allowed_provider_slugs or []
-
-    rotation_skipped=0
+    env_extra = env_extra or {}
+    rotation_skipped = 0
+    feedback_skipped = 0
+    suppress_keys = set(env_extra.get("FEEDBACK_SUPPRESS_KEYS") or [])
 
     def _eligible(it: Dict[str, Any]) -> bool:
-        nonlocal rotation_skipped
+        nonlocal rotation_skipped, feedback_skipped
         if float(it.get("score", 0) or 0) < EMAIL_SCORE_MIN: return False
-        # anime gate handled upstream, but double-protect here
-        if EMAIL_EXCLUDE_ANIME and "anime" in (", ".join(str(g).lower() for g in (it.get("genres") or []))):
+        if EMAIL_EXCLUDE_ANIME and _is_anime_like(it): return False
+        # Feedback suppression (recent 👎)
+        k = recency.key_for_item(it)
+        if k and k in suppress_keys:
+            feedback_skipped += 1
             return False
-        if _rotation_skip(it):
+        # Basic provider check
+        if not _providers_for_item(it, allowed): return False
+        # Rotation (cooldown by last-shown)
+        if ROTATION_ENABLE and recency.should_skip_key(k, cooldown_days=ROTATION_COOLDOWN_DAYS):
             rotation_skipped += 1
             return False
-        if not _providers_for_item(it, allowed): return False
         return True
 
     movies: List[str] = []
     shows:  List[str] = []
-    chosen_keys: List[str]=[]
+    chosen_keys: List[str] = []
     m_cnt=s_cnt=0
 
     for it in sorted(ranked_items, key=lambda x: float(x.get("score", x.get("tmdb_vote", 0.0)) or 0.0), reverse=True):
@@ -317,24 +271,19 @@ def render_email(
         subs = os.getenv("SUBS_INCLUDE","")
         lines.append(f"- Region: **{region}**")
         lines.append(f"- SUBS_INCLUDE: `{subs}`")
-        c = (diag or {}).get("counts", {}) if diag else {}
-        env_pool = ((diag or {}).get("env") or {}).get("POOL_TELEMETRY") or {}
-        if c:
-            lines.append(f"- Discovered this run: **{c.get('discovered', 0)}**")
-            lines.append(f"- Eligible after strict seen-filter: **{c.get('eligible', 0)}**")
-            lines.append(f"- Scored items: **{c.get('scored', 0)}**")
-            lines.append(f"- Excluded as seen (strict): **{c.get('excluded_seen', 0)}**")
-        if env_pool:
-            if env_pool.get("file_lines_after") is not None:
-                lines.append(f"- Pool size (lines): **{env_pool.get('file_lines_after')}**")
-            if env_pool.get("appended_this_run") is not None:
-                lines.append(f"- New titles appended to pool: **{env_pool.get('appended_this_run')}**")
-            if env_pool.get("unique_keys_est") is not None:
-                lines.append(f"- Pool unique keys (est): **{env_pool.get('unique_keys_est')}**")
-            if env_pool.get("pages"):
-                lines.append(f"- Discovery pages this run: **{env_pool.get('pages')}** ({env_pool.get('paging_mode')})")
-        if ROTATION_ENABLE:
-            lines.append(f"- Rotation: **on** (cooldown {ROTATION_COOLDOWN_DAYS} days; exempt ≥ {int(ROTATION_EXEMPT_SCORE)})")
+        if diag:
+            c = (diag.get("counts") or {})
+            if c:
+                lines.append(f"- Discovered this run: **{c.get('discovered', 0)}**")
+                lines.append(f"- Eligible after strict seen-filter: **{c.get('eligible', 0)}**")
+                lines.append(f"- Scored items: **{c.get('scored', 0)}**")
+                lines.append(f"- Excluded as seen (strict): **{c.get('excluded_seen', 0)}**")
+            fb = (diag.get("feedback") or {})
+            if fb:
+                lines.append(f"- Feedback items: **{fb.get('feedback_items', 0)}** (in pool: **{fb.get('feedback_items_in_pool', 0)}**)")
+                lines.append(f"- Suppressed by 👎 cooldown: **{fb.get('suppress_keys', 0)}**")
+        lines.append(f"- Skipped by rotation (last-shown cooldown): **{rotation_skipped}**")
+        lines.append(f"- Skipped by feedback cooldown in selection: **{feedback_skipped}**")
         lines.append("")
     return "\n".join(lines)
 
@@ -358,8 +307,7 @@ def write_email_markdown(
         ranked_items=ranked,
         region=str(env.get("REGION") or "US"),
         allowed_provider_slugs=(env.get("SUBS_INCLUDE") or []),
-        seen_index=None,
-        seen_tv_roots=None,
+        env_extra=env,
         diag=diag,
     )
     out = run_dir / "summary.md"
