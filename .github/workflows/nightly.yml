@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-24.04
 
     env:
-      # ---------- Core config ----------
+      # Core config
       REGION: US
       ORIGINAL_LANGS: '["en"]'
       # Only list the services you actually have
@@ -27,21 +27,28 @@ jobs:
 
       # IMDb (CSV expected at data/user/ratings.csv)
       IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
-      IMDB_PUBLIC_MAX_PAGES: "10"   # ok to keep
+      IMDB_PUBLIC_MAX_PAGES: "10"
 
-      # ---------- Profile model knobs (keep yours) ----------
+      # Enrichment knobs
+      ENRICH_PROVIDERS_TOP_N: "220"
+      ENRICH_SCORING_TOP_N: "260"                # richer details/credits/keywords
+      ENRICH_EXTERNALIDS_EXCL_TOP_N: "800"       # ext-ids before exclusions
+      ENRICH_PROVIDERS_FINAL_TOP_N: "50"         # providers for final Top K
+      ENRICH_EXTERNALIDS_TOP_N: "60"             # ext-ids for final Top K
+
+      # Profile model knobs
       AFFINITY_K: "5"                  # shrinkage
       DECAY_HALF_LIFE_DAYS: "270"      # taste recency
 
-      # ---------- Scoring / enrichment knobs ----------
+      # Scoring blend knobs
       AUDIENCE_PRIOR_LAMBDA: "0.3"
       PROVIDER_PREF_LAMBDA: "0.5"
 
-      ENRICH_PROVIDERS_TOP_N: "220"     # keep
-      ENRICH_SCORING_TOP_N: "260"       # bumped for richer details
-      ENRICH_EXTERNALIDS_EXCL_TOP_N: "800"   # ext-ids before exclusions (hardens never-seen)
-      ENRICH_PROVIDERS_FINAL_TOP_N: "50"     # providers enrichment for final Top K
-      ENRICH_EXTERNALIDS_TOP_N: "60"         # ext-ids enrichment for final Top K
+      # Anime / Kids penalties
+      PENALIZE_KIDS: "true"
+      PENALIZE_ANIME: "true"
+      KIDS_CARTOON_PENALTY: "25"
+      ANIME_PENALTY: "20"
 
       # TV commitment penalty
       COMMITMENT_ENABLED: "true"
@@ -49,7 +56,7 @@ jobs:
       COMMITMENT_SEASON_PENALTY: "3"
       COMMITMENT_MAX_PENALTY: "18"
 
-      # Recency boosts (aligns with scoring + email labels)
+      # Recency boosts
       RECENCY_MOVIE_WINDOW_DAYS: "270"
       RECENCY_MOVIE_BONUS_MAX: "10"
       RECENCY_TV_FIRST_WINDOW: "180"
@@ -59,18 +66,15 @@ jobs:
       RECENCY_TV_FOLLOWUP_BONUS_MAX: "6"
       RECENCY_PROVIDER_MULTIPLIER: "1.15"
 
-      # Anime / Kids penalties
-      PENALIZE_KIDS: "true"
-      PENALIZE_ANIME: "true"
-      KIDS_CARTOON_PENALTY: "25"
-      ANIME_PENALTY: "20"
-
-      # Email rendering (Top Picks + inline labels)
-      EMAIL_TOPK: "10"
+      # Email layout & gating (split 10/10 + telemetry + labels; hide anime in email)
+      EMAIL_TOP_MOVIES: "10"
+      EMAIL_TOP_TV: "10"
       EMAIL_SCORE_MIN: "60"
+      EMAIL_INCLUDE_TELEMETRY: "true"
+      EMAIL_EXCLUDE_ANIME: "true"
       EMAIL_INCLUDE_NEW_MOVIE_LABEL: "true"
       EMAIL_INCLUDE_NEW_SEASON_LABEL: "true"
-      EMAIL_INCLUDE_NEW_SERIES_LABEL: "false"
+      EMAIL_INCLUDE_NEW_SERIES_LABEL: "true"
 
       # Optional @mention for notifications
       NOTIFY_USER: ${{ vars.NOTIFY_USER }}
@@ -105,17 +109,15 @@ jobs:
           restore-keys: |
             pool-${{ runner.os }}-${{ env.REGION }}-${{ env.POOL_CACHE_VERSION }}-
 
-      - name: Run engine (writes summary.md with inline New Movie/New Season labels)
-        run: |
-          mkdir -p data/out data/cache
-          python -m engine.runner
-
-      # (Removed the separate "python -m engine.summarize" CLI call since runner now generates summary.md)
-
       - name: Ensure debug scripts executable
         run: |
           chmod +x ./.github/scripts/make_debug_bundle.sh || true
           chmod +x ./.github/scripts/collect_diag.py || true
+
+      - name: Run engine
+        run: |
+          mkdir -p data/out data/cache
+          python -m engine.runner
 
       - name: Make debug bundle (full + compact snapshot)
         run: bash ./.github/scripts/make_debug_bundle.sh
