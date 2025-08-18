@@ -14,6 +14,7 @@ from .exclusions import (
 from .profile import build_user_model
 from . import summarize
 from . import tmdb
+from . import imdb_scrape  # NEW
 
 try:
     from .self_check import run_self_check
@@ -55,6 +56,11 @@ def _env_from_os() -> Dict[str, Any]:
     def _i(n: str, d: int) -> int:
         try: v = os.getenv(n, ""); return int(v) if v else d
         except Exception: return d
+    def _b(n: str, d: bool) -> bool:
+        v=(os.getenv(n,"") or "").strip().lower()
+        if v in {"1","true","yes","on"}: return True
+        if v in {"0","false","no","off"}: return False
+        return d
     return {
         "REGION": os.getenv("REGION","US").strip() or "US",
         "ORIGINAL_LANGS": _json_or_list(os.getenv("ORIGINAL_LANGS",'["en"]')),
@@ -68,7 +74,11 @@ def _env_from_os() -> Dict[str, Any]:
         "ENRICH_SCORING_TOP_N": _i("ENRICH_SCORING_TOP_N", 260),
         "ENRICH_EXTERNALIDS_EXCL_TOP_N": _i("ENRICH_EXTERNALIDS_EXCL_TOP_N", 800),
         "ENRICH_EXTERNALIDS_TOP_N": _i("ENRICH_EXTERNALIDS_TOP_N", 60),
-        "ENRICH_PROVIDERS_FINAL_TOP_N": _i("ENRICH_PROVIDERS_FINAL_TOP_N", 400),  # bump to 400
+        "ENRICH_PROVIDERS_FINAL_TOP_N": _i("ENRICH_PROVIDERS_FINAL_TOP_N", 400),
+
+        # IMDb scrape knobs (NEW)
+        "IMDB_SCRAPE_ENABLE": _b("IMDB_SCRAPE_ENABLE", True),
+        "IMDB_SCRAPE_TOP_N": _i("IMDB_SCRAPE_TOP_N", 120),
     }
 
 def _base_for_select(it: Dict[str, Any]) -> float:
@@ -82,7 +92,7 @@ def _base_for_select(it: Dict[str, Any]) -> float:
 def _select_top(items: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
     return sorted(items, key=_base_for_select, reverse=True)[: max(0, n)]
 
-# --- enrichment helpers (cached in tmdb.py) ---
+# --- enrichment helpers ---
 def _enrich_external_ids(items: List[Dict[str, Any]], top_n: int) -> None:
     for it in _select_top(items, top_n):
         if it.get("imdb_id"): continue
@@ -96,7 +106,6 @@ def _enrich_external_ids(items: List[Dict[str, Any]], top_n: int) -> None:
             pass
 
 def _enrich_providers(items: List[Dict[str, Any]], region: str, top_n: int) -> None:
-    # pace a little to avoid 429; tmdb layer caches anyway
     count = 0
     for it in _select_top(items, top_n):
         if it.get("providers"): continue
@@ -133,28 +142,53 @@ def _enrich_scoring_signals(items: List[Dict[str, Any]], top_n: int) -> None:
         except Exception:
             pass
         try:
-            kws = tmdb.get_keywords(kind, tid)
+            from .tmdb import get_keywords
+            kws = get_keywords(kind, tid)
             if kws: it["keywords"] = kws[:20]
         except Exception:
             pass
 
-def _collect_seen_tv_roots(ratings_csv: Path) -> List[str]:
-    import csv, re
-    roots: List[str] = []
-    if not ratings_csv.exists(): return roots
-    _non = re.compile(r"[^a-z0-9]+")
-    def norm(s: str) -> str: return _non.sub(" ", (s or "").strip().lower()).strip()
-    with ratings_csv.open("r", encoding="utf-8", errors="replace") as fh:
-        rd = csv.DictReader(fh)
-        for r in rd:
-            t = (r.get("Title") or r.get("Primary Title") or r.get("Original Title") or "").strip()
-            tt = (r.get("Title Type") or "").lower()
-            if t and ("tv" in tt or "series" in tt or "episode" in tt):
-                roots.append(norm(t))
-    out, seen = [], set()
-    for x in roots:
-        if x not in seen: out.append(x); seen.add(x)
-    return out
+def _needs_imdb_augment(it: Dict[str, Any]) -> bool:
+    # Treat an item as "thin" if missing any of these:
+    if not it.get("imdb_id"): return False
+    if not it.get("runtime"): return True
+    if not it.get("directors"): return True
+    if not it.get("genres") and not it.get("tmdb_genres"): return True
+    if not it.get("keywords"): return True
+    # If audience looks unset or weird (<= 0 or missing), try to fill it
+    try:
+        aud = float(it.get("audience") or it.get("tmdb_vote") or 0.0)
+        if aud <= 0.0: return True
+    except Exception:
+        return True
+    return False
+
+def _augment_from_imdb(items: List[Dict[str, Any]], top_n: int) -> None:
+    if top_n <= 0: return
+    count = 0
+    for it in _select_top(items, top_n):
+        if not _needs_imdb_augment(it): continue
+        imdb_id = it.get("imdb_id")
+        try:
+            data = imdb_scrape.fetch_title(imdb_id)
+            if not data: continue
+            # Merge non-empty fields
+            for k in ("runtime","genres","directors","writers","cast","audience","title","year"):
+                v = data.get(k)
+                if v and it.get(k) in (None, [], "", {}):
+                    it[k] = v
+            # Keep a breadcrumb
+            it.setdefault("why", "")
+            if "imdb_augmented" in data:
+                it["why"] = (it["why"] + ("; " if it["why"] else "") + "IMDb details augmented")
+            # Optional backlink
+            if data.get("imdb_url"):
+                it["imdb_url"] = data["imdb_url"]
+        except Exception:
+            continue
+        count += 1
+        if (count % 20) == 0:
+            time.sleep(0.05)
 
 def main() -> None:
     t0 = time.time()
@@ -167,14 +201,13 @@ def main() -> None:
     exports_dir = run_dir / "exports"
     exports_dir.mkdir(parents=True, exist_ok=True)
 
-    # Env guard
     if not (os.getenv("TMDB_API_KEY") or os.getenv("TMDB_BEARER") or os.getenv("TMDB_ACCESS_TOKEN") or os.getenv("TMDB_V4_TOKEN")):
         msg = "[env] Missing required environment: TMDB_API_KEY or TMDB_BEARER/ACCESS_TOKEN."
         print(msg); _safe_json(diag_path, {"error": msg}); sys.exit(2)
 
     env = _env_from_os()
 
-    # 1) Build pool (TMDB discover + optional IMDb TSV)
+    # 1) Catalog
     print(" | catalog:begin")
     try:
         items = build_catalog(env)
@@ -185,7 +218,7 @@ def main() -> None:
     pool_t = env.get("POOL_TELEMETRY") or {}
     print(f" | catalog:end pooled={len(items)}")
 
-    # 2) Pre-exclusion: hydrate external IDs for strict 'never-seen'
+    # 2) External IDs for strict seen-filter
     try: _enrich_external_ids(items, top_n=int(env.get("ENRICH_EXTERNALIDS_EXCL_TOP_N", 800)))
     except Exception as ex: print(f"[extids-pre] FAILED: {ex!r}")
 
@@ -199,7 +232,19 @@ def main() -> None:
             from .exclusions import load_seen_index as _lsi
             seen_idx = _lsi(ratings_csv)
             excl_info["ratings_rows"] = sum(1 for k in seen_idx if isinstance(k, str) and k.startswith("tt"))
-            seen_tv_roots = _collect_seen_tv_roots(ratings_csv)
+            # Collect TV roots
+            import csv, re
+            _non = re.compile(r"[^a-z0-9]+")
+            def norm(s: str) -> str: return _non.sub(" ", (s or "").strip().lower()).strip()
+            with ratings_csv.open("r", encoding="utf-8", errors="replace") as fh:
+                rd = csv.DictReader(fh)
+                roots = []
+                for r in rd:
+                    t = (r.get("Title") or r.get("Primary Title") or r.get("Original Title") or "").strip()
+                    tt = (r.get("Title Type") or "").lower()
+                    if t and ("tv" in tt or "series" in tt or "episode" in tt):
+                        roots.append(norm(t))
+                seen_tv_roots = list(dict.fromkeys(roots))
             (exports_dir / "seen_tv_roots.json").write_text(json.dumps(seen_tv_roots, indent=2), encoding="utf-8")
         before_pub = len(seen_idx)
         seen_idx = _merge_seen_public(seen_idx)
@@ -219,7 +264,7 @@ def main() -> None:
 
     eligible = len(items)
 
-    # 4) Pre-scoring enrichment (details/credits/keywords), providers for some
+    # 4) Pre-scoring enrichment
     try:
         _enrich_scoring_signals(items, top_n=int(env.get("ENRICH_SCORING_TOP_N", 260)))
     except Exception as ex:
@@ -230,7 +275,14 @@ def main() -> None:
     except Exception as ex:
         print(f"[providers-pre] FAILED: {ex!r}")
 
-    # 5) Profile model
+    # 5) Optional IMDb augmentation (NEW)
+    if env.get("IMDB_SCRAPE_ENABLE", True):
+        try:
+            _augment_from_imdb(items, top_n=int(env.get("IMDB_SCRAPE_TOP_N", 120)))
+        except Exception as ex:
+            print(f"[imdb-augment] FAILED: {ex!r}")
+
+    # 6) Profile model
     model_path = str((exports_dir / "user_model.json"))
     try:
         model = build_user_model(Path("data/user/ratings.csv"), exports_dir)
@@ -241,7 +293,7 @@ def main() -> None:
     env["USER_MODEL_PATH"] = model_path
     env["SEEN_TV_TITLE_ROOTS"] = seen_tv_roots
 
-    # 6) Score
+    # 7) Score
     try:
         ranked = score_items(env, items)
         ranked = sorted(ranked, key=lambda it: it.get("score", it.get("tmdb_vote", it.get("popularity", 0.0))), reverse=True)
@@ -250,18 +302,18 @@ def main() -> None:
         traceback.print_exc()
         ranked = items
 
-    # 7) Post-scoring enrichment (providers + external_ids) on bigger final cut
+    # 8) Post-scoring enrichment (providers + external_ids)
     try:
         _enrich_providers(ranked, env.get("REGION","US"), top_n=int(env.get("ENRICH_PROVIDERS_FINAL_TOP_N", 400)))
         _enrich_external_ids(ranked, top_n=int(env.get("ENRICH_EXTERNALIDS_TOP_N", 60)))
     except Exception as ex:
         print(f"[post-enrich] FAILED: {ex!r}")
 
-    # 8) Persist core outputs
+    # 9) Persist lists
     (run_dir / "items.enriched.json").write_text(json.dumps(ranked, ensure_ascii=False, indent=2), encoding="utf-8")
     (run_dir / "assistant_feed.json").write_text(json.dumps(ranked, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # 9) Write diag **before** building summary so telemetry shows up
+    # 10) diag BEFORE summary (telemetry shows up)
     _safe_json(
         diag_path,
         {
@@ -295,7 +347,7 @@ def main() -> None:
         },
     )
 
-    # 10) Build summary (now telemetry will include counts)
+    # 11) Summary (email)
     try:
         summarize.write_email_markdown(
             run_dir=run_dir,
@@ -308,7 +360,7 @@ def main() -> None:
         print(f"[summarize] FAILED: {ex!r}")
         (run_dir / "summary.md").write_text("# Daily Recommendations\n\n_Summary generation failed._\n", encoding="utf-8")
 
-    # 11) Final log + stamp
+    # 12) Final log + stamp
     above_cut = sum(1 for it in ranked if float(it.get("score", 0) or 0) >= 58.0)
     print(f" | results: discovered={env.get('DISCOVERED_COUNT',0)} eligible={eligible} above_cut={above_cut}")
     _stamp_last_run(run_dir)
