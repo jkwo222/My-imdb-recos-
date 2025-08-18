@@ -14,7 +14,8 @@ from .exclusions import (
 from .profile import build_user_model
 from . import summarize
 from . import tmdb
-from . import imdb_scrape  # IMDb augmentation
+from . import imdb_scrape
+from . import feedback as fb  # NEW
 
 try:
     from .self_check import run_self_check
@@ -52,15 +53,17 @@ def _json_or_list(s: str) -> List[str]:
         except Exception: return []
     return [x.strip() for x in s.split(",") if x.strip()]
 
+def _b(n: str, d: bool) -> bool:
+    v=(os.getenv(n,"") or "").strip().lower()
+    if v in {"1","true","yes","on"}: return True
+    if v in {"0","false","no","off"}: return False
+    return d
+
+def _i(n: str, d: int) -> int:
+    try: v = os.getenv(n, ""); return int(v) if v else d
+    except Exception: return d
+
 def _env_from_os() -> Dict[str, Any]:
-    def _i(n: str, d: int) -> int:
-        try: v = os.getenv(n, ""); return int(v) if v else d
-        except Exception: return d
-    def _b(n: str, d: bool) -> bool:
-        v=(os.getenv(n,"") or "").strip().lower()
-        if v in {"1","true","yes","on"}: return True
-        if v in {"0","false","no","off"}: return False
-        return d
     return {
         "REGION": os.getenv("REGION","US").strip() or "US",
         "ORIGINAL_LANGS": _json_or_list(os.getenv("ORIGINAL_LANGS",'["en"]')),
@@ -82,6 +85,19 @@ def _env_from_os() -> Dict[str, Any]:
         "IMDB_SCRAPE_TOP_N": _i("IMDB_SCRAPE_TOP_N", 120),
         "IMDB_SCRAPE_KEYWORDS_TOP_N": _i("IMDB_SCRAPE_KEYWORDS_TOP_N", 80),
         "IMDB_SCRAPE_KEYWORDS_MAX": _i("IMDB_SCRAPE_KEYWORDS_MAX", 30),
+
+        # Feedback
+        "FEEDBACK_ENABLE": _b("FEEDBACK_ENABLE", True),
+        "FEEDBACK_JSON_PATH": os.getenv("FEEDBACK_JSON_PATH", "data/user/feedback.json"),
+        "FEEDBACK_DOWN_COOLDOWN_DAYS": _i("FEEDBACK_DOWN_COOLDOWN_DAYS", 14),
+        "FEEDBACK_DECAY": float(os.getenv("FEEDBACK_DECAY","0.98") or 0.98),
+        "FEEDBACK_UP_DIRECT_BONUS": float(os.getenv("FEEDBACK_UP_DIRECT_BONUS","10") or 10),
+        "FEEDBACK_DOWN_DIRECT_PENALTY": float(os.getenv("FEEDBACK_DOWN_DIRECT_PENALTY","18") or 18),
+        "FEEDBACK_SIMILAR_ACTOR_W": float(os.getenv("FEEDBACK_SIMILAR_ACTOR_W","1.4") or 1.4),
+        "FEEDBACK_SIMILAR_DIRECTOR_W": float(os.getenv("FEEDBACK_SIMILAR_DIRECTOR_W","0.8") or 0.8),
+        "FEEDBACK_SIMILAR_WRITER_W": float(os.getenv("FEEDBACK_SIMILAR_WRITER_W","0.6") or 0.6),
+        "FEEDBACK_SIMILAR_GENRE_W": float(os.getenv("FEEDBACK_SIMILAR_GENRE_W","0.6") or 0.6),
+        "FEEDBACK_SIMILAR_KEYWORD_W": float(os.getenv("FEEDBACK_SIMILAR_KEYWORD_W","0.2") or 0.2),
     }
 
 def _base_for_select(it: Dict[str, Any]) -> float:
@@ -95,15 +111,15 @@ def _base_for_select(it: Dict[str, Any]) -> float:
 def _select_top(items: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
     return sorted(items, key=_base_for_select, reverse=True)[: max(0, n)]
 
-# --- enrichment helpers ---
 def _enrich_external_ids(items: List[Dict[str, Any]], top_n: int) -> None:
+    from .tmdb import get_external_ids
     for it in _select_top(items, top_n):
         if it.get("imdb_id"): continue
         kind = (it.get("media_type") or "").lower()
         tid = it.get("tmdb_id")
         if not kind or not tid: continue
         try:
-            ex = tmdb.get_external_ids(kind, int(tid))
+            ex = get_external_ids(kind, int(tid))
             if ex.get("imdb_id"): it["imdb_id"] = ex["imdb_id"]
         except Exception:
             pass
@@ -145,8 +161,7 @@ def _enrich_scoring_signals(items: List[Dict[str, Any]], top_n: int) -> None:
         except Exception:
             pass
         try:
-            from .tmdb import get_keywords
-            kws = get_keywords(kind, tid)
+            kws = tmdb.get_keywords(kind, tid)
             if kws: it["keywords"] = kws[:20]
         except Exception:
             pass
@@ -178,8 +193,6 @@ def _augment_from_imdb(items: List[Dict[str, Any]], top_n: int, kw_top_n: int, k
                     v = data.get(k)
                     if v and it.get(k) in (None, [], "", {}):
                         it[k] = v
-                it.setdefault("why", "")
-                it["why"] = (it["why"] + ("; " if it["why"] else "") + "IMDb details augmented")
                 if data.get("imdb_url"):
                     it["imdb_url"] = data["imdb_url"]
             except Exception:
@@ -188,7 +201,7 @@ def _augment_from_imdb(items: List[Dict[str, Any]], top_n: int, kw_top_n: int, k
             if (count % 20) == 0:
                 time.sleep(0.05)
 
-    # keywords augmentation (even if details didn't need it)
+    # keywords augmentation
     if kw_top_n > 0 and kw_limit > 0:
         count = 0
         for it in _select_top(items, kw_top_n):
@@ -202,8 +215,6 @@ def _augment_from_imdb(items: List[Dict[str, Any]], top_n: int, kw_top_n: int, k
                 if kws:
                     merged = list(dict.fromkeys([*(existing or []), *kws]))
                     it["keywords"] = merged
-                    it.setdefault("why", "")
-                    it["why"] = (it["why"] + ("; " if it["why"] else "") + "IMDb keywords augmented")
             except Exception:
                 continue
             count += 1
@@ -237,11 +248,11 @@ def main() -> None:
         items = []
     print(f" | catalog:end pooled={len(items)}")
 
-    # 2) External IDs for strict seen-filter
+    # 2) External IDs (to strengthen seen-filter & feedback key mapping)
     try: _enrich_external_ids(items, top_n=int(env.get("ENRICH_EXTERNALIDS_EXCL_TOP_N", 800)))
     except Exception as ex: print(f"[extids-pre] FAILED: {ex!r}")
 
-    # 3) Exclusions
+    # 3) Exclusions (CSV + public IMDb page)
     excl_info = {"ratings_rows": 0, "public_ids": 0, "excluded_count": 0}
     seen_tv_roots: List[str] = []
     try:
@@ -250,17 +261,15 @@ def main() -> None:
         if ratings_csv.exists():
             from .exclusions import load_seen_index as _lsi
             seen_idx = _lsi(ratings_csv)
-            excl_info["ratings_rows"] = sum(1 for k in seen_idx if isinstance(k, str) and k.startswith("tt"))
-            # collect TV roots
+            excl_info["ratings_rows"] = sum(1 for k in seen_idx if isinstance(k, str))
+            # collect TV roots (title-normalized)
             import csv, re
-            _non = re.compile(r"[^a-z0-9]+")
-            def norm(s: str) -> str: return _non.sub(" ", (s or "").strip().lower()).strip()
+            _non = re.compile(r"[^a-z0-9]+"); norm=lambda s:_non.sub(" ", (s or "").strip().lower()).strip()
             with ratings_csv.open("r", encoding="utf-8", errors="replace") as fh:
-                rd = csv.DictReader(fh)
-                roots = []
+                rd = csv.DictReader(fh); roots=[]
                 for r in rd:
-                    t = (r.get("Title") or r.get("Primary Title") or r.get("Original Title") or "").strip()
-                    tt = (r.get("Title Type") or "").lower()
+                    t=(r.get("Title") or r.get("Primary Title") or r.get("Original Title") or "").strip()
+                    tt=(r.get("Title Type") or "").lower()
                     if t and ("tv" in tt or "series" in tt or "episode" in tt):
                         roots.append(norm(t))
                 seen_tv_roots = list(dict.fromkeys(roots))
@@ -271,11 +280,7 @@ def main() -> None:
         pre = len(items)
         items = _filter_unseen(items, seen_idx)
         excl_info["excluded_count"] = pre - len(items)
-        (exports_dir / "seen_index.json").write_text(
-            json.dumps({
-                "imdb_ids": [k for k in seen_idx if isinstance(k, str) and k.startswith("tt")],
-                "title_year_keys": [k for k in seen_idx if "::" in k],
-            }, indent=2), encoding="utf-8")
+        (exports_dir / "seen_index.json").write_text(json.dumps(seen_idx, indent=2), encoding="utf-8")
         print(f"[exclusions] strict filter removed={excl_info['excluded_count']}")
     except Exception as ex:
         print(f"[exclusions] FAILED: {ex!r}")
@@ -284,15 +289,11 @@ def main() -> None:
     eligible = len(items)
 
     # 4) Pre-scoring enrichment
-    try:
-        _enrich_scoring_signals(items, top_n=int(env.get("ENRICH_SCORING_TOP_N", 260)))
-    except Exception as ex:
-        print(f"[scoring-enrich] FAILED: {ex!r}")
+    try: _enrich_scoring_signals(items, top_n=int(env.get("ENRICH_SCORING_TOP_N", 260)))
+    except Exception as ex: print(f"[scoring-enrich] FAILED: {ex!r}")
 
-    try:
-        _enrich_providers(items, env.get("REGION","US"), top_n=int(env.get("ENRICH_PROVIDERS_TOP_N", 220)))
-    except Exception as ex:
-        print(f"[providers-pre] FAILED: {ex!r}")
+    try: _enrich_providers(items, env.get("REGION","US"), top_n=int(env.get("ENRICH_PROVIDERS_TOP_N", 220)))
+    except Exception as ex: print(f"[providers-pre] FAILED: {ex!r}")
 
     # 5) Optional IMDb augmentation (details + keywords)
     if env.get("IMDB_SCRAPE_ENABLE", True):
@@ -316,7 +317,30 @@ def main() -> None:
     env["USER_MODEL_PATH"] = model_path
     env["SEEN_TV_TITLE_ROOTS"] = seen_tv_roots
 
-    # 7) Score
+    # 7) Feedback learning & suppressions
+    fb_stats = {}
+    if env.get("FEEDBACK_ENABLE", True):
+        try:
+            fb_json = Path(env.get("FEEDBACK_JSON_PATH") or "data/user/feedback.json")
+            fb_data = fb.load_feedback(fb_json)
+            bank, suppress, fb_stats = fb.update_feature_bank(
+                items,
+                fb_data,
+                cooldown_days=int(env.get("FEEDBACK_DOWN_COOLDOWN_DAYS", 14)),
+                decay=float(env.get("FEEDBACK_DECAY", 0.98)),
+            )
+            env["FEEDBACK_FEATURES"] = bank
+            env["FEEDBACK_SUPPRESS_KEYS"] = list(suppress)
+            env["FEEDBACK_ITEMS"] = fb_data.get("items", {})
+            # export
+            (exports_dir / "feedback_bank.json").write_text(json.dumps(bank, indent=2), encoding="utf-8")
+            (exports_dir / "feedback_suppress.json").write_text(json.dumps(sorted(list(suppress)), indent=2), encoding="utf-8")
+            (exports_dir / "feedback_raw.json").write_text(json.dumps(fb_data, indent=2), encoding="utf-8")
+        except Exception as ex:
+            print(f"[feedback] FAILED: {ex!r}")
+            traceback.print_exc()
+
+    # 8) Score
     try:
         ranked = score_items(env, items)
         ranked = sorted(
@@ -329,18 +353,18 @@ def main() -> None:
         traceback.print_exc()
         ranked = items
 
-    # 8) Post-scoring enrichment (providers + external_ids)
+    # 9) Post-scoring enrichment (providers + external_ids)
     try:
         _enrich_providers(ranked, env.get("REGION","US"), top_n=int(env.get("ENRICH_PROVIDERS_FINAL_TOP_N", 400)))
         _enrich_external_ids(ranked, top_n=int(env.get("ENRICH_EXTERNALIDS_TOP_N", 60)))
     except Exception as ex:
         print(f"[post-enrich] FAILED: {ex!r}")
 
-    # 9) Persist lists
+    # 10) Persist lists
     (run_dir / "items.enriched.json").write_text(json.dumps(ranked, ensure_ascii=False, indent=2), encoding="utf-8")
     (run_dir / "assistant_feed.json").write_text(json.dumps(ranked, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # 10) diag BEFORE summary
+    # 11) diag BEFORE summary
     _safe_json(
         diag_path,
         {
@@ -352,6 +376,7 @@ def main() -> None:
                 "scored": len(ranked),
                 "excluded_seen": excl_info.get("excluded_count", 0),
             },
+            "feedback": fb_stats,
             "env": {
                 "REGION": env.get("REGION","US"),
                 "ORIGINAL_LANGS": env.get("ORIGINAL_LANGS",[]),
@@ -370,24 +395,29 @@ def main() -> None:
                 "seen_index_json": str((exports_dir / "seen_index.json").resolve()),
                 "user_model_json": str((exports_dir / "user_model.json").resolve()),
                 "seen_tv_roots": str((exports_dir / "seen_tv_roots.json").resolve()),
+                "feedback_bank": str((exports_dir / "feedback_bank.json").resolve()),
+                "feedback_suppress": str((exports_dir / "feedback_suppress.json").resolve()),
+                "feedback_raw": str((exports_dir / "feedback_raw.json").resolve()),
             },
         },
     )
 
-    # 11) Summary (email)
+    # 12) Summary (email)
     try:
         summarize.write_email_markdown(
             run_dir=run_dir,
             ranked_items_path=run_dir / "items.enriched.json",
-            env={"REGION": env.get("REGION", "US"), "SUBS_INCLUDE": env.get("SUBS_INCLUDE", [])},
-            seen_index_path=exports_dir / "seen_index.json",
-            seen_tv_roots_path=exports_dir / "seen_tv_roots.json",
+            env={
+                "REGION": env.get("REGION", "US"),
+                "SUBS_INCLUDE": env.get("SUBS_INCLUDE", []),
+                "FEEDBACK_SUPPRESS_KEYS": env.get("FEEDBACK_SUPPRESS_KEYS", []),
+            },
         )
     except Exception as ex:
         print(f"[summarize] FAILED: {ex!r}")
         (run_dir / "summary.md").write_text("# Daily Recommendations\n\n_Summary generation failed._\n", encoding="utf-8")
 
-    # 12) Final log + stamp
+    # 13) Final log + stamp
     above_cut = sum(1 for it in ranked if float(it.get("score", 0) or 0) >= 58.0)
     print(f" | results: discovered={env.get('DISCOVERED_COUNT',0)} eligible={eligible} above_cut={above_cut}")
     _stamp_last_run(run_dir)
