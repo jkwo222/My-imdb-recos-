@@ -29,7 +29,6 @@ def _tmdb_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, A
     return r.json()
 
 # ---------- provider name <-> slug helpers ----------
-
 def _slugify_provider_name(name: str) -> str:
     n = (name or "").strip().lower()
     if not n:
@@ -68,8 +67,7 @@ def _normalize_slug(s: str) -> str:
         return "max"
     return s
 
-# ---------- provider directory (for building discover queries) ----------
-
+# ---------- provider directory ----------
 def _fetch_provider_directory(region: str) -> Dict[str, int]:
     region = (region or "US").upper()
     out: Dict[str, int] = {}
@@ -96,7 +94,6 @@ def providers_from_env(subs: List[str], region: str) -> Tuple[List[int], Dict[st
     return ids, used_map
 
 # ---------- discovery (subscription-only) ----------
-
 def _common_discover_params(region: str, langs: List[str], provider_ids: List[int]) -> Dict[str, Any]:
     params: Dict[str, Any] = {
         "watch_region": (region or "US").upper(),
@@ -158,7 +155,6 @@ def discover_tv_page(page: int, region: str, langs: List[str], provider_ids: Lis
     return results, diag
 
 # ---------- trending ----------
-
 def trending(kind: str, period: str = "day") -> List[Dict[str, Any]]:
     kind = (kind or "movie").lower()
     if kind not in ("movie", "tv"):
@@ -170,8 +166,7 @@ def trending(kind: str, period: str = "day") -> List[Dict[str, Any]]:
         shaped.append(_shape_movie_result(r) if kind == "movie" else _shape_tv_result(r))
     return shaped
 
-# ---------- external IDs (IMDb) ----------
-
+# ---------- external IDs / mapping ----------
 def get_external_ids(kind: str, tmdb_id: int) -> Dict[str, Any]:
     kind = (kind or "").lower()
     if kind not in ("movie", "tv") or not tmdb_id:
@@ -179,8 +174,24 @@ def get_external_ids(kind: str, tmdb_id: int) -> Dict[str, Any]:
     data = _tmdb_get(f"{kind}/{int(tmdb_id)}/external_ids")
     return {"imdb_id": data.get("imdb_id")}
 
-# ---------- details / credits / keywords (for scoring enrichment) ----------
+def find_by_imdb(imdb_id: str) -> Dict[str, Any]:
+    """
+    Map an IMDb tconst (tt...) to TMDB id and media_type via /find.
+    Returns: {"media_type": "movie"|"tv"|None, "tmdb_id": int|None}
+    """
+    imdb_id = (imdb_id or "").strip()
+    if not imdb_id:
+        return {}
+    data = _tmdb_get(f"find/{imdb_id}", {"external_source": "imdb_id"})
+    # prefer movie results first, then tv
+    for bucket, kind in (("movie_results", "movie"), ("tv_results", "tv")):
+        arr = (data or {}).get(bucket) or []
+        if arr:
+            rid = arr[0].get("id")
+            return {"media_type": kind, "tmdb_id": rid}
+    return {}
 
+# ---------- details / credits / keywords ----------
 def get_details(kind: str, tmdb_id: int) -> Dict[str, Any]:
     kind = (kind or "").lower()
     if kind not in ("movie", "tv") or not tmdb_id:
@@ -192,7 +203,7 @@ def get_details(kind: str, tmdb_id: int) -> Dict[str, Any]:
         "production_companies": [c.get("name") for c in (data.get("production_companies") or []) if isinstance(c, dict) and c.get("name")],
     }
     if kind == "movie":
-        out["runtime"] = data.get("runtime")  # minutes
+        out["runtime"] = data.get("runtime")
         out["belongs_to_collection"] = (data.get("belongs_to_collection") or {}).get("name")
     else:
         out["episode_run_time"] = data.get("episode_run_time") or []
@@ -239,10 +250,9 @@ def get_keywords(kind: str, tmdb_id: int) -> List[str]:
         name = kw.get("name")
         if isinstance(name, str) and name.strip():
             kws.append(name.strip().lower())
-    return list(dict.fromkeys(kws))  # unique, keep order
+    return list(dict.fromkeys(kws))
 
 # ---------- per-title watch providers (subscription-only) ----------
-
 def get_title_watch_providers(kind: str, tmdb_id: int, region: str = "US") -> List[str]:
     kind = (kind or "").lower()
     if kind not in ("movie", "tv") or not tmdb_id:
