@@ -4,19 +4,20 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 from . import catalog_builder
 from . import enrich
 from . import profile
-from . import scoring          # <- was scorer
-from . import filtering        # <- was filters
+from . import scoring
+from . import filtering
+from . import recency  # ensure rotation file exists when marking
 
 RUN_ROOT = Path("data/out")
 LATEST   = RUN_ROOT / "latest"
 
 def _ensure_dirs() -> None:
-    (Path("data/cache")).mkdir(parents=True, exist_ok=True)
+    Path("data/cache").mkdir(parents=True, exist_ok=True)
     RUN_ROOT.mkdir(parents=True, exist_ok=True)
     LATEST.mkdir(parents=True, exist_ok=True)
 
@@ -24,9 +25,7 @@ def _env() -> Dict[str, Any]:
     e = dict(os.environ)
     def _list_env(name: str) -> List[str]:
         v = (e.get(name) or "").strip()
-        if not v:
-            return []
-        return [x.strip() for x in v.split(",") if x.strip()]
+        return [x.strip() for x in v.split(",") if x.strip()] if v else []
     e["SUBS_INCLUDE"] = _list_env("SUBS_INCLUDE")
     return e
 
@@ -57,34 +56,37 @@ def main() -> None:
     env = _env()
     run_dir = LATEST
 
-    # Pre-run sanity
+    # record the run dir for debug bundler
+    try:
+        RUN_ROOT.joinpath("last_run_dir.txt").write_text(str(run_dir), encoding="utf-8")
+    except Exception:
+        pass
+
     for line in _self_check():
         print(line)
 
-    # TMDB auth sanity
     if not (os.getenv("TMDB_API_KEY") or os.getenv("TMDB_BEARER") or os.getenv("TMDB_ACCESS_TOKEN")):
         print("[env] Missing required environment: TMDB_API_KEY or TMDB_BEARER. Set these and re-run.", file=sys.stderr)
         sys.exit(2)
 
-    # 1) Catalog (pool grows via cache)
+    # 1) Catalog
     pool_items = catalog_builder.build_catalog(env)
     pool_tel = env.get("POOL_TELEMETRY", {})
     disc_path = run_dir / "items.discovered.json"
     _write_json(disc_path, pool_items)
 
-    # 2) Seen index + strict filter
+    # 2) Seen index → strict filter
     ratings_csv = Path("data/user/ratings.csv")
     imdb_public_seen = Path("data/cache/imdb_public/seen.json")
     seen_index = filtering.build_seen_index(ratings_csv, imdb_public_seen if imdb_public_seen.exists() else None)
-
     eligible_pre, seen_counts_pre = filtering.filter_seen(pool_items, seen_index)
-    _write_json(run_dir / "assistant_feed.json", eligible_pre)  # light snapshot
+    _write_json(run_dir / "assistant_feed.json", eligible_pre)
 
-    # 3) Enrich (search_multi fallback)
+    # 3) Enrich (search_multi fallback inside)
     enriched_path = run_dir / "items.enriched.json"
     enrich.write_enriched(items_in_path=disc_path, out_path=enriched_path, run_dir=run_dir)
 
-    # 4) Re-load enriched and re-apply seen (IMDb IDs can improve de-dupe)
+    # 4) Re-apply seen on enriched
     enriched = _read_json(enriched_path) or []
     eligible, seen_counts = filtering.filter_seen(enriched, seen_index)
 
@@ -113,7 +115,7 @@ def main() -> None:
     prior_diag["pool"] = pool_tel
     _write_json(diag_path, prior_diag)
 
-    print(f" | catalog:begin")
+    print(" | catalog:begin")
     print(f" | catalog:end kept={len(pool_items)}")
     print(f" | results: discovered={len(pool_items)} eligible={len(eligible)} above_cut={len(ranked)}")
 
