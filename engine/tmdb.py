@@ -14,6 +14,7 @@ TMDB_BEARER = (
 )
 
 _API_BASE = "https://api.themoviedb.org/3"
+_TIMEOUT = 25
 
 def _tmdb_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """GET TMDB v3/v4 with either API key (v3) or Bearer (v4)."""
@@ -24,7 +25,7 @@ def _tmdb_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, A
     q = dict(params or {})
     if TMDB_KEY and "api_key" not in q and not TMDB_BEARER:
         q["api_key"] = TMDB_KEY
-    r = requests.get(url, headers=headers, params=q, timeout=25)
+    r = requests.get(url, headers=headers, params=q, timeout=_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
@@ -183,7 +184,6 @@ def find_by_imdb(imdb_id: str) -> Dict[str, Any]:
     if not imdb_id:
         return {}
     data = _tmdb_get(f"find/{imdb_id}", {"external_source": "imdb_id"})
-    # prefer movie results first, then tv
     for bucket, kind in (("movie_results", "movie"), ("tv_results", "tv")):
         arr = (data or {}).get(bucket) or []
         if arr:
@@ -203,11 +203,13 @@ def get_details(kind: str, tmdb_id: int) -> Dict[str, Any]:
         "production_companies": [c.get("name") for c in (data.get("production_companies") or []) if isinstance(c, dict) and c.get("name")],
     }
     if kind == "movie":
-        out["runtime"] = data.get("runtime")
+        out["runtime"] = data.get("runtime")  # minutes
         out["belongs_to_collection"] = (data.get("belongs_to_collection") or {}).get("name")
     else:
         out["episode_run_time"] = data.get("episode_run_time") or []
         out["networks"] = [n.get("name") for n in (data.get("networks") or []) if isinstance(n, dict) and n.get("name")]
+        out["number_of_seasons"] = data.get("number_of_seasons")
+        out["number_of_episodes"] = data.get("number_of_episodes")
     return out
 
 def get_credits(kind: str, tmdb_id: int) -> Dict[str, Any]:
