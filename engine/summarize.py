@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# Strict set of services to display / filter on
 ALLOWED_SUBS = {
     "apple_tv_plus", "netflix", "max", "paramount_plus",
     "disney_plus", "peacock", "hulu",
@@ -20,14 +19,8 @@ FRIENDLY = {
     "disney_plus": "Disney+",
     "peacock": "Peacock",
     "hulu": "Hulu",
-    # common extras (ignored unless also in ALLOWED_SUBS)
+    # extra slugs
     "prime_video": "Prime Video",
-    "peacock_premium": "Peacock Premium",
-    "starz": "STARZ",
-    "showtime": "Showtime",
-    "amc_plus": "AMC+",
-    "criterion_channel": "Criterion Channel",
-    "mubi": "MUBI",
 }
 
 def _load_json(p: Optional[Path]) -> Any:
@@ -49,7 +42,6 @@ def _as_list(x) -> List[str]:
 
 def _normalize_slug(s: str) -> str:
     s = (s or "").strip().lower()
-    # Normalize HBO variants to 'max'
     if s in {"hbo_max", "hbomax", "hbo"}:
         return "max"
     return s
@@ -61,7 +53,6 @@ def _score(it: Dict[str, Any]) -> float:
         return 0.0
 
 def _aud_0_100(it: Dict[str, Any]) -> float:
-    # Prefer normalized audience; else tmdb_vote (0..10) → 0..100
     for k in ("audience", "tmdb_vote"):
         v = it.get(k)
         try:
@@ -78,12 +69,10 @@ def _providers_slugs(it: Dict[str, Any]) -> List[str]:
     return [s for s in p if isinstance(s, str)]
 
 def _allowed_from_env(diag_env: Dict[str, Any]) -> List[str]:
-    # Respect SUBS_INCLUDE but restrict strictly to our ALLOWED_SUBS set
     subs = [_normalize_slug(s) for s in _as_list(diag_env.get("SUBS_INCLUDE"))]
     if not subs:
         subs = list(ALLOWED_SUBS)
     allowed = [s for s in subs if s in ALLOWED_SUBS]
-    # Fallback to all seven if nothing intersected
     return allowed or list(ALLOWED_SUBS)
 
 def _eligible_item(it: Dict[str, Any], allowed: List[str]) -> bool:
@@ -91,15 +80,13 @@ def _eligible_item(it: Dict[str, Any], allowed: List[str]) -> bool:
     if not provs:
         return False
     allowed_set = set(allowed)
-    # Keep only titles available on at least one allowed provider
     return any(p in allowed_set for p in provs)
 
 def _fmt_providers_bold(it: Dict[str, Any], allowed: List[str], maxn: int = 3) -> Optional[str]:
     provs = [_normalize_slug(p) for p in _providers_slugs(it)]
     if not provs:
         return None
-    allowed_set = set(allowed)
-    kept = [p for p in provs if p in allowed_set]
+    kept = [p for p in provs if p in set(allowed)]
     if not kept:
         return None
     names = [FRIENDLY.get(p, " ".join(w.capitalize() for w in p.split("_"))) for p in kept]
@@ -123,12 +110,53 @@ def _tmdb_link(it: Dict[str, Any]) -> Optional[str]:
     return f"https://www.themoviedb.org/{'movie' if kind=='movie' else 'tv'}/{tid}"
 
 def _emoji_for_kind(kind: str) -> str:
-    kind = (kind or "").lower()
-    return "🍿" if kind == "movie" else "📺"
+    return "🍿" if (kind or "").lower() == "movie" else "📺"
+
+def _pick_top(items: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
+    return sorted(items, key=_score, reverse=True)[:n]
+
+# ---- FINAL GUARD: consult exported seen_index.json ---------------------------
+
+def _load_seen_guard(diag: Dict[str, Any]) -> Dict[str, set]:
+    paths = (diag or {}).get("paths", {}) if isinstance(diag, dict) else {}
+    exp = paths.get("seen_index_json")
+    if not exp:
+        return {"ids": set(), "tkeys": set()}
+    p = Path(exp)
+    data = _load_json(p) or {}
+    ids = set(data.get("imdb_ids") or [])
+    tkeys = set(data.get("title_year_keys") or [])
+    return {"ids": ids, "tkeys": tkeys}
+
+def _title_year_key_norm(it: Dict[str, Any]) -> str:
+    t = (it.get("title") or it.get("name") or "").strip().lower()
+    t = "".join(ch if ch.isalnum() else " " for ch in t)
+    t = " ".join(w for w in t.split() if w not in {"the","a","an","and","of","part"})
+    y = str(it.get("year") or "").strip()
+    return f"{t}::{y}"
+
+def _guard_seen(it: Dict[str, Any], guard: Dict[str, set]) -> bool:
+    imdb = it.get("imdb_id")
+    if imdb and imdb in guard["ids"]:
+        return True
+    key = _title_year_key_norm(it)
+    if key in guard["tkeys"]:
+        return True
+    # year ±1 tolerance
+    if "::" in key and key.endswith("::"):
+        # no usable year, skip tol
+        return False
+    base, y = key.rsplit("::", 1)
+    try:
+        yi = int(y)
+    except Exception:
+        return False
+    for dy in (-1, 1):
+        if f"{base}::{yi+dy}" in guard["tkeys"]:
+            return True
+    return False
 
 def _bullet(it: Dict[str, Any], allowed: List[str]) -> Optional[str]:
-    if not _eligible_item(it, allowed):
-        return None
     title = it.get("title") or it.get("name") or "—"
     year = it.get("year") or ""
     sc = _score(it)
@@ -155,25 +183,6 @@ def _bullet(it: Dict[str, Any], allowed: List[str]) -> Optional[str]:
         main += f" — {link_s}"
     return f"- {main}"
 
-def _pick_top(items: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
-    return sorted(items, key=_score, reverse=True)[:n]
-
-def _read_ratings_csv(p: Path) -> Tuple[int, Dict[str, int]]:
-    if not p.exists():
-        return 0, {}
-    import re
-    sep = re.compile(r"[|,/;+]")
-    n, g = 0, {}
-    with p.open("r", encoding="utf-8", errors="replace") as fh:
-        reader = csv.DictReader(fh)
-        for row in reader:
-            n += 1
-            gs = row.get("genres") or row.get("Genres") or ""
-            for tok in (t.strip() for t in sep.split(gs)):
-                if tok:
-                    g[tok] = g.get(tok, 0) + 1
-    return n, dict(sorted(g.items(), key=lambda kv: kv[1], reverse=True))
-
 def build_digest(items: List[Dict[str, Any]], diag: Dict[str, Any], ratings_csv: Optional[Path], top_n: int = 12) -> str:
     env = (diag or {}).get("env", {}) if isinstance(diag, dict) else {}
     allowed = _allowed_from_env(env)
@@ -189,28 +198,47 @@ def build_digest(items: List[Dict[str, Any]], diag: Dict[str, Any], ratings_csv:
     discovered = env.get("DISCOVERED_COUNT", None)
     eligible_pre = env.get("ELIGIBLE_COUNT", None)
 
-    # Filter to allowed services only
+    # 1) service filter
     filtered = [it for it in items if _eligible_item(it, allowed)]
 
-    # selections
+    # 2) take top N
     picks = _pick_top(filtered, top_n)
 
-    # taste profile (optional)
+    # 3) final guard: drop anything in seen_index.json (ids or title/year ±1)
+    guard = _load_seen_guard(diag)
+    guard_removed = 0
+    guarded_picks: List[Dict[str, Any]] = []
+    for it in picks:
+        if _guard_seen(it, guard):
+            guard_removed += 1
+            continue
+        guarded_picks.append(it)
+
+    # 4) taste profile (optional)
     ratings_rows, genre_counter = (0, {})
     if ratings_csv and ratings_csv.exists():
         try:
-            ratings_rows, genre_counter = _read_ratings_csv(ratings_csv)
+            import re
+            sep = re.compile(r"[|,/;+]")
+            with ratings_csv.open("r", encoding="utf-8", errors="replace") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    ratings_rows += 1
+                    gs = row.get("genres") or row.get("Genres") or ""
+                    for tok in (t.strip() for t in sep.split(gs)):
+                        if tok:
+                            genre_counter[tok] = genre_counter.get(tok, 0) + 1
         except Exception:
             pass
 
     lines: List[str] = []
     lines.append(f"### 🎬 Top Picks ({region})\n")
     if ratings_rows:
-        top_gen = ", ".join([f"{g}×{c}" for g, c in list(genre_counter.items())[:6]])
+        top_gen = ", ".join([f"{g}×{c}" for g, c in sorted(genre_counter.items(), key=lambda kv: kv[1], reverse=True)[:6]])
         lines.append(f"_Taste profile (from your ratings.csv, {ratings_rows} rows):_ {top_gen}\n")
 
-    if picks:
-        for it in picks:
+    if guarded_picks:
+        for it in guarded_picks:
             b = _bullet(it, allowed)
             if b:
                 lines.append(b)
@@ -218,7 +246,7 @@ def build_digest(items: List[Dict[str, Any]], diag: Dict[str, Any], ratings_csv:
     else:
         lines.append("_No items to show on your services right now._\n")
 
-    # Telemetry (exclusions + pool growth deltas)
+    # Telemetry
     lines.append("### 📊 Telemetry")
     if ran_at is not None:
         lines.append(f"- Ran at (UTC): **{ran_at}**" + (f" — {run_sec:.1f}s" if isinstance(run_sec, (int, float)) else ""))
@@ -236,11 +264,13 @@ def build_digest(items: List[Dict[str, Any]], diag: Dict[str, Any], ratings_csv:
     if prov_unmatched:
         lines.append(f"- Provider slugs not matched: `{prov_unmatched}`")
 
-    # NEW: strict-exclusion counts
+    # exclusions summary from runner
     excl = (diag or {}).get("env", {}).get("EXCLUSIONS", {})
     if excl:
-        lines.append(f"- Excluded as seen: **{excl.get('excluded_count', 0)}** "
+        lines.append(f"- Excluded as seen (runner): **{excl.get('excluded_count', 0)}** "
                      f"(ratings_ids~{excl.get('ratings_rows', 0)}, public_ids={excl.get('public_ids', 0)})")
+    # guard summary
+    lines.append(f"- Guard removed in summary: **{guard_removed}**")
 
     if pool_t:
         before = pool_t.get("file_lines_before")
