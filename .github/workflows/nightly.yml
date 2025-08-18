@@ -22,6 +22,9 @@ jobs:
       TMDB_BEARER:  ${{ secrets.TMDB_ACCESS_TOKEN }}
       IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
 
+      # Make provider enrichment broader so service filtering has data
+      ENRICH_PROVIDERS_TOP_N: "150"
+
       # Optional @mention for notifications; set in repo Variables
       NOTIFY_USER: ${{ vars.NOTIFY_USER }}
 
@@ -64,7 +67,7 @@ jobs:
           mkdir -p data/out data/cache
           python -m engine.runner
 
-      - name: Build digest summary (Top Picks w/ icons + pool deltas)
+      - name: Build digest summary (Top Picks on your services, bold providers)
         run: |
           python -m engine.summarize \
             --in "data/out/latest/items.enriched.json" \
@@ -74,7 +77,9 @@ jobs:
             --top 12
 
       - name: Make debug bundle
-        run: bash ./.github/scripts/make_debug_bundle.sh
+        run: |
+          chmod +x ./.github/scripts/make_debug_bundle.sh || true
+          bash ./.github/scripts/make_debug_bundle.sh
 
       - name: Post/update Daily Recommendations issue + comment
         uses: actions/github-script@v7
