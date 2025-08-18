@@ -104,7 +104,7 @@ jobs:
       - name: Run engine
         run: |
           mkdir -p data/out data/cache
-          python -m engine.runner
+          python -m engine.runner | tee data/out/latest/runner.log
 
       # Build digest using our summarize module (no CLI flags needed)
       - name: Build digest summary (Top Movies & Top Shows)
