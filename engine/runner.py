@@ -14,7 +14,7 @@ from .exclusions import (
 from .profile import build_user_model
 from . import summarize
 from . import tmdb
-from . import imdb_scrape  # NEW
+from . import imdb_scrape  # IMDb augmentation
 
 try:
     from .self_check import run_self_check
@@ -69,6 +69,7 @@ def _env_from_os() -> Dict[str, Any]:
         "POOL_MAX_ITEMS": _i("POOL_MAX_ITEMS", 20000),
         "POOL_PRUNE_AT": _i("POOL_PRUNE_AT", 0),
         "POOL_PRUNE_KEEP": _i("POOL_PRUNE_KEEP", 0),
+
         # enrichment sizes
         "ENRICH_PROVIDERS_TOP_N": _i("ENRICH_PROVIDERS_TOP_N", 220),
         "ENRICH_SCORING_TOP_N": _i("ENRICH_SCORING_TOP_N", 260),
@@ -76,9 +77,11 @@ def _env_from_os() -> Dict[str, Any]:
         "ENRICH_EXTERNALIDS_TOP_N": _i("ENRICH_EXTERNALIDS_TOP_N", 60),
         "ENRICH_PROVIDERS_FINAL_TOP_N": _i("ENRICH_PROVIDERS_FINAL_TOP_N", 400),
 
-        # IMDb scrape knobs (NEW)
+        # IMDb scrape knobs
         "IMDB_SCRAPE_ENABLE": _b("IMDB_SCRAPE_ENABLE", True),
         "IMDB_SCRAPE_TOP_N": _i("IMDB_SCRAPE_TOP_N", 120),
+        "IMDB_SCRAPE_KEYWORDS_TOP_N": _i("IMDB_SCRAPE_KEYWORDS_TOP_N", 80),
+        "IMDB_SCRAPE_KEYWORDS_MAX": _i("IMDB_SCRAPE_KEYWORDS_MAX", 30),
     }
 
 def _base_for_select(it: Dict[str, Any]) -> float:
@@ -149,13 +152,11 @@ def _enrich_scoring_signals(items: List[Dict[str, Any]], top_n: int) -> None:
             pass
 
 def _needs_imdb_augment(it: Dict[str, Any]) -> bool:
-    # Treat an item as "thin" if missing any of these:
     if not it.get("imdb_id"): return False
     if not it.get("runtime"): return True
     if not it.get("directors"): return True
     if not it.get("genres") and not it.get("tmdb_genres"): return True
     if not it.get("keywords"): return True
-    # If audience looks unset or weird (<= 0 or missing), try to fill it
     try:
         aud = float(it.get("audience") or it.get("tmdb_vote") or 0.0)
         if aud <= 0.0: return True
@@ -163,32 +164,51 @@ def _needs_imdb_augment(it: Dict[str, Any]) -> bool:
         return True
     return False
 
-def _augment_from_imdb(items: List[Dict[str, Any]], top_n: int) -> None:
-    if top_n <= 0: return
-    count = 0
-    for it in _select_top(items, top_n):
-        if not _needs_imdb_augment(it): continue
-        imdb_id = it.get("imdb_id")
-        try:
-            data = imdb_scrape.fetch_title(imdb_id)
-            if not data: continue
-            # Merge non-empty fields
-            for k in ("runtime","genres","directors","writers","cast","audience","title","year"):
-                v = data.get(k)
-                if v and it.get(k) in (None, [], "", {}):
-                    it[k] = v
-            # Keep a breadcrumb
-            it.setdefault("why", "")
-            if "imdb_augmented" in data:
+def _augment_from_imdb(items: List[Dict[str, Any]], top_n: int, kw_top_n: int, kw_limit: int) -> None:
+    # details augmentation
+    if top_n > 0:
+        count = 0
+        for it in _select_top(items, top_n):
+            if not _needs_imdb_augment(it): continue
+            imdb_id = it.get("imdb_id")
+            try:
+                data = imdb_scrape.fetch_title(imdb_id)
+                if not data: continue
+                for k in ("runtime","genres","directors","writers","cast","audience","title","year"):
+                    v = data.get(k)
+                    if v and it.get(k) in (None, [], "", {}):
+                        it[k] = v
+                it.setdefault("why", "")
                 it["why"] = (it["why"] + ("; " if it["why"] else "") + "IMDb details augmented")
-            # Optional backlink
-            if data.get("imdb_url"):
-                it["imdb_url"] = data["imdb_url"]
-        except Exception:
-            continue
-        count += 1
-        if (count % 20) == 0:
-            time.sleep(0.05)
+                if data.get("imdb_url"):
+                    it["imdb_url"] = data["imdb_url"]
+            except Exception:
+                continue
+            count += 1
+            if (count % 20) == 0:
+                time.sleep(0.05)
+
+    # keywords augmentation (even if details didn't need it)
+    if kw_top_n > 0 and kw_limit > 0:
+        count = 0
+        for it in _select_top(items, kw_top_n):
+            if not it.get("imdb_id"): continue
+            existing = it.get("keywords") or []
+            if isinstance(existing, list) and len(existing) >= 5:
+                continue
+            imdb_id = it.get("imdb_id")
+            try:
+                kws = imdb_scrape.fetch_keywords(imdb_id, limit=kw_limit)
+                if kws:
+                    merged = list(dict.fromkeys([*(existing or []), *kws]))
+                    it["keywords"] = merged
+                    it.setdefault("why", "")
+                    it["why"] = (it["why"] + ("; " if it["why"] else "") + "IMDb keywords augmented")
+            except Exception:
+                continue
+            count += 1
+            if (count % 20) == 0:
+                time.sleep(0.05)
 
 def main() -> None:
     t0 = time.time()
@@ -215,7 +235,6 @@ def main() -> None:
         print(f"[catalog] FAILED: {ex!r}")
         traceback.print_exc()
         items = []
-    pool_t = env.get("POOL_TELEMETRY") or {}
     print(f" | catalog:end pooled={len(items)}")
 
     # 2) External IDs for strict seen-filter
@@ -232,7 +251,7 @@ def main() -> None:
             from .exclusions import load_seen_index as _lsi
             seen_idx = _lsi(ratings_csv)
             excl_info["ratings_rows"] = sum(1 for k in seen_idx if isinstance(k, str) and k.startswith("tt"))
-            # Collect TV roots
+            # collect TV roots
             import csv, re
             _non = re.compile(r"[^a-z0-9]+")
             def norm(s: str) -> str: return _non.sub(" ", (s or "").strip().lower()).strip()
@@ -275,28 +294,36 @@ def main() -> None:
     except Exception as ex:
         print(f"[providers-pre] FAILED: {ex!r}")
 
-    # 5) Optional IMDb augmentation (NEW)
+    # 5) Optional IMDb augmentation (details + keywords)
     if env.get("IMDB_SCRAPE_ENABLE", True):
         try:
-            _augment_from_imdb(items, top_n=int(env.get("IMDB_SCRAPE_TOP_N", 120)))
+            _augment_from_imdb(
+                items,
+                top_n=int(env.get("IMDB_SCRAPE_TOP_N", 120)),
+                kw_top_n=int(env.get("IMDB_SCRAPE_KEYWORDS_TOP_N", 80)),
+                kw_limit=int(env.get("IMDB_SCRAPE_KEYWORDS_MAX", 30)),
+            )
         except Exception as ex:
             print(f"[imdb-augment] FAILED: {ex!r}")
 
     # 6) Profile model
     model_path = str((exports_dir / "user_model.json"))
     try:
-        model = build_user_model(Path("data/user/ratings.csv"), exports_dir)
+        _ = build_user_model(Path("data/user/ratings.csv"), exports_dir)
     except Exception as ex:
         print(f"[profile] FAILED: {ex!r}")
         traceback.print_exc()
-        model = {}
     env["USER_MODEL_PATH"] = model_path
     env["SEEN_TV_TITLE_ROOTS"] = seen_tv_roots
 
     # 7) Score
     try:
         ranked = score_items(env, items)
-        ranked = sorted(ranked, key=lambda it: it.get("score", it.get("tmdb_vote", it.get("popularity", 0.0))), reverse=True)
+        ranked = sorted(
+            ranked,
+            key=lambda it: it.get("score", it.get("tmdb_vote", it.get("popularity", 0.0))),
+            reverse=True,
+        )
     except Exception as ex:
         print(f"[scoring] FAILED: {ex!r}")
         traceback.print_exc()
@@ -313,7 +340,7 @@ def main() -> None:
     (run_dir / "items.enriched.json").write_text(json.dumps(ranked, ensure_ascii=False, indent=2), encoding="utf-8")
     (run_dir / "assistant_feed.json").write_text(json.dumps(ranked, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # 10) diag BEFORE summary (telemetry shows up)
+    # 10) diag BEFORE summary
     _safe_json(
         diag_path,
         {
