@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple, Iterable
 from datetime import date, datetime
 
-# --- env knobs ---
+# --- env helpers ---
 def _bool(name:str, default:bool)->bool:
     v=(os.getenv(name,"").strip().lower())
     if v in {"1","true","yes","on"}: return True
@@ -40,9 +40,9 @@ REC_MOVIE_WINDOW = _int("RECENCY_MOVIE_WINDOW_DAYS", 270)    # ~9 months
 REC_MOVIE_MAX = _float("RECENCY_MOVIE_BONUS_MAX", 10.0)
 REC_TV_FIRST_WINDOW = _int("RECENCY_TV_FIRST_WINDOW", 180)   # new series
 REC_TV_FIRST_MAX = _float("RECENCY_TV_FIRST_BONUS_MAX", 8.0)
-REC_TV_LAST_WINDOW = _int("RECENCY_TV_LAST_WINDOW", 120)     # new season (recent air)
+REC_TV_LAST_WINDOW = _int("RECENCY_TV_LAST_WINDOW", 120)     # new season
 REC_TV_LAST_MAX = _float("RECENCY_TV_LAST_BONUS_MAX", 10.0)
-REC_TV_FOLLOWUP_MAX = _float("RECENCY_TV_FOLLOWUP_BONUS_MAX", 6.0)  # extra if it's a show you watched
+REC_TV_FOLLOWUP_MAX = _float("RECENCY_TV_FOLLOWUP_BONUS_MAX", 6.0)  # extra if user watched older seasons
 REC_PROVIDER_MULT = _float("RECENCY_PROVIDER_MULTIPLIER", 1.15)     # stronger when on your services
 
 # blend weights
@@ -119,6 +119,7 @@ def _kids_penalize(it: Dict[str, Any]) -> Tuple[bool, str]:
         elif isinstance(g, str): genres.append(g.lower())
     genres=set(genres)
     studios=[str(n).lower() for n in _as_list(it.get("production_companies"))]
+    # Allow feature animation from fav studios (Pixar/Disney/etc.)
     if any(s in KIDS_STUDIO_WHITELIST for s in studios): return False, "kids:whitelist_studio"
     title=_norm(it.get("title") or it.get("name") or "")
     hits=any(k in title for k in ("bluey","peppa","paw patrol","cocomelon","octonauts","dora "))
@@ -161,6 +162,11 @@ def _sum(tokens: Iterable[str], table: Dict[str, float]) -> Tuple[float, List[Tu
     return total, contribs
 
 def _recency_boost(it: Dict[str, Any], seen_tv_roots: set[str], allowed_providers: set[str]) -> Tuple[float, str]:
+    """
+    Movies: boost if recent release within REC_MOVIE_WINDOW.
+    TV: boost for new series and/or new season; but DO NOT apply 'new season' to S01 (prevents double counting).
+        Apply follow-up bonus only when 'new season' fired AND user watched prior seasons.
+    """
     mt=(it.get("media_type") or "").lower()
     provs=set(str(p).lower() for p in _as_list(it.get("providers") or it.get("providers_slugs")))
     mult = REC_PROVIDER_MULT if (provs & allowed_providers) else 1.0
@@ -168,32 +174,60 @@ def _recency_boost(it: Dict[str, Any], seen_tv_roots: set[str], allowed_provider
     if mt=="movie":
         rd=_parse_ymd(it.get("release_date"))
         d=_days_since(rd)
-        if d is None: return 0.0, ""
-        if d<=REC_MOVIE_WINDOW:
+        if d is not None and d<=REC_MOVIE_WINDOW:
             frac=max(0.0, (REC_MOVIE_WINDOW - d)/REC_MOVIE_WINDOW)
             bonus=frac*REC_MOVIE_MAX*mult
             return bonus, f"+{round(bonus,1)} new movie ({d}d)"
         return 0.0, ""
 
     if mt=="tv":
-        fad=_parse_ymd(it.get("first_air_date")); lad=_parse_ymd(it.get("last_air_date"))
-        b=0.0; reasons=[]
+        fad=_parse_ymd(it.get("first_air_date"))
+        lad=_parse_ymd(it.get("last_air_date"))
+        try:
+            seasons=int(it.get("number_of_seasons") or 0)
+        except Exception:
+            seasons=0
+
+        is_new_series=False
+        series_bonus=0.0
+        reasons=[]
+
+        # new series boost
         if fad is not None:
-            d=_days_since(fad)
-            if d is not None and d<=REC_TV_FIRST_WINDOW:
-                frac=max(0.0,(REC_TV_FIRST_WINDOW-d)/REC_TV_FIRST_WINDOW)
-                x=frac*REC_TV_FIRST_MAX*mult; b+=x; reasons.append(f"+{round(x,1)} new series ({d}d)")
+            ds=_days_since(fad)
+            if ds is not None and ds<=REC_TV_FIRST_WINDOW:
+                is_new_series=True
+                frac=max(0.0,(REC_TV_FIRST_WINDOW-ds)/REC_TV_FIRST_WINDOW)
+                x=frac*REC_TV_FIRST_MAX*mult
+                series_bonus=x
+                reasons.append(f"+{round(x,1)} new series ({ds}d)")
+
+        # new season boost (suppress for S01 so we don't double-count)
+        season_bonus=0.0
         if lad is not None:
-            d=_days_since(lad)
-            if d is not None and d<=REC_TV_LAST_WINDOW:
-                frac=max(0.0,(REC_TV_LAST_WINDOW-d)/REC_TV_LAST_WINDOW)
-                x=frac*REC_TV_LAST_MAX*mult; b+=x; reasons.append(f"+{round(x,1)} new season ({d}d)")
-                # follow-up boost if user has watched the show before
-                title_root=_norm(it.get("title") or it.get("name") or "")
-                if title_root in seen_tv_roots:
-                    y=min(REC_TV_FOLLOWUP_MAX, 2.0 + frac*REC_TV_FOLLOWUP_MAX)
-                    b+=y; reasons.append(f"+{round(y,1)} follow-up (watched prev)")
-        return b, "; ".join(reasons)
+            dl=_days_since(lad)
+            if dl is not None and dl<=REC_TV_LAST_WINDOW:
+                # Only consider as "new season" when there are >= 2 seasons
+                if seasons >= 2:
+                    frac=max(0.0,(REC_TV_LAST_WINDOW-dl)/REC_TV_LAST_WINDOW)
+                    x=frac*REC_TV_LAST_MAX*mult
+                    season_bonus=x
+                    reasons.append(f"+{round(x,1)} new season ({dl}d)")
+                # else: S01 -> skip new season to avoid double counting
+
+        # follow-up bonus only if we actually awarded a new-season bonus
+        follow_bonus=0.0
+        if season_bonus>0.0:
+            title_root=_norm(it.get("title") or it.get("name") or "")
+            if title_root in seen_tv_roots:
+                # modest fixed floor then scale by recency strength
+                frac = min(1.0, season_bonus / max(1e-6, REC_TV_LAST_MAX*mult))
+                y=min(REC_TV_FOLLOWUP_MAX, 2.0 + frac*REC_TV_FOLLOWUP_MAX)
+                follow_bonus=y
+                reasons.append(f"+{round(y,1)} follow-up (watched prev)")
+
+        total = series_bonus + season_bonus + follow_bonus
+        return total, "; ".join(reasons)
 
     return 0.0, ""
 
