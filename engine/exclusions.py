@@ -1,173 +1,135 @@
 # engine/exclusions.py
 from __future__ import annotations
 import csv
+import os
 import re
-from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Dict, Any, List, Set
+import requests
 
-from .imdb_public import load_public_seen_from_env
-
-# --- Normalization helpers ----------------------------------------------------
-
-_STOPWORDS = {"the", "a", "an", "and", "of", "part"}
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 
 def _norm_title(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = _NON_ALNUM.sub(" ", s)
-    toks = [t for t in s.split() if t and t not in _STOPWORDS]
-    return " ".join(toks)
+    return _NON_ALNUM.sub(" ", (s or "").strip().lower()).strip()
 
-def _tokset(s: str) -> Set[str]:
-    return set(_norm_title(s).split())
-
-def _title_year_key(title: str, year: int | str | None) -> str:
-    y = ""
-    if isinstance(year, int):
-        y = str(year)
-    elif isinstance(year, str) and year.strip().isdigit():
-        y = year.strip()
-    return f"{_norm_title(title)}::{y}"
-
-def _extract_imdb_from_url(url: str) -> str | None:
-    m = re.search(r"/title/(tt\d{7,8})", url or "")
-    return m.group(1) if m else None
-
-def _int_year(y) -> int | None:
+def _title_year_key(title: str|None, year: Any|None) -> str|None:
+    if not title:
+        return None
     try:
-        yi = int(str(y).strip()[:4])
-        if 1880 <= yi <= 2100:
-            return yi
+        y = int(str(year)[:4]) if year is not None else None
     except Exception:
-        pass
+        y = None
+    if y:
+        return f"{_norm_title(title)}::{y}"
     return None
 
-def _jaccard(a: Set[str], b: Set[str]) -> float:
-    if not a or not b:
-        return 0.0
-    inter = len(a & b)
-    if inter == 0:
-        return 0.0
-    union = len(a | b)
-    return inter / union
+def _imdb_id_from_row(row: Dict[str, Any]) -> str|None:
+    for k in ("imdb_id","Const","const","ID","Id"):
+        v = row.get(k)
+        if isinstance(v, str) and v.startswith("tt"):
+            return v.strip()
+    url = row.get("URL") or row.get("Url") or row.get("url")
+    if isinstance(url,str):
+        m = re.search(r"/title/(tt\d{7,8})", url)
+        if m: return m.group(1)
+    return None
 
-# --- Seen index building ------------------------------------------------------
-
-def load_seen_index(ratings_csv: Path) -> Dict[str, bool]:
-    """
-    Build a dict-like index of seen items from ratings.csv:
-      - imdb_id (tt...)
-      - normalized (title, year) pairs  (with variants & tolerance applied at filter time)
-    Supports common CSV headers: Const/imdb_id/URL/Title/Original Title/Year/startYear.
-    """
+def load_seen_index(ratings_csv_path) -> Dict[str, bool]:
+    """Return dict-like set with imdb ids and title::year keys from CSV."""
     seen: Dict[str, bool] = {}
-    if not ratings_csv.exists():
-        return seen
-
-    with ratings_csv.open("r", encoding="utf-8", errors="replace") as fh:
-        reader = csv.DictReader(fh)
-        for row in reader:
-            # tt id
-            imdb_id = None
-            for k in ("imdb_id","const","IMDb Const","Const","IMDB_ID","ID"):
-                v = row.get(k)
-                if isinstance(v, str) and v.startswith("tt"):
-                    imdb_id = v.strip()
-                    break
-            if not imdb_id:
-                url = row.get("URL") or row.get("Url") or row.get("url")
-                if isinstance(url, str):
-                    imdb_id = _extract_imdb_from_url(url)
-            if imdb_id:
-                seen[imdb_id] = True
-
-            # title + year
-            title = row.get("title") or row.get("Title") or row.get("originalTitle") or row.get("Original Title")
-            year = row.get("year") or row.get("Year") or row.get("startYear")
-            if title:
+    try:
+        with open(ratings_csv_path, "r", encoding="utf-8", errors="replace") as fh:
+            reader = csv.DictReader(fh)
+            for r in reader:
+                imdb = _imdb_id_from_row(r)
+                title = r.get("Title") or r.get("Primary Title") or r.get("Original Title")
+                year = r.get("Year")
+                if imdb:
+                    seen[imdb] = True
                 key = _title_year_key(title, year)
-                seen[key] = True
-
+                if key:
+                    seen[key] = True
+                    # also add ±1 year tolerance
+                    try:
+                        yi = int(str(year)[:4])
+                        seen[f"{_norm_title(title)}::{yi-1}"] = True
+                        seen[f"{_norm_title(title)}::{yi+1}"] = True
+                    except Exception:
+                        pass
+    except FileNotFoundError:
+        pass
     return seen
 
-def merge_with_public(seen: Dict[str, bool]) -> Dict[str, bool]:
+def _fetch_imdb_list_csv(list_id: str) -> List[str]:
     """
-    Merge your public IMDb user ratings (tconsts) into the seen index.
+    Fetch public IMDb list CSV: https://www.imdb.com/list/lsXXXXXXXXX/export
+    Returns list of tconst ids.
     """
-    public_ids = load_public_seen_from_env()
-    for tconst in public_ids:
-        seen[tconst] = True
-    return seen
-
-# --- Strict filtering ---------------------------------------------------------
-
-def _maybe_years(y) -> List[int]:
-    yi = _int_year(y)
-    if yi is None:
+    list_id = list_id.strip()
+    if not list_id or not list_id.startswith("ls"):
         return []
-    return [yi - 1, yi, yi + 1]  # ±1 tolerance
+    url = f"https://www.imdb.com/list/{list_id}/export"
+    try:
+        r = requests.get(url, timeout=20)
+        if r.status_code != 200:
+            return []
+        ids: List[str] = []
+        for i, line in enumerate(r.text.splitlines()):
+            if i == 0:
+                continue  # header
+            cols = line.split(",")
+            if not cols:
+                continue
+            # first col is const for export
+            tconst = cols[1] if len(cols) > 1 else cols[0]
+            tconst = tconst.strip().strip('"')
+            if tconst.startswith("tt"):
+                ids.append(tconst)
+        return list(dict.fromkeys(ids))
+    except Exception:
+        return []
 
-def _candidate_keys_from_item(it: Dict) -> List[str]:
-    title = it.get("title") or it.get("name") or it.get("original_title") or it.get("original_name") or ""
-    year = it.get("year")
-    keys = []
-    for yi in _maybe_years(year) or [None]:
-        keys.append(_title_year_key(title, yi))
-    return keys
-
-def _fuzzy_seen_by_title(it: Dict, seen_keys: Set[str], thresh: float = 0.90) -> bool:
+def merge_with_public(seen_idx: Dict[str, bool]) -> Dict[str, bool]:
     """
-    Fuzzy fallback: token-set Jaccard on normalized titles, with ±1 year tolerance if present.
+    Merge optional extra public IMDb lists into seen index.
+    Configure via IMDB_EXTRA_LIST_IDS='lsXXXXXXXX,lsYYYYYYYY'.
     """
-    title = it.get("title") or it.get("name") or it.get("original_title") or it.get("original_name")
-    if not title:
-        return False
-    tset = _tokset(title)
-    # Try exact year box first
-    years = _maybe_years(it.get("year"))
-    for key in seen_keys:
-        if "::" not in key:
+    extras = os.getenv("IMDB_EXTRA_LIST_IDS", "")
+    if not extras.strip():
+        return seen_idx
+    added = 0
+    for tok in extras.split(","):
+        tok = tok.strip()
+        if not tok:
             continue
-        t_norm, y = key.split("::", 1)
-        # year tolerant check
-        y_ok = True
-        if y and years:
-            try:
-                yi = int(y)
-                y_ok = yi in years
-            except Exception:
-                y_ok = True
-        # title similarity
-        if y_ok and _jaccard(tset, set(t_norm.split())) >= thresh:
-            return True
-    return False
+        ids = _fetch_imdb_list_csv(tok)
+        for t in ids:
+            if t not in seen_idx:
+                seen_idx[t] = True
+                added += 1
+    # tiny hint in log via caller's diag
+    seen_idx["_public_added_count"] = bool(added)  # marker; caller may ignore
+    return seen_idx
 
-def filter_unseen(items: List[Dict], seen_index: Dict[str, bool]) -> List[Dict]:
-    """
-    Remove any item whose imdb_id matches seen, OR whose (title,year) normalized matches seen
-    (with ±1 year tolerance), OR whose title fuzzy-matches a seen title (token-set Jaccard).
-    """
-    id_set: Set[str] = {k for k in seen_index.keys() if isinstance(k, str) and k.startswith("tt")}
-    key_set: Set[str] = {k for k in seen_index.keys() if "::" in k}
-
-    out: List[Dict] = []
+def filter_unseen(items: List[Dict[str, Any]], seen_idx: Dict[str, bool]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
     for it in items:
-        imdb_id = it.get("imdb_id")
-        if isinstance(imdb_id, str) and imdb_id in id_set:
-            continue
-
-        # exact normalized keys (+- year variants)
-        drop_by_key = False
-        for key in _candidate_keys_from_item(it):
-            if key in key_set:
-                drop_by_key = True
-                break
-        if drop_by_key:
-            continue
-
-        # fuzzy safety net
-        if _fuzzy_seen_by_title(it, key_set, thresh=0.90):
-            continue
-
-        out.append(it)
+        imdb = it.get("imdb_id")
+        title = it.get("title") or it.get("name")
+        year = it.get("year")
+        key = _title_year_key(title, year)
+        is_seen = False
+        if isinstance(imdb, str) and imdb in seen_idx:
+            is_seen = True
+        elif key and key in seen_idx:
+            is_seen = True
+        # also try ±1 year even if not pre-inserted
+        if not is_seen and title and year:
+            try:
+                yi = int(str(year)[:4])
+                if f"{_norm_title(title)}::{yi-1}" in seen_idx or f"{_norm_title(title)}::{yi+1}" in seen_idx:
+                    is_seen = True
+            except Exception:
+                pass
+        if not is_seen:
+            out.append(it)
     return out
