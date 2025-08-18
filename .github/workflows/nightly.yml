@@ -75,6 +75,11 @@ jobs:
       ROTATION_ENABLE: "true"
       ROTATION_COOLDOWN_DAYS: "5"
 
+      # Recency labeling (optional)
+      RECENT_MOVIE_MONTHS: "9"
+      RECENT_SERIES_DAYS: "120"
+      RECENT_SEASON_DAYS: "120"
+
       # Optional @mention for notifications on the single digest
       NOTIFY_USER: ${{ vars.NOTIFY_USER }}
 
@@ -149,7 +154,8 @@ jobs:
           ls -lh repo-snapshot.zip
 
       # Post/update one Issue with the full digest body only (no per-title comments)
-      - name: Post/update Daily Recommendations issue
+      - name: Post/update Daily Recommendations issue (single digest)
+        if: always()
         uses: actions/github-script@v7
         with:
           script: |
@@ -157,28 +163,63 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const title = 'Daily Recommendations';
+            const wantLabel = 'daily-recos';
 
+            // 1) Load the summary body
             let body = '';
             try { body = fs.readFileSync('data/out/latest/summary.md', 'utf8'); }
             catch { body = 'No summary.md found. Check debug bundle.'; }
+            core.info(`summary.md length: ${body.length}`);
 
-            const { data: issues } = await github.rest.issues.listForRepo({
-              owner, repo, state: 'open', labels: 'daily-recos', per_page: 100
-            });
-            let issue = issues.find(i => i.title === title);
+            // 2) Find existing open issue by title (no label filter)
+            const allOpen = await github.paginate(
+              github.rest.issues.listForRepo,
+              { owner, repo, state: 'open', per_page: 100 }
+            );
+            let issue = allOpen.find(i => i.title === title);
 
-            if (!issue) {
-              issue = (await github.rest.issues.create({ owner, repo, title, body, labels: ['daily-recos'] })).data;
-            } else {
-              await github.rest.issues.update({ owner, repo, issue_number: issue.number, body });
+            // 3) Best-effort ensure label exists (ignore errors if not allowed)
+            let canUseLabel = false;
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: wantLabel });
+              canUseLabel = true;
+            } catch (e) {
+              try {
+                await github.rest.issues.createLabel({ owner, repo, name: wantLabel, color: '0e8a16' });
+                canUseLabel = true;
+              } catch (e2) {
+                core.warning(`Could not ensure label '${wantLabel}': ${e2?.message || e2}`);
+              }
             }
 
+            // 4) Create or update the digest issue
+            if (!issue) {
+              const args = { owner, repo, title, body };
+              if (canUseLabel) args.labels = [wantLabel];
+              issue = (await github.rest.issues.create(args)).data;
+              core.info(`Created issue #${issue.number}`);
+            } else {
+              await github.rest.issues.update({ owner, repo, issue_number: issue.number, body });
+              core.info(`Updated issue #${issue.number}`);
+              if (canUseLabel) {
+                try {
+                  await github.rest.issues.addLabels({ owner, repo, issue_number: issue.number, labels: [wantLabel] });
+                } catch (e3) {
+                  core.warning(`Could not add label to issue #${issue.number}: ${e3?.message || e3}`);
+                }
+              }
+            }
+
+            // 5) Optional: mention a user
             const mention = process.env.NOTIFY_USER ? ` cc @${process.env.NOTIFY_USER}` : '';
             if (mention) {
-              await github.rest.issues.createComment({
-                owner, repo, issue_number: issue.number,
-                body: `Daily digest posted.${mention}`
-              });
+              try {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: issue.number, body: `Daily digest posted.${mention}`
+                });
+              } catch (e4) {
+                core.warning(`Could not add mention comment: ${e4?.message || e4}`);
+              }
             }
 
       - name: Upload debug bundle
