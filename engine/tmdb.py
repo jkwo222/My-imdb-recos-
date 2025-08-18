@@ -1,7 +1,6 @@
 # engine/tmdb.py
 from __future__ import annotations
 import os
-import time
 from typing import Dict, List, Tuple, Any, Optional
 
 import requests
@@ -49,7 +48,6 @@ def _slugify_provider_name(name: str) -> str:
         return "peacock"
     if "hulu" in n:
         return "hulu"
-    # Others we may see (downstream filters ignore if not allowed)
     if "prime video" in n or "amazon" in n:
         return "prime_video"
     if "starz" in n:
@@ -73,10 +71,6 @@ def _normalize_slug(s: str) -> str:
 # ---------- provider directory (for building discover queries) ----------
 
 def _fetch_provider_directory(region: str) -> Dict[str, int]:
-    """
-    Build a mapping of provider_slug -> provider_id for the region by
-    combining movie and tv provider lists.
-    """
     region = (region or "US").upper()
     out: Dict[str, int] = {}
     for kind in ("watch/providers/movie", "watch/providers/tv"):
@@ -89,10 +83,6 @@ def _fetch_provider_directory(region: str) -> Dict[str, int]:
     return out
 
 def providers_from_env(subs: List[str], region: str) -> Tuple[List[int], Dict[str, Optional[int]]]:
-    """
-    Resolve user-requested provider slugs to TMDB provider IDs in this region.
-    Returns (provider_ids, used_map[slug] -> id or None if not available).
-    """
     subs = [_normalize_slug(s) for s in (subs or [])]
     directory = _fetch_provider_directory(region)
     used_map: Dict[str, Optional[int]] = {}
@@ -110,7 +100,6 @@ def providers_from_env(subs: List[str], region: str) -> Tuple[List[int], Dict[st
 def _common_discover_params(region: str, langs: List[str], provider_ids: List[int]) -> Dict[str, Any]:
     params: Dict[str, Any] = {
         "watch_region": (region or "US").upper(),
-        # subscription-like buckets only
         "with_watch_monetization_types": "flatrate,ads",
         "sort_by": "popularity.desc",
         "include_adult": "false",
@@ -137,6 +126,7 @@ def _shape_movie_result(rec: Dict[str, Any]) -> Dict[str, Any]:
         "year": _to_year(rec.get("release_date")),
         "tmdb_vote": rec.get("vote_average"),
         "popularity": rec.get("popularity"),
+        "original_language": (rec.get("original_language") or "").lower(),
     }
 
 def _shape_tv_result(rec: Dict[str, Any]) -> Dict[str, Any]:
@@ -148,14 +138,12 @@ def _shape_tv_result(rec: Dict[str, Any]) -> Dict[str, Any]:
         "year": _to_year(rec.get("first_air_date")),
         "tmdb_vote": rec.get("vote_average"),
         "popularity": rec.get("popularity"),
+        "original_language": (rec.get("original_language") or "").lower(),
     }
 
 def discover_movie_page(page: int, region: str, langs: List[str], provider_ids: List[int], slot: int = 0) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     params = _common_discover_params(region, langs, provider_ids)
-    params.update({
-        "page": max(1, int(page)),
-        "vote_count.gte": 50 if (page % 3) else 100,
-    })
+    params.update({"page": max(1, int(page)), "vote_count.gte": 50 if (page % 3) else 100})
     data = _tmdb_get("discover/movie", params)
     results = [_shape_movie_result(r) for r in (data or {}).get("results", [])]
     diag = {"page": page, "total_pages": (data or {}).get("total_pages"), "count": len(results)}
@@ -163,10 +151,7 @@ def discover_movie_page(page: int, region: str, langs: List[str], provider_ids: 
 
 def discover_tv_page(page: int, region: str, langs: List[str], provider_ids: List[int], slot: int = 0) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     params = _common_discover_params(region, langs, provider_ids)
-    params.update({
-        "page": max(1, int(page)),
-        "vote_count.gte": 50 if (page % 2) else 100,
-    })
+    params.update({"page": max(1, int(page)), "vote_count.gte": 50 if (page % 2) else 100})
     data = _tmdb_get("discover/tv", params)
     results = [_shape_tv_result(r) for r in (data or {}).get("results", [])]
     diag = {"page": page, "total_pages": (data or {}).get("total_pages"), "count": len(results)}
@@ -194,20 +179,78 @@ def get_external_ids(kind: str, tmdb_id: int) -> Dict[str, Any]:
     data = _tmdb_get(f"{kind}/{int(tmdb_id)}/external_ids")
     return {"imdb_id": data.get("imdb_id")}
 
+# ---------- details / credits / keywords (for scoring enrichment) ----------
+
+def get_details(kind: str, tmdb_id: int) -> Dict[str, Any]:
+    kind = (kind or "").lower()
+    if kind not in ("movie", "tv") or not tmdb_id:
+        return {}
+    data = _tmdb_get(f"{kind}/{int(tmdb_id)}")
+    out: Dict[str, Any] = {
+        "original_language": (data.get("original_language") or "").lower(),
+        "production_countries": [c.get("iso_3166_1") for c in (data.get("production_countries") or []) if isinstance(c, dict) and c.get("iso_3166_1")],
+        "production_companies": [c.get("name") for c in (data.get("production_companies") or []) if isinstance(c, dict) and c.get("name")],
+    }
+    if kind == "movie":
+        out["runtime"] = data.get("runtime")  # minutes
+        out["belongs_to_collection"] = (data.get("belongs_to_collection") or {}).get("name")
+    else:
+        out["episode_run_time"] = data.get("episode_run_time") or []
+        out["networks"] = [n.get("name") for n in (data.get("networks") or []) if isinstance(n, dict) and n.get("name")]
+    return out
+
+def get_credits(kind: str, tmdb_id: int) -> Dict[str, Any]:
+    kind = (kind or "").lower()
+    if kind not in ("movie", "tv") or not tmdb_id:
+        return {}
+    data = _tmdb_get(f"{kind}/{int(tmdb_id)}/credits")
+    directors = []
+    writers = []
+    try:
+        for c in (data.get("crew") or []):
+            if not isinstance(c, dict): continue
+            job = (c.get("job") or "").lower()
+            name = c.get("name")
+            if not name: continue
+            if job == "director":
+                directors.append(name)
+            elif job in {"writer", "screenplay", "story"}:
+                writers.append(name)
+    except Exception:
+        pass
+    cast = []
+    try:
+        for c in (data.get("cast") or [])[:8]:
+            if isinstance(c, dict) and c.get("name"):
+                cast.append(c.get("name"))
+    except Exception:
+        pass
+    return {"directors": directors, "writers": writers, "cast": cast}
+
+def get_keywords(kind: str, tmdb_id: int) -> List[str]:
+    kind = (kind or "").lower()
+    if kind not in ("movie", "tv") or not tmdb_id:
+        return []
+    path = f"{kind}/{int(tmdb_id)}/keywords"
+    data = _tmdb_get(path)
+    raw = data.get("keywords") if kind == "movie" else data.get("results")
+    kws = []
+    for kw in raw or []:
+        name = kw.get("name")
+        if isinstance(name, str) and name.strip():
+            kws.append(name.strip().lower())
+    return list(dict.fromkeys(kws))  # unique, keep order
+
 # ---------- per-title watch providers (subscription-only) ----------
 
 def get_title_watch_providers(kind: str, tmdb_id: int, region: str = "US") -> List[str]:
-    """
-    Return provider slugs for this title that are available via subscription (flatrate/ads)
-    in the given region. Excludes rent/buy and premium add-ons.
-    """
     kind = (kind or "").lower()
     if kind not in ("movie", "tv") or not tmdb_id:
         return []
     data = _tmdb_get(f"{kind}/{int(tmdb_id)}/watch/providers")
     by_region = (data or {}).get("results", {}).get((region or "US").upper()) or {}
     slugs = set()
-    for bucket in ("flatrate", "ads"):  # subscription-like buckets
+    for bucket in ("flatrate", "ads"):
         for offer in by_region.get(bucket, []) or []:
             slug = _slugify_provider_name(offer.get("provider_name", ""))
             if slug:
