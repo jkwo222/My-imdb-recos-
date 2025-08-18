@@ -22,11 +22,13 @@ jobs:
       TMDB_BEARER:  ${{ secrets.TMDB_ACCESS_TOKEN }}
       IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
 
+      # Optional @mention for notifications; set in repo Variables
       NOTIFY_USER: ${{ vars.NOTIFY_USER }}
-      # bump this to invalidate old caches
+
+      # Cache version to invalidate old pools when needed
       POOL_CACHE_VERSION: v1
 
-      # pool behavior knobs (already supported by code)
+      # Pool knobs supported by runner/catalog
       POOL_MAX_ITEMS: "20000"
       # POOL_PRUNE_AT: "200000"
       # POOL_PRUNE_KEEP: "150000"
@@ -45,7 +47,7 @@ jobs:
           python -m pip install -U pip
           pip install -r requirements.txt
 
-      # NEW: restore the last saved cache (pool + tmdb)
+      # Restore persistent caches so the pool truly grows
       - name: Restore pool/tmdb caches
         id: cache-restore
         uses: actions/cache/restore@v4
@@ -62,7 +64,7 @@ jobs:
           mkdir -p data/out data/cache
           python -m engine.runner
 
-      - name: Build digest summary
+      - name: Build digest summary (Top Picks w/ icons + pool deltas)
         run: |
           python -m engine.summarize \
             --in "data/out/latest/items.enriched.json" \
@@ -85,6 +87,7 @@ jobs:
             let body = '';
             try { body = fs.readFileSync('data/out/latest/summary.md', 'utf8'); }
             catch { body = 'No summary.md found. Check debug bundle.'; }
+
             const { data: issues } = await github.rest.issues.listForRepo({
               owner, repo, state: 'open', labels: 'daily-recos', per_page: 100
             });
@@ -94,6 +97,7 @@ jobs:
             } else {
               await github.rest.issues.update({ owner, repo, issue_number: issue.number, body });
             }
+
             const mention = process.env.NOTIFY_USER ? ` cc @${process.env.NOTIFY_USER}` : '';
             await github.rest.issues.createComment({
               owner, repo, issue_number: issue.number,
@@ -128,7 +132,7 @@ jobs:
             data/out/latest/summary.md
             data/out/latest/diag.json
 
-      # NEW: save the updated cache with a unique key for this run
+      # Save caches so next run restores an ever-growing pool
       - name: Save pool/tmdb caches
         if: always()
         uses: actions/cache/save@v4
