@@ -5,6 +5,10 @@ on:
     - cron: '30 7 * * *'   # 07:30 UTC (3:30am ET)
   workflow_dispatch:
 
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -13,20 +17,29 @@ jobs:
       # ---------- Core config ----------
       REGION: US
       ORIGINAL_LANGS: '["en"]'
-      SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
+      # Only list the services you actually have
+      SUBS_INCLUDE: apple_tv_plus,netflix,max,paramount_plus,disney_plus,peacock,hulu
       DISCOVER_PAGES: "12"
 
       # TMDB auth (runner accepts either v3 or v4)
-      TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}          # v3 key
-      TMDB_BEARER:  ${{ secrets.TMDB_ACCESS_TOKEN }}     # v4 bearer
+      TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+      TMDB_BEARER:  ${{ secrets.TMDB_ACCESS_TOKEN }}
+
       # IMDb (CSV expected at data/user/ratings.csv)
       IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
-      # Optional extra public lists to exclude (comma-separated lsXXXXXXXX IDs)
-      # IMDB_EXTRA_LIST_IDS: "ls012345678,ls098765432"
+      IMDB_PUBLIC_MAX_PAGES: "10"   # ok to keep
+
+      # ---------- Profile model knobs (keep yours) ----------
+      AFFINITY_K: "5"                  # shrinkage
+      DECAY_HALF_LIFE_DAYS: "270"      # taste recency
 
       # ---------- Scoring / enrichment knobs ----------
+      AUDIENCE_PRIOR_LAMBDA: "0.3"
+      PROVIDER_PREF_LAMBDA: "0.5"
+
+      ENRICH_PROVIDERS_TOP_N: "220"     # keep
+      ENRICH_SCORING_TOP_N: "260"       # bumped for richer details
       ENRICH_EXTERNALIDS_EXCL_TOP_N: "800"   # ext-ids before exclusions (hardens never-seen)
-      ENRICH_SCORING_TOP_N: "260"            # details/credits/keywords enrichment set
       ENRICH_PROVIDERS_FINAL_TOP_N: "50"     # providers enrichment for final Top K
       ENRICH_EXTERNALIDS_TOP_N: "60"         # ext-ids enrichment for final Top K
 
@@ -36,7 +49,7 @@ jobs:
       COMMITMENT_SEASON_PENALTY: "3"
       COMMITMENT_MAX_PENALTY: "18"
 
-      # Recency boosts
+      # Recency boosts (aligns with scoring + email labels)
       RECENCY_MOVIE_WINDOW_DAYS: "270"
       RECENCY_MOVIE_BONUS_MAX: "10"
       RECENCY_TV_FIRST_WINDOW: "180"
@@ -46,6 +59,12 @@ jobs:
       RECENCY_TV_FOLLOWUP_BONUS_MAX: "6"
       RECENCY_PROVIDER_MULTIPLIER: "1.15"
 
+      # Anime / Kids penalties
+      PENALIZE_KIDS: "true"
+      PENALIZE_ANIME: "true"
+      KIDS_CARTOON_PENALTY: "25"
+      ANIME_PENALTY: "20"
+
       # Email rendering (Top Picks + inline labels)
       EMAIL_TOPK: "10"
       EMAIL_SCORE_MIN: "60"
@@ -53,8 +72,15 @@ jobs:
       EMAIL_INCLUDE_NEW_SEASON_LABEL: "true"
       EMAIL_INCLUDE_NEW_SERIES_LABEL: "false"
 
+      # Optional @mention for notifications
+      NOTIFY_USER: ${{ vars.NOTIFY_USER }}
+
+      # Cache version for pool (bump to invalidate)
+      POOL_CACHE_VERSION: v1
+      POOL_MAX_ITEMS: "20000"
+
     steps:
-      - name: Check out
+      - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -67,18 +93,32 @@ jobs:
           python -m pip install -U pip
           pip install -r requirements.txt
 
-      - name: Ensure scripts executable
-        run: |
-          chmod +x .github/scripts/make_debug_bundle.sh || true
-          chmod +x .github/scripts/collect_diag.py || true
+      # Restore persistent caches so the pool truly grows
+      - name: Restore pool/tmdb caches
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            data/cache/pool
+            data/cache/tmdb
+          key: pool-${{ runner.os }}-${{ env.REGION }}-${{ env.POOL_CACHE_VERSION }}-${{ github.run_id }}
+          restore-keys: |
+            pool-${{ runner.os }}-${{ env.REGION }}-${{ env.POOL_CACHE_VERSION }}-
 
-      - name: Run engine
+      - name: Run engine (writes summary.md with inline New Movie/New Season labels)
         run: |
           mkdir -p data/out data/cache
           python -m engine.runner
 
+      # (Removed the separate "python -m engine.summarize" CLI call since runner now generates summary.md)
+
+      - name: Ensure debug scripts executable
+        run: |
+          chmod +x ./.github/scripts/make_debug_bundle.sh || true
+          chmod +x ./.github/scripts/collect_diag.py || true
+
       - name: Make debug bundle (full + compact snapshot)
-        run: bash .github/scripts/make_debug_bundle.sh
+        run: bash ./.github/scripts/make_debug_bundle.sh
 
       - name: Upload compact debug snapshot
         uses: actions/upload-artifact@v4
@@ -87,22 +127,21 @@ jobs:
           path: debug-snapshot.zip
           if-no-files-found: warn
 
-      - name: Upload full debug bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-data
-          path: debug-data.zip
-          if-no-files-found: warn
-
       - name: Create repo snapshot (current code)
-        run: |
-          git archive -o repo-snapshot.zip HEAD
+        run: git archive -o repo-snapshot.zip HEAD
 
       - name: Upload repo snapshot
         uses: actions/upload-artifact@v4
         with:
           name: repo-snapshot
           path: repo-snapshot.zip
+          if-no-files-found: warn
+
+      - name: Upload full debug bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-data
+          path: debug-data.zip
           if-no-files-found: warn
 
       - name: Upload latest outputs (convenience)
@@ -119,7 +158,7 @@ jobs:
             data/out/latest/summary.md
             data/out/latest/diag.json
 
-      - name: Post/update Daily Recommendations issue
+      - name: Post/update Daily Recommendations issue + comment
         uses: actions/github-script@v7
         with:
           script: |
@@ -128,23 +167,31 @@ jobs:
             const repo = context.repo.repo;
             const title = 'Daily Recommendations';
             let body = '';
-            try {
-              body = fs.readFileSync('data/out/latest/summary.md', 'utf8');
-            } catch (e) {
-              body = 'No summary.md found. Check debug snapshot/bundle.';
-            }
+            try { body = fs.readFileSync('data/out/latest/summary.md', 'utf8'); }
+            catch { body = 'No summary.md found. Check debug snapshot/bundle.'; }
+
             const { data: issues } = await github.rest.issues.listForRepo({
               owner, repo, state: 'open', labels: 'daily-recos', per_page: 100
             });
             let issue = issues.find(i => i.title === title);
             if (!issue) {
-              const res = await github.rest.issues.create({
-                owner, repo, title, body, labels: ['daily-recos']
-              });
-              issue = res.data;
+              issue = (await github.rest.issues.create({ owner, repo, title, body, labels: ['daily-recos'] })).data;
             } else {
-              await github.rest.issues.update({
-                owner, repo, issue_number: issue.number, body
-              });
+              await github.rest.issues.update({ owner, repo, issue_number: issue.number, body });
             }
-            core.info(`Issue #${issue.number} updated`);
+
+            const mention = process.env.NOTIFY_USER ? ` cc @${process.env.NOTIFY_USER}` : '';
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: issue.number,
+              body: `Daily digest posted.${mention}\n\n` + body
+            });
+
+      # Save caches so next run restores an ever-growing pool
+      - name: Save pool/tmdb caches
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            data/cache/pool
+            data/cache/tmdb
+          key: pool-${{ runner.os }}-${{ env.REGION }}-${{ env.POOL_CACHE_VERSION }}-${{ github.run_id }}
