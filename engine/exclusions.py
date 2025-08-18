@@ -1,10 +1,10 @@
 # engine/exclusions.py
 from __future__ import annotations
-import csv
-import os
-import re
+import csv, os, re
+from pathlib import Path
 from typing import Dict, Any, List, Set
-import requests
+
+from . import imdb_public  # NEW
 
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 
@@ -15,121 +15,109 @@ def _title_year_key(title: str|None, year: Any|None) -> str|None:
     if not title:
         return None
     try:
-        y = int(str(year)[:4]) if year is not None else None
+        yi = int(str(year)[:4]) if year else None
     except Exception:
-        y = None
-    if y:
-        return f"{_norm_title(title)}::{y}"
-    return None
+        yi = None
+    if yi is None:
+        return None
+    return f"{_norm_title(title)}::{yi}"
 
-def _imdb_id_from_row(row: Dict[str, Any]) -> str|None:
-    for k in ("imdb_id","Const","const","ID","Id"):
-        v = row.get(k)
-        if isinstance(v, str) and v.startswith("tt"):
-            return v.strip()
-    url = row.get("URL") or row.get("Url") or row.get("url")
-    if isinstance(url,str):
-        m = re.search(r"/title/(tt\d{7,8})", url)
-        if m: return m.group(1)
-    return None
+def load_seen_index(ratings_csv_path: Path) -> Dict[str, Any]:
+    """
+    Loads seen set from CSV.
+    Returns a dict with keys:
+      - imdb: set of imdb ids ("tt...")
+      - title_year: set of "normtitle::YYYY"
+    """
+    idx_imdb: Set[str] = set()
+    idx_ty:   Set[str] = set()
 
-def load_seen_index(ratings_csv_path) -> Dict[str, bool]:
-    """Return dict-like set with imdb ids and title::year keys from CSV."""
-    seen: Dict[str, bool] = {}
-    try:
-        with open(ratings_csv_path, "r", encoding="utf-8", errors="replace") as fh:
-            reader = csv.DictReader(fh)
-            for r in reader:
-                imdb = _imdb_id_from_row(r)
-                title = r.get("Title") or r.get("Primary Title") or r.get("Original Title")
-                year = r.get("Year")
-                if imdb:
-                    seen[imdb] = True
-                key = _title_year_key(title, year)
+    if ratings_csv_path.exists():
+        with ratings_csv_path.open("r", encoding="utf-8", errors="replace") as fh:
+            rd = csv.DictReader(fh)
+            for r in rd:
+                imdb = (r.get("Const") or r.get("IMDb ID") or r.get("imdb_id") or "").strip()
+                t = (r.get("Title") or r.get("Primary Title") or r.get("Original Title") or "").strip()
+                year = (r.get("Year") or r.get("Release Year") or r.get("Year Released") or r.get("Original Release Year") or "").strip()
+                if imdb.startswith("tt"):
+                    idx_imdb.add(imdb)
+                key = _title_year_key(t, year)
                 if key:
-                    seen[key] = True
-                    # also add ±1 year tolerance
-                    try:
-                        yi = int(str(year)[:4])
-                        seen[f"{_norm_title(title)}::{yi-1}"] = True
-                        seen[f"{_norm_title(title)}::{yi+1}"] = True
-                    except Exception:
-                        pass
-    except FileNotFoundError:
-        pass
-    return seen
+                    idx_ty.add(key)
 
-def _fetch_imdb_list_csv(list_id: str) -> List[str]:
-    """
-    Fetch public IMDb list CSV: https://www.imdb.com/list/lsXXXXXXXXX/export
-    Returns list of tconst ids.
-    """
-    list_id = list_id.strip()
-    if not list_id or not list_id.startswith("ls"):
-        return []
-    url = f"https://www.imdb.com/list/{list_id}/export"
-    try:
-        r = requests.get(url, timeout=20)
-        if r.status_code != 200:
-            return []
-        ids: List[str] = []
-        for i, line in enumerate(r.text.splitlines()):
-            if i == 0:
-                continue  # header
-            cols = line.split(",")
-            if not cols:
-                continue
-            # first col is const for export
-            tconst = cols[1] if len(cols) > 1 else cols[0]
-            tconst = tconst.strip().strip('"')
-            if tconst.startswith("tt"):
-                ids.append(tconst)
-        return list(dict.fromkeys(ids))
-    except Exception:
-        return []
+    return {"imdb": idx_imdb, "title_year": idx_ty}
 
-def merge_with_public(seen_idx: Dict[str, bool]) -> Dict[str, bool]:
+def merge_with_public(seen_idx: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Merge optional extra public IMDb lists into seen index.
-    Configure via IMDB_EXTRA_LIST_IDS='lsXXXXXXXX,lsYYYYYYYY'.
+    Adds titles from public ratings page (cached) into the seen index.
+    Controlled by:
+      IMDB_USER_ID (required unless IMDB_PUBLIC_URL provided)
+      IMDB_PUBLIC_URL (optional direct URL)
+      IMDB_PUBLIC_MAX_PAGES (default 6)
+      IMDB_PUBLIC_FORCE_REFRESH (true/false)
     """
-    extras = os.getenv("IMDB_EXTRA_LIST_IDS", "")
-    if not extras.strip():
+    user_id = os.getenv("IMDB_USER_ID", "").strip()
+    public_url = os.getenv("IMDB_PUBLIC_URL", "").strip() or None
+    max_pages = int(os.getenv("IMDB_PUBLIC_MAX_PAGES", "6") or "6")
+    force = (os.getenv("IMDB_PUBLIC_FORCE_REFRESH", "").strip().lower() in {"1","true","yes","on"})
+
+    if not user_id and not public_url:
         return seen_idx
-    added = 0
-    for tok in extras.split(","):
-        tok = tok.strip()
-        if not tok:
-            continue
-        ids = _fetch_imdb_list_csv(tok)
-        for t in ids:
-            if t not in seen_idx:
-                seen_idx[t] = True
-                added += 1
-    # tiny hint in log via caller's diag
-    seen_idx["_public_added_count"] = bool(added)  # marker; caller may ignore
-    return seen_idx
 
-def filter_unseen(items: List[Dict[str, Any]], seen_idx: Dict[str, bool]) -> List[Dict[str, Any]]:
+    try:
+        data = imdb_public.fetch_user_ratings(
+            user_id or "",
+            public_url=public_url,
+            max_pages=max_pages,
+            force_refresh=force
+        )
+    except Exception:
+        # If IMDb is unreachable, just return what we already had
+        return seen_idx
+
+    imdb_ids = set(seen_idx.get("imdb") or set())
+    imdb_ids.update([x for x in (data.get("imdb_ids") or []) if isinstance(x, str) and x.startswith("tt")])
+
+    tkeys = set(seen_idx.get("title_year") or set())
+    for k in (data.get("title_year_keys") or []):
+        if isinstance(k, str) and "::" in k:
+            tkeys.add(k)
+
+    return {"imdb": imdb_ids, "title_year": tkeys}
+
+def filter_unseen(items: List[Dict[str, Any]], seen_idx: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Strict filter: remove any item whose imdb_id is in seen, OR whose title::year key matches,
+    with a tiny tolerance for +/- 1 year in case of metadata slop.
+    """
+    seen_imdb: Set[str] = set(seen_idx.get("imdb") or [])
+    seen_tk:   Set[str] = set(seen_idx.get("title_year") or [])
+
     out: List[Dict[str, Any]] = []
     for it in items:
-        imdb = it.get("imdb_id")
-        title = it.get("title") or it.get("name")
-        year = it.get("year")
-        key = _title_year_key(title, year)
+        imdb = (it.get("imdb_id") or "").strip()
+        title = (it.get("title") or it.get("name") or "").strip()
+        year = it.get("year") or it.get("release_year") or it.get("first_air_year")
+
         is_seen = False
-        if isinstance(imdb, str) and imdb in seen_idx:
+
+        if imdb and imdb in seen_imdb:
             is_seen = True
-        elif key and key in seen_idx:
+
+        key = _title_year_key(title, year)
+        if not is_seen and key and key in seen_tk:
             is_seen = True
-        # also try ±1 year even if not pre-inserted
+
+        # Tolerance: +/- 1 year
         if not is_seen and title and year:
             try:
                 yi = int(str(year)[:4])
-                if f"{_norm_title(title)}::{yi-1}" in seen_idx or f"{_norm_title(title)}::{yi+1}" in seen_idx:
+                if f"{_norm_title(title)}::{yi-1}" in seen_tk or f"{_norm_title(title)}::{yi+1}" in seen_tk:
                     is_seen = True
             except Exception:
                 pass
+
         if not is_seen:
             out.append(it)
+
     return out
