@@ -1,134 +1,111 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-OUT_ZIP="debug-data.zip"
-BUNDLE_DIR="debug-bundle"
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$ROOT"
 
-rm -f "$OUT_ZIP"
-rm -rf "$BUNDLE_DIR"
-mkdir -p "$BUNDLE_DIR"
+OUT_DIR="data/out"
+RUN_DIR_FILE="$OUT_DIR/last_run_dir.txt"
 
-resolve_run_dir() {
-  local run_src=""
-  if [[ -e "data/out/latest" ]]; then
-    run_src="data/out/latest"
-  fi
-  if [[ -z "${run_src}" && -f "data/out/last_run_dir.txt" ]]; then
-    run_src="$(cat data/out/last_run_dir.txt || true)"
-  fi
-  if [[ -z "${run_src}" ]]; then
-    local newest
-    newest=$(ls -dt data/out/run_* 2>/dev/null | head -n1 || true)
-    if [[ -n "${newest}" ]]; then
-      run_src="${newest}"
-    fi
-  fi
-  echo "${run_src}"
-}
-
-RUN_DIR="$(resolve_run_dir)"
-echo "Detected run dir: ${RUN_DIR:-<none>}"
-
-# Copy run artifacts
-if [[ -n "${RUN_DIR}" && -d "${RUN_DIR}" ]]; then
-  for f in runner.log assistant_feed.json items.discovered.json items.enriched.json summary.md diag.json; do
-    cp -f "${RUN_DIR}/${f}" "$BUNDLE_DIR/" 2>/dev/null || true
-  done
-  if [[ -d "${RUN_DIR}/exports" ]]; then
-    mkdir -p "$BUNDLE_DIR/exports"
-    cp -rf "${RUN_DIR}/exports/." "$BUNDLE_DIR/exports/" 2>/dev/null || true
-  fi
+# --- locate latest run dir ---
+if [[ -f "$RUN_DIR_FILE" ]]; then
+  RUN_DIR="$(cat "$RUN_DIR_FILE")"
 else
-  echo "WARN: No run directory found; bundle will be minimal" | tee "$BUNDLE_DIR/_warning.txt"
+  # fallback to newest run_* dir
+  RUN_DIR="$(ls -1dt "$OUT_DIR"/run_* 2>/dev/null | head -n1 || true)"
 fi
 
-# Env capture (no secrets)
-{
-  echo "REGION=${REGION:-}"
-  echo "SUBS_INCLUDE=${SUBS_INCLUDE:-}"
-  echo "ORIGINAL_LANGS=${ORIGINAL_LANGS:-}"
-  echo "DISCOVER_PAGES=${DISCOVER_PAGES:-}"
-  echo "POOL_MAX_ITEMS=${POOL_MAX_ITEMS:-}"
-  echo "POOL_PRUNE_AT=${POOL_PRUNE_AT:-}"
-  echo "POOL_PRUNE_KEEP=${POOL_PRUNE_KEEP:-}"
-  echo "ENRICH_PROVIDERS_TOP_N=${ENRICH_PROVIDERS_TOP_N:-}"
-} > "$BUNDLE_DIR/env.txt"
-
-{
-  for k in TMDB_API_KEY TMDB_BEARER IMDB_USER_ID; do
-    v="${!k:-}"
-    if [[ -n "${v}" ]]; then echo "$k=<set>"; else echo "$k=<missing>"; fi
-  done
-} > "$BUNDLE_DIR/env-sanitized.txt"
-
-# Git + listings
-{
-  echo "== git status -sb =="; git status -sb || true
-  echo; echo "== git log -1 =="; git log -1 --oneline --decorate || true
-  echo; echo "== git remote -v =="; git remote -v || true
-} > "$BUNDLE_DIR/git.txt"
-
-{
-  echo "# data/out (top)"; ls -alh "data/out" 2>/dev/null || echo "<no data/out>"
-  echo; echo "# data/out/latest (top)"; ls -alh "data/out/latest" 2>/dev/null || echo "<no latest>"
-  echo; echo "# data/cache (top)"; ls -alh "data/cache" 2>/dev/null || echo "<no cache>"
-} > "$BUNDLE_DIR/listings.txt"
-
-# Pool snapshot (head, tail, count)
-if [[ -f "data/cache/pool/pool.jsonl" ]]; then
-  head -n 100 "data/cache/pool/pool.jsonl" > "$BUNDLE_DIR/pool.head.jsonl" || true
-  tail -n 100 "data/cache/pool/pool.jsonl" > "$BUNDLE_DIR/pool.tail.jsonl" || true
-  wc -l "data/cache/pool/pool.jsonl" > "$BUNDLE_DIR/pool.count.txt" || true
+if [[ -z "${RUN_DIR:-}" || ! -d "$RUN_DIR" ]]; then
+  echo "No run directory found. Exiting."
+  exit 0
 fi
 
-# Quick diagnostics (JSON + MD)
-python - <<'PY' || true
-import json, statistics
-from pathlib import Path
-B = Path("debug-bundle")
+echo "Using run dir: $RUN_DIR"
 
-def load_json(p: Path):
-    try:
-        return json.loads(p.read_text(encoding="utf-8", errors="replace"))
-    except Exception:
-        return None
+# --- staging ---
+STAGE=".debug_stage"
+FULL="$STAGE/full"
+SNAP="$STAGE/snapshot"
+rm -rf "$STAGE"
+mkdir -p "$FULL" "$SNAP"
 
-items = load_json(B/"items.enriched.json") or load_json(B/"assistant_feed.json") or []
-matches = []
-for it in items:
-    try:
-        matches.append(float(it.get("match", it.get("score", 0.0)) or 0.0))
-    except Exception:
-        pass
+# --- copy core files into FULL bundle (verbose, everything we might inspect) ---
+mkdir -p "$FULL/data/out/latest" "$FULL/data/cache" "$FULL/exports"
 
-diag = load_json(B/"diag.json") or {}
-env_diag = (diag or {}).get("env", {})
-pool_t = env_diag.get("POOL_TELEMETRY", {})
+# prefer run_dir; mirror key outputs
+cp -f "$RUN_DIR/runner.log" "$FULL/runner.log" || true
+cp -f "$RUN_DIR/diag.json" "$FULL/diag.json" || true
+cp -f "$RUN_DIR/items.discovered.json" "$FULL/items.discovered.json" || true
+cp -f "$RUN_DIR/items.enriched.json" "$FULL/items.enriched.json" || true
+cp -f "$RUN_DIR/assistant_feed.json" "$FULL/assistant_feed.json" || true
+cp -f "$RUN_DIR/summary.md" "$FULL/summary.md" || true
 
-report = {
-  "items": len(items),
-  "match_stats": {
-    "count": len(matches),
-    "min": min(matches) if matches else None,
-    "median": statistics.median(matches) if matches else None,
-    "max": max(matches) if matches else None
-  },
-  "pool": pool_t,
-}
+# exports (model + guards)
+mkdir -p "$FULL/exports"
+cp -f "$RUN_DIR/exports/"*.json "$FULL/exports/" 2>/dev/null || true
+cp -f "$RUN_DIR/exports/"*.md   "$FULL/exports/" 2>/dev/null || true
 
-(B/"analysis.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-(B/"analysis.md").write_text("# Diagnostics\n\n````json\n"+json.dumps(report, indent=2)+"\n````\n", encoding="utf-8")
-print("Wrote analysis into debug-bundle/analysis.{md,json}")
+# cache (pool – optional but helpful to check growth)
+mkdir -p "$FULL/data/cache/pool"
+cp -f data/cache/pool/* "$FULL/data/cache/pool/" 2>/dev/null || true
+
+# also keep a copy of the last_run_dir pointer for convenience
+mkdir -p "$FULL/data/out"
+cp -f "$OUT_DIR/last_run_dir.txt" "$FULL/data/out/last_run_dir.txt" || true
+
+# --- build SNAPSHOT (compact, analysis-ready) ---
+# Keep only essentials + computed diagnostics
+cp -f "$RUN_DIR/runner.log" "$SNAP/runner.log" || true
+cp -f "$RUN_DIR/diag.json" "$SNAP/diag.json" || true
+cp -f "$RUN_DIR/summary.md" "$SNAP/summary.md" || true
+
+mkdir -p "$SNAP/exports"
+cp -f "$RUN_DIR/exports/seen_index.json" "$SNAP/exports/seen_index.json" 2>/dev/null || true
+cp -f "$RUN_DIR/exports/user_model.json" "$SNAP/exports/user_model.json" 2>/dev/null || true
+cp -f "$RUN_DIR/exports/seen_tv_roots.json" "$SNAP/exports/seen_tv_roots.json" 2>/dev/null || true
+
+# Trim items.enriched.json to top 200 by score for compactness (we’ll also store the top 10 list and metrics)
+python3 - <<'PY'
+import json, sys, os, pathlib
+root = pathlib.Path(".")
+run_dir = pathlib.Path(os.environ.get("RUN_DIR", "")) if os.environ.get("RUN_DIR") else None
+snap = pathlib.Path(".debug_stage/snapshot")
+src = (run_dir / "items.enriched.json") if run_dir and (run_dir / "items.enriched.json").exists() \
+      else None
+if src:
+    data = json.loads(src.read_text(encoding="utf-8", errors="replace"))
+    safe = sorted(data, key=lambda x: float(x.get("score", x.get("tmdb_vote", 0.0)) or 0.0), reverse=True)
+    top200 = safe[:200]
+    (snap / "items.top200.json").write_text(json.dumps(top200, ensure_ascii=False, indent=2), encoding="utf-8")
 PY
 
-# Zip the debug bundle
-( cd "$BUNDLE_DIR" && zip -q -r "../${OUT_ZIP}" . ) || true
-ls -lh "$OUT_ZIP" || true
+# --- add computed rich diagnostics (metrics, violations, provider coverage, recency, penalties, pool delta) ---
+python3 .github/scripts/collect_diag.py \
+  --run-dir "$RUN_DIR" \
+  --out-dir "$SNAP" \
+  || echo "collect_diag.py failed (continuing)"
 
-# Compact repo snapshot
-SNAP="repo-snapshot.zip"
-zip -q -r "$SNAP" . \
-  -x ".git/*" "data/out/*" "data/cache/*" \
-  -x "__pycache__/*" "*.pyc" ".venv/*" "venv/*" \
-  -x "node_modules/*" ".mypy_cache/*" ".pytest_cache/*" || true
-ls -lh "$SNAP" || true
+# --- version fingerprint (sha + run id if on Actions) ---
+{
+  echo "git_sha=${GITHUB_SHA:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
+  echo "workflow=${GITHUB_WORKFLOW:-local}"
+  echo "run_id=${GITHUB_RUN_ID:-local}"
+  echo "run_number=${GITHUB_RUN_NUMBER:-local}"
+} > "$SNAP/VERSION.txt"
+
+# --- pack zips in repo root (avoid absolute paths) ---
+DEBUG_FULL_ZIP="debug-data.zip"
+DEBUG_SNAP_ZIP="debug-snapshot.zip"
+rm -f "$DEBUG_FULL_ZIP" "$DEBUG_SNAP_ZIP"
+
+( cd "$FULL"  && zip -qr "../$DEBUG_FULL_ZIP" . )
+( cd "$SNAP"  && zip -qr "../$DEBUG_SNAP_ZIP" . )
+mv "$STAGE/$DEBUG_FULL_ZIP" "$ROOT/$DEBUG_FULL_ZIP"
+mv "$STAGE/$DEBUG_SNAP_ZIP" "$ROOT/$DEBUG_SNAP_ZIP"
+
+# cleanup stage
+rm -rf "$STAGE"
+
+# sizes
+echo "Created $DEBUG_FULL_ZIP ($(du -h "$DEBUG_FULL_ZIP" | awk '{print $1}'))"
+echo "Created $DEBUG_SNAP_ZIP ($(du -h "$DEBUG_SNAP_ZIP" | awk '{print $1}'))"
