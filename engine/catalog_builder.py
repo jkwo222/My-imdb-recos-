@@ -61,9 +61,6 @@ def _pick_pages(mode: str, count: int, max_page: int) -> List[int]:
     return list(range(1, count+1))
 
 def _collect_for_page(kind: str, page: int, region: str, langs: List[str], tel: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Widen sources per page and record failures in telemetry.
-    """
     out: List[Dict[str, Any]] = []
     def call(fn_name: str):
         fn = getattr(tmdb, fn_name, None)
@@ -71,7 +68,7 @@ def _collect_for_page(kind: str, page: int, region: str, langs: List[str], tel: 
         try:
             res = fn(page=page, region=region, langs=langs) if "discover" in fn_name else fn(page=page, region=region)
             if res: out.extend(res)
-        except Exception as ex:
+        except Exception:
             tel.setdefault("errors", {}).setdefault("tmdb_calls_failed", 0)
             tel["errors"]["tmdb_calls_failed"] += 1
 
@@ -88,7 +85,6 @@ def _collect_for_page(kind: str, page: int, region: str, langs: List[str], tel: 
     # trending
     call(f"trending_{kind}")
 
-    # normalize
     for it in out:
         it.setdefault("media_type", kind)
         if it.get("id") and not it.get("tmdb_id"):
@@ -109,7 +105,6 @@ def build_catalog(env: Dict[str, Any]) -> List[Dict[str, Any]]:
         pool_idx.update(j1); srcs.append(POOL_FILE.name)
     j2 = _read_lines_json(LEGACY_ND)
     if j2:
-        # do not overwrite existing keys; keep first-wins
         for k,v in j2.items():
             pool_idx.setdefault(k, v)
         srcs.append(LEGACY_ND.name)
@@ -139,9 +134,8 @@ def build_catalog(env: Dict[str, Any]) -> List[Dict[str, Any]]:
         "pool_size_after": len(pool_idx),
         "pool_appended_this_run": appended,
     }
-    env["DISCOVERED_COUNT"] = appended  # legacy
+    env["DISCOVERED_COUNT"] = appended
 
-    # Bound and return
     max_items = int(env.get("POOL_MAX_ITEMS", 20000) or 20000)
     items = list(pool_idx.values())
     if len(items) > max_items:
