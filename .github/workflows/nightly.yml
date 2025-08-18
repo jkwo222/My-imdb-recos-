@@ -319,6 +319,13 @@ jobs:
           path: debug-data.zip
           if-no-files-found: warn
 
+      - name: Create repo snapshot (tracked files at HEAD)
+        run: |
+          set -e
+          rm -f repo-snapshot.zip
+          git archive -o repo-snapshot.zip HEAD
+          ls -lh repo-snapshot.zip
+
       - name: Upload repo snapshot
         uses: actions/upload-artifact@v4
         with:
