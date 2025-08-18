@@ -6,7 +6,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 try:
     from .env import Env
@@ -29,7 +29,6 @@ try:
 except Exception:
     score_items = None  # type: ignore
 
-# Strict exclusions (CSV + public IMDb)
 from .exclusions import (
     load_seen_index as _load_seen_index,
     filter_unseen as _filter_unseen,
@@ -99,7 +98,7 @@ def _env_from_os() -> Env:
     pool_max = _int_env("POOL_MAX_ITEMS", 20000)
     prune_at = _int_env("POOL_PRUNE_AT", 0)
     prune_keep = _int_env("POOL_PRUNE_KEEP", max(0, prune_at - 5000) if prune_at > 0 else 0)
-    enrich_top_n = _int_env("ENRICH_PROVIDERS_TOP_N", 150)
+    enrich_top_n = _int_env("ENRICH_PROVIDERS_TOP_N", 220)  # bump default for better coverage
 
     return Env.from_mapping({
         "REGION": os.getenv("REGION", "US").strip() or "US",
@@ -152,7 +151,7 @@ def _markdown_summary(items: List[Dict[str, Any]], env: Env, top_n: int = 25) ->
     return "\n".join(lines)
 
 
-def _enrich_top_providers(items: List[Dict[str, Any]], env: Env, top_n: int = 150) -> None:
+def _enrich_top_providers(items: List[Dict[str, Any]], env: Env, top_n: int = 220) -> None:
     if tmdb is None:
         return
     region = env.get("REGION", "US")
@@ -217,21 +216,29 @@ def main() -> None:
 
     _safe_json_dump(run_dir / "items.discovered.json", items)
 
-    # --- STRICT EXCLUSIONS: ratings.csv + public IMDb ---
+    # --- STRICT EXCLUSIONS: ratings.csv + public IMDb + fuzzy/title-year ---
     excl_info = {"ratings_rows": 0, "public_ids": 0, "excluded_count": 0}
+    seen_export = {"imdb_ids": [], "title_year_keys": []}
     try:
         seen_idx: Dict[str, bool] = {}
         ratings_csv = Path("data/user/ratings.csv")
         if ratings_csv.exists():
             seen_idx = _load_seen_index(ratings_csv)
-            # Approx count of explicit ids from CSV
+            # Count explicit ids from CSV
             excl_info["ratings_rows"] = sum(1 for k in seen_idx.keys() if isinstance(k, str) and k.startswith("tt"))
         before_pub = len(seen_idx)
         seen_idx = _merge_seen_public(seen_idx)
         excl_info["public_ids"] = max(0, len(seen_idx) - before_pub)
+
         pre_ct = len(items)
         items = _filter_unseen(items, seen_idx)
         excl_info["excluded_count"] = pre_ct - len(items)
+
+        # Export a compact seen snapshot for summarizer double-check
+        seen_export["imdb_ids"] = [k for k in seen_idx.keys() if isinstance(k, str) and k.startswith("tt")]
+        seen_export["title_year_keys"] = [k for k in seen_idx.keys() if "::" in k]
+        _safe_json_dump(exports_dir / "seen_index.json", seen_export)
+
         _log(f"[exclusions] strict filter applied: removed={excl_info['excluded_count']} "
              f"(ratings_ids~{excl_info['ratings_rows']}, public_ids={excl_info['public_ids']})")
         eligible = len(items)
@@ -241,7 +248,7 @@ def main() -> None:
 
     # Enrich more titles with providers so the service filter has data
     try:
-        _enrich_top_providers(items, env, top_n=int(env.get("ENRICH_PROVIDERS_TOP_N", 150)))
+        _enrich_top_providers(items, env, top_n=int(env.get("ENRICH_PROVIDERS_TOP_N", 220)))
     except Exception as ex:
         _log(f"[providers] enrichment failed: {ex!r}")
 
@@ -269,7 +276,7 @@ def main() -> None:
     _safe_json_dump(run_dir / "items.enriched.json", ranked)
     _safe_json_dump(run_dir / "assistant_feed.json", ranked)
 
-    # Quick markdown telemetry (the digest email is built later by engine.summarize)
+    # Quick markdown telemetry
     try:
         (run_dir / "summary.md").write_text(_markdown_summary(ranked, env, top_n=25), encoding="utf-8")
     except Exception as ex:
@@ -294,7 +301,7 @@ def main() -> None:
                 "PROVIDER_MAP": env.get("PROVIDER_MAP", {}),
                 "PROVIDER_UNMATCHED": env.get("PROVIDER_UNMATCHED", []),
                 "POOL_TELEMETRY": env.get("POOL_TELEMETRY", {}),
-                "EXCLUSIONS": excl_info,  # strict filter telemetry
+                "EXCLUSIONS": excl_info,
             },
             "discover_pages": env.get("DISCOVER_PAGE_TELEMETRY", []),
             "paths": {
@@ -304,6 +311,7 @@ def main() -> None:
                 "summary": str((run_dir / "summary.md").resolve()),
                 "runner_log": str((run_dir / "runner.log").resolve()),
                 "exports_dir": str((run_dir / "exports").resolve()),
+                "seen_index_json": str((exports_dir / "seen_index.json").resolve()),
             },
         }
         _safe_json_dump(diag_path, diag)
