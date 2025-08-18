@@ -1,6 +1,6 @@
 # engine/catalog_builder.py
 from __future__ import annotations
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 from .env import Env
 from . import tmdb
 from . import pool as pool_mod
@@ -54,7 +54,7 @@ def build_catalog(env: Env) -> List[Dict[str, Any]]:
         fresh.extend(tmdb.trending("movie", period))
         fresh.extend(tmdb.trending("tv", period))
 
-    # De-dupe fresh
+    # Deduplicate fresh by (media_type, tmdb_id)
     seen_fresh = set()
     uniq_fresh: List[Dict[str, Any]] = []
     for it in fresh:
@@ -68,16 +68,18 @@ def build_catalog(env: Env) -> List[Dict[str, Any]]:
 
     # --- telemetry fix: measure BEFORE append ---
     stats_before = pool_mod.pool_stats(sample_unique=False)
-
     appended = pool_mod.append_candidates(with_ids)
 
+    # Optional prune
     if prune_at and stats_before.get("file_lines", 0) + appended > prune_at and prune_keep > 0:
         pool_mod.prune_pool(keep_last_lines=prune_keep)
 
     stats_after = pool_mod.pool_stats(sample_unique=True, sample_limit=200000)
 
+    # Load a large unique working set from the pool (newest-first)
     pool = pool_mod.load_pool(max_items=pool_max, unique_only=True, prefer_recent=True)
 
+    # Combine pool + fresh (avoid dupes)
     combined_keys = set()
     combined: List[Dict[str, Any]] = []
     for it in pool:
