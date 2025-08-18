@@ -3,28 +3,25 @@ from __future__ import annotations
 import csv
 import re
 from pathlib import Path
-from typing import Dict, List, Set, Tuple, Any
+from typing import Dict, List, Set, Tuple
 
 from .imdb_public import load_public_seen_from_env
 
-_NON_ALNUM = re.compile(r"[^a-z0-9]+", re.I)
-ARTICLES = {"the", "a", "an"}
-STOPWORDS = ARTICLES | {"and", "of", "in", "on", "at", "to", "for", "with", "part", "season"}
+# --- Normalization helpers ----------------------------------------------------
+
+_STOPWORDS = {"the", "a", "an", "and", "of", "part"}
+_NON_ALNUM = re.compile(r"[^a-z0-9]+")
 
 def _norm_title(s: str) -> str:
     s = (s or "").strip().lower()
     s = _NON_ALNUM.sub(" ", s)
-    s = " ".join(tok for tok in s.split() if tok)
-    # drop leading articles once normalized
-    toks = s.split()
-    if toks and toks[0] in ARTICLES:
-        toks = toks[1:]
+    toks = [t for t in s.split() if t and t not in _STOPWORDS]
     return " ".join(toks)
 
-def _token_set(s: str) -> Set[str]:
-    return {t for t in _norm_title(s).split() if t and t not in STOPWORDS}
+def _tokset(s: str) -> Set[str]:
+    return set(_norm_title(s).split())
 
-def _title_year_key(title: str, year: Any) -> str:
+def _title_year_key(title: str, year: int | str | None) -> str:
     y = ""
     if isinstance(year, int):
         y = str(year)
@@ -33,111 +30,144 @@ def _title_year_key(title: str, year: Any) -> str:
     return f"{_norm_title(title)}::{y}"
 
 def _extract_imdb_from_url(url: str) -> str | None:
-    m = re.search(r"/title/(tt\d{7,8})", url or "", flags=re.I)
+    m = re.search(r"/title/(tt\d{7,8})", url or "")
     return m.group(1) if m else None
 
-class SeenRegistry:
-    """
-    Registry aggregating multiple match strategies:
-      - imdb_ids: exact tt... matches
-      - title_year_keys: exact normalized title + year key
-      - tokens_index: map normalized title -> token set (for fuzzy)
-    """
-    def __init__(self) -> None:
-        self.imdb_ids: Set[str] = set()
-        self.title_year_keys: Set[str] = set()
-        self.tokens_index: Dict[str, Set[str]] = {}
-
-    @classmethod
-    def from_csv_and_public(cls, ratings_csv: Path | None, include_public: bool = True) -> "SeenRegistry":
-        reg = cls()
-        # CSV
-        if ratings_csv and ratings_csv.exists():
-            with ratings_csv.open("r", encoding="utf-8", errors="replace") as fh:
-                reader = csv.DictReader(fh)
-                for row in reader:
-                    imdb_id = row.get("imdb_id") or row.get("const") or row.get("IMDb Const")
-                    if not imdb_id and row.get("URL"):
-                        imdb_id = _extract_imdb_from_url(row.get("URL"))
-                    if isinstance(imdb_id, str) and imdb_id.startswith("tt"):
-                        reg.imdb_ids.add(imdb_id)
-
-                    title = row.get("title") or row.get("Title") or row.get("originalTitle") or row.get("Original Title")
-                    year  = row.get("year")  or row.get("Year")  or row.get("startYear")
-                    if title:
-                        reg.title_year_keys.add(_title_year_key(title, year))
-                        nt = _norm_title(title)
-                        if nt:
-                            reg.tokens_index.setdefault(nt, _token_set(title))
-
-        # Public IMDb (recent ratings) — IDs only
-        if include_public:
-            for tconst in load_public_seen_from_env():
-                reg.imdb_ids.add(tconst)
-        return reg
+def _int_year(y) -> int | None:
+    try:
+        yi = int(str(y).strip()[:4])
+        if 1880 <= yi <= 2100:
+            return yi
+    except Exception:
+        pass
+    return None
 
 def _jaccard(a: Set[str], b: Set[str]) -> float:
     if not a or not b:
         return 0.0
-    return len(a & b) / len(a | b)
+    inter = len(a & b)
+    if inter == 0:
+        return 0.0
+    union = len(a | b)
+    return inter / union
 
-def _maybe_same_title(a: str, b_norm: str) -> bool:
-    A = _token_set(a)
-    B = set(b_norm.split())  # b_norm already normalized
-    # subset check (handles subtitles, “Part I/II”, etc.) or high Jaccard
-    return (A.issubset(B) or B.issubset(A) or _jaccard(A, B) >= 0.88)
+# --- Seen index building ------------------------------------------------------
 
-def is_seen_by_registry(title: str | None, year: Any, imdb_id: str | None, reg: SeenRegistry, year_tol: int = 1) -> bool:
-    # 1) IMDb ID exact
-    if isinstance(imdb_id, str) and imdb_id in reg.imdb_ids:
-        return True
+def load_seen_index(ratings_csv: Path) -> Dict[str, bool]:
+    """
+    Build a dict-like index of seen items from ratings.csv:
+      - imdb_id (tt...)
+      - normalized (title, year) pairs  (with variants & tolerance applied at filter time)
+    Supports common CSV headers: Const/imdb_id/URL/Title/Original Title/Year/startYear.
+    """
+    seen: Dict[str, bool] = {}
+    if not ratings_csv.exists():
+        return seen
 
+    with ratings_csv.open("r", encoding="utf-8", errors="replace") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            # tt id
+            imdb_id = None
+            for k in ("imdb_id","const","IMDb Const","Const","IMDB_ID","ID"):
+                v = row.get(k)
+                if isinstance(v, str) and v.startswith("tt"):
+                    imdb_id = v.strip()
+                    break
+            if not imdb_id:
+                url = row.get("URL") or row.get("Url") or row.get("url")
+                if isinstance(url, str):
+                    imdb_id = _extract_imdb_from_url(url)
+            if imdb_id:
+                seen[imdb_id] = True
+
+            # title + year
+            title = row.get("title") or row.get("Title") or row.get("originalTitle") or row.get("Original Title")
+            year = row.get("year") or row.get("Year") or row.get("startYear")
+            if title:
+                key = _title_year_key(title, year)
+                seen[key] = True
+
+    return seen
+
+def merge_with_public(seen: Dict[str, bool]) -> Dict[str, bool]:
+    """
+    Merge your public IMDb user ratings (tconsts) into the seen index.
+    """
+    public_ids = load_public_seen_from_env()
+    for tconst in public_ids:
+        seen[tconst] = True
+    return seen
+
+# --- Strict filtering ---------------------------------------------------------
+
+def _maybe_years(y) -> List[int]:
+    yi = _int_year(y)
+    if yi is None:
+        return []
+    return [yi - 1, yi, yi + 1]  # ±1 tolerance
+
+def _candidate_keys_from_item(it: Dict) -> List[str]:
+    title = it.get("title") or it.get("name") or it.get("original_title") or it.get("original_name") or ""
+    year = it.get("year")
+    keys = []
+    for yi in _maybe_years(year) or [None]:
+        keys.append(_title_year_key(title, yi))
+    return keys
+
+def _fuzzy_seen_by_title(it: Dict, seen_keys: Set[str], thresh: float = 0.90) -> bool:
+    """
+    Fuzzy fallback: token-set Jaccard on normalized titles, with ±1 year tolerance if present.
+    """
+    title = it.get("title") or it.get("name") or it.get("original_title") or it.get("original_name")
     if not title:
         return False
-
-    # 2) exact normalized title + year (± year tolerance)
-    try:
-        y = int(year)
-        years = {y}
-        for d in range(1, max(1, year_tol) + 1):
-            years.add(y - d); years.add(y + d)
-    except Exception:
-        years = {""}
-
-    nt = _norm_title(title)
-    for yy in years:
-        key = f"{nt}::{yy}" if yy != "" else f"{nt}::"
-        if key in reg.title_year_keys:
-            return True
-
-    # 3) fuzzy token match against known titles
-    for seen_norm in reg.tokens_index.keys():
-        if _maybe_same_title(title, seen_norm):
+    tset = _tokset(title)
+    # Try exact year box first
+    years = _maybe_years(it.get("year"))
+    for key in seen_keys:
+        if "::" not in key:
+            continue
+        t_norm, y = key.split("::", 1)
+        # year tolerant check
+        y_ok = True
+        if y and years:
+            try:
+                yi = int(y)
+                y_ok = yi in years
+            except Exception:
+                y_ok = True
+        # title similarity
+        if y_ok and _jaccard(tset, set(t_norm.split())) >= thresh:
             return True
     return False
 
 def filter_unseen(items: List[Dict], seen_index: Dict[str, bool]) -> List[Dict]:
     """
-    Backwards-compatible filter that accepts a simple dict from the older API.
-    Kept for runner compatibility. (New code should use SeenRegistry + filter_unseen_strict.)
+    Remove any item whose imdb_id matches seen, OR whose (title,year) normalized matches seen
+    (with ±1 year tolerance), OR whose title fuzzy-matches a seen title (token-set Jaccard).
     """
-    def _is_seen_legacy(it: Dict) -> bool:
-        imdb_id = it.get("imdb_id")
-        title = it.get("title") or it.get("name")
-        year = it.get("year")
-        if isinstance(imdb_id, str) and imdb_id in seen_index:
-            return True
-        if title and f"{_norm_title(title)}::{str(year) if year is not None else ''}" in seen_index:
-            return True
-        return False
-    return [it for it in items if not _is_seen_legacy(it)]
+    id_set: Set[str] = {k for k in seen_index.keys() if isinstance(k, str) and k.startswith("tt")}
+    key_set: Set[str] = {k for k in seen_index.keys() if "::" in k}
 
-def filter_unseen_strict(items: List[Dict], reg: SeenRegistry, year_tol: int = 1) -> List[Dict]:
     out: List[Dict] = []
     for it in items:
-        title = it.get("title") or it.get("name")
-        year  = it.get("year")
-        imdb  = it.get("imdb_id")
-        if not is_seen_by_registry(title, year, imdb, reg, year_tol=year_tol):
-            out.append(it)
+        imdb_id = it.get("imdb_id")
+        if isinstance(imdb_id, str) and imdb_id in id_set:
+            continue
+
+        # exact normalized keys (+- year variants)
+        drop_by_key = False
+        for key in _candidate_keys_from_item(it):
+            if key in key_set:
+                drop_by_key = True
+                break
+        if drop_by_key:
+            continue
+
+        # fuzzy safety net
+        if _fuzzy_seen_by_title(it, key_set, thresh=0.90):
+            continue
+
+        out.append(it)
     return out
