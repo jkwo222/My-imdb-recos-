@@ -21,6 +21,7 @@ jobs:
       TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
       TMDB_BEARER:  ${{ secrets.TMDB_ACCESS_TOKEN }}
       IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
+      IMDB_PUBLIC_MAX_PAGES: "10"         # <— ensure recent public ratings are pulled
 
       # Make provider enrichment broader so service filtering has data
       ENRICH_PROVIDERS_TOP_N: "150"
