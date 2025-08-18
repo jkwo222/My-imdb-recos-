@@ -1,369 +1,202 @@
 # engine/scoring.py
 from __future__ import annotations
-import os, re, math
-from typing import Any, Dict, List, Iterable, Optional
-from datetime import date, datetime
+import math
+import os
+from typing import Any, Dict, List
 
-from .recency import key_for_item
+_NON_FAV_ERA_YEAR = int(os.getenv("ERA_CUTOFF_YEAR", "1984") or 1984)
 
-# helpers
-def _bool(n,strue): v=(os.getenv(n,"") or "").strip().lower(); 
-# keep simple to avoid style linters; expand:
-def _bool(n: str, d: bool) -> bool:
-    v=(os.getenv(n,"") or "").strip().lower()
-    if v in {"1","true","yes","on"}: return True
-    if v in {"0","false","no","off"}: return False
-    return d
-def _int(n: str, d: int) -> int:
-    try: return int(os.getenv(n,"") or d)
-    except Exception: return d
-def _float(n: str, d: float) -> float:
-    try: return float(os.getenv(n,"") or d)
-    except Exception: return d
+# Penalties / knobs
+PENALIZE_ANIME        = (os.getenv("PENALIZE_ANIME","true").lower() in {"1","true","yes","on"})
+ANIME_PENALTY         = float(os.getenv("ANIME_PENALTY","20") or 20)
 
-_NON = re.compile(r"[^a-z0-9]+")
+PENALIZE_KIDS         = (os.getenv("PENALIZE_KIDS","true").lower() in {"1","true","yes","on"})
+KIDS_CARTOON_PENALTY  = float(os.getenv("KIDS_CARTOON_PENALTY","25") or 25)
+KIDS_STUDIO_EXEMPT    = {"pixar","walt disney","disney","waltdisney","disney animation","dreamworks","illumination","blue sky","sony pictures animation","laika","ghibli"}
+
+ROMANCE_PENALTY       = float(os.getenv("ROMANCE_PENALTY","10") or 10)
+OLD_BW_PENALTY        = float(os.getenv("OLD_BW_PENALTY","25") or 25)
+PRE1984_PENALTY       = float(os.getenv("PRE1984_PENALTY","20") or 20)
+
+TV_COMMIT_PENALTY_PER_SEASON = float(os.getenv("TV_COMMIT_PENALTY_PER_SEASON","3") or 3)
+TV_COMMIT_MAX_PENALTY        = float(os.getenv("TV_COMMIT_MAX_PENALTY","18") or 18)
+
+AUDIENCE_PRIOR_LAMBDA = float(os.getenv("AUDIENCE_PRIOR_LAMBDA","0.3") or 0.3)
+PROVIDER_PREF_LAMBDA  = float(os.getenv("PROVIDER_PREF_LAMBDA","0.5") or 0.5)
+
 def _norm(s: str) -> str:
-    return _NON.sub(" ", (s or "").strip().lower()).strip()
+    return "".join(ch.lower() if ch.isalnum() else " " for ch in (s or "")).strip()
 
-def _to_year(s: Any) -> Optional[int]:
-    if s is None: return None
-    s=str(s)
-    if len(s)>=4 and s[:4].isdigit():
-        try: return int(s[:4])
-        except Exception: return None
-    return None
-
-def _parse_ymd(s: Optional[str]) -> Optional[date]:
-    if not s: return None
-    s=s.strip()
-    for fmt in ("%Y-%m-%d","%Y/%m/%d"):
-        try: return datetime.strptime(s, fmt).date()
-        except Exception: pass
-    if len(s)>=4 and s[:4].isdigit():
-        try: return date(int(s[:4]),1,1)
-        except Exception: return None
-    return None
-
-def _days_since(d: Optional[date]) -> Optional[int]:
-    if not d: return None
-    try: return (date.today()-d).days
-    except Exception: return None
-
-def _listify(x) -> List[str]:
-    out=[]
-    if not x: return out
-    if isinstance(x, list):
-        for v in x:
-            if isinstance(v, dict) and v.get("name"): out.append(str(v["name"]).strip())
-            else: out.append(str(v).strip())
-    else:
-        out.append(str(x).strip())
-    return [t for t in out if t]
-
-# knobs
-AUDIENCE_PRIOR_LAMBDA = _float("AUDIENCE_PRIOR_LAMBDA", 0.30)
-PROVIDER_PREF_LAMBDA  = _float("PROVIDER_PREF_LAMBDA", 0.50)
-
-ACTOR_WEIGHT    = _float("ACTOR_WEIGHT", 2.2)
-DIRECTOR_WEIGHT = _float("DIRECTOR_WEIGHT", 1.0)
-WRITER_WEIGHT   = _float("WRITER_WEIGHT", 0.8)
-GENRE_WEIGHT    = _float("GENRE_WEIGHT", 0.9)
-KEYWORD_WEIGHT  = _float("KEYWORD_WEIGHT", 0.25)
-SUBGENRE_WEIGHT = _float("SUBGENRE_WEIGHT", 1.0)  # NEW
-
-PENALIZE_KIDS         = _bool("PENALIZE_KIDS", True)
-PENALIZE_ANIME        = _bool("PENALIZE_ANIME", True)
-KIDS_CARTOON_PENALTY  = max(0, _int("KIDS_CARTOON_PENALTY", 30))
-ANIME_PENALTY         = max(0, _int("ANIME_PENALTY", 20))
-KIDS_MOVIE_MIN_RUNTIME= _int("KIDS_MOVIE_MIN_RUNTIME", 70)
-
-ROMANCE_PENALTY       = max(0, _int("ROMANCE_PENALTY", 12))
-ROMCOM_PENALTY        = max(0, _int("ROMCOM_PENALTY", 16))
-
-OLD_CONTENT_YEAR_CUTOFF = _int("OLD_CONTENT_YEAR_CUTOFF", 1984)
-OLD_CONTENT_PENALTY     = max(0, _int("OLD_CONTENT_PENALTY", 18))
-BLACK_WHITE_PENALTY     = max(0, _int("BLACK_WHITE_PENALTY", 22))
-
-COMMITMENT_ENABLED         = _bool("COMMITMENT_ENABLED", True)
-COMMITMENT_UNSEEN_THRESHOLD= _int("COMMITMENT_UNSEEN_THRESHOLD", 1)
-COMMITMENT_SEEN_THRESHOLD  = _int("COMMITMENT_SEEN_THRESHOLD", 4)
-COMMITMENT_SEASON_PENALTY  = _float("COMMITMENT_SEASON_PENALTY", 3.0)
-COMMITMENT_MAX_PENALTY     = _float("COMMITMENT_MAX_PENALTY", 18.0)
-
-REC_MOVIE_WINDOW_DAYS  = _int("RECENCY_MOVIE_WINDOW_DAYS", 270)
-REC_MOVIE_BONUS_MAX    = _float("RECENCY_MOVIE_BONUS_MAX", 10.0)
-REC_TV_FIRST_WINDOW    = _int("RECENCY_TV_FIRST_WINDOW", 180)
-REC_TV_FIRST_BONUS_MAX = _float("RECENCY_TV_FIRST_BONUS_MAX", 8.0)
-REC_TV_LAST_WINDOW     = _int("RECENCY_TV_LAST_WINDOW", 120)
-REC_TV_LAST_BONUS_MAX  = _float("RECENCY_TV_LAST_BONUS_MAX", 7.0)
-
-FEEDBACK_ENABLE     = _bool("FEEDBACK_ENABLE", True)
-FB_UP_DIRECT_BONUS  = _float("FEEDBACK_UP_DIRECT_BONUS", 10.0)
-FB_DOWN_DIRECT_PEN  = _float("FEEDBACK_DOWN_DIRECT_PENALTY", 18.0)
-FB_SIM_ACTOR_W      = _float("FEEDBACK_SIMILAR_ACTOR_W",    1.4)
-FB_SIM_DIRECTOR_W   = _float("FEEDBACK_SIMILAR_DIRECTOR_W", 0.8)
-FB_SIM_WRITER_W     = _float("FEEDBACK_SIMILAR_WRITER_W",   0.6)
-FB_SIM_GENRE_W      = _float("FEEDBACK_SIMILAR_GENRE_W",    0.6)
-FB_SIM_KEYWORD_W    = _float("FEEDBACK_SIMILAR_KEYWORD_W",  0.2)
-
-SCORE_SCALE  = _float("SCORE_SCALE", 1.0)
-SCORE_OFFSET = _float("SCORE_OFFSET", 0.0)
-
-_ALLOWED_PROVIDERS = None
-
-def _genres_lower(it: Dict[str, Any]) -> List[str]:
-    out=[]
-    for g in (it.get("genres") or it.get("tmdb_genres") or []):
-        if isinstance(g, dict) and g.get("name"): out.append(g["name"].lower())
-        elif isinstance(g, str): out.append(g.lower())
-    return out
-
-def _is_black_and_white(it: Dict[str, Any]) -> bool:
-    kws=set(k.lower() for k in (it.get("keywords") or []))
-    return bool(kws & {"black and white","black-and-white","b&w","black & white"})
-
-def _is_romance_movie(it: Dict[str, Any]) -> bool:
-    if (it.get("media_type") or "").lower()!="movie": return False
-    g=_genres_lower(it)
-    if "romantic comedy" in g or "rom-com" in g or "romcom" in g: return True
-    if "romance" in g and ("comedy" in g): return True
-    if "romance" in g: return True
-    return False
-
-def _is_anime(it: Dict[str, Any]) -> bool:
-    title=_norm(it.get("title") or it.get("name") or "")
-    g=_genres_lower(it)
-    lang=(it.get("original_language") or "").lower()
-    countries=set(str(c).upper() for c in (it.get("production_countries") or []))
-    if "anime" in g: return True
-    if "animation" in g and (lang=="ja" or "JP" in countries): return True
-    if any(k in title for k in ("one piece","dandadan","dragon ball","naruto","jujutsu kaisen",
-                                "attack on titan","my hero academia","chainsaw man","spy x family")):
-        return True
-    return False
-
-def _recency_bonus(it: Dict[str, Any]) -> float:
-    mt=(it.get("media_type") or "").lower()
-    if mt=="movie":
-        d=_days_since(_parse_ymd(it.get("release_date")))
-        if d is None or d>REC_MOVIE_WINDOW_DAYS: return 0.0
-        frac=max(0.0, 1.0 - (d/REC_MOVIE_WINDOW_DAYS))
-        return REC_MOVIE_BONUS_MAX * frac
-    if mt=="tv":
-        b=0.0
-        df=_days_since(_parse_ymd(it.get("first_air_date")))
-        if df is not None and df<=REC_TV_FIRST_WINDOW:
-            frac=max(0.0, 1.0-(df/REC_TV_FIRST_WINDOW))
-            b+= REC_TV_FIRST_BONUS_MAX * frac
-        dl=_days_since(_parse_ymd(it.get("last_air_date")))
-        seasons=int(it.get("number_of_seasons") or 0)
-        if seasons>=2 and dl is not None and dl<=REC_TV_LAST_WINDOW:
-            frac=max(0.0, 1.0-(dl/REC_TV_LAST_WINDOW))
-            b+= REC_TV_LAST_BONUS_MAX * frac
-        return b
-    return 0.0
-
-def _commitment_penalty(it: Dict[str, Any], seen_tv_roots: Iterable[str]) -> float:
-    if (it.get("media_type") or "").lower()!="tv": return 0.0
-    seasons=int(it.get("number_of_seasons") or 0)
-    title_root=_norm(it.get("title") or it.get("name") or "")
-    threshold = COMMITMENT_SEEN_THRESHOLD if title_root in (set(seen_tv_roots or [])) else COMMITMENT_UNSEEN_THRESHOLD
-    over=max(0, seasons - threshold)
-    if over<=0: return 0.0
-    return min(COMMITMENT_MAX_PENALTY, over*COMMITMENT_SEASON_PENALTY)
-
-def _old_bw_penalty(it: Dict[str, Any]) -> float:
-    y = _to_year(it.get("year") or it.get("release_year") or it.get("first_air_year"))
-    pen = 0.0
-    if y is not None and y < OLD_CONTENT_YEAR_CUTOFF: pen += OLD_CONTENT_PENALTY
-    if _is_black_and_white(it): pen += BLACK_WHITE_PENALTY
-    return pen
-
-def _romance_penalty(it: Dict[str, Any]) -> float:
-    if _is_romance_movie(it):
-        g=_genres_lower(it)
-        if "romantic comedy" in g or "rom-com" in g or ("romance" in g and "comedy" in g):
-            return ROMCOM_PENALTY
-        return ROMANCE_PENALTY
-    return 0.0
-
-def _kids_cartoon_penalty(it: Dict[str, Any]) -> float:
-    if not PENALIZE_KIDS: return 0.0
-    if (it.get("media_type") or "").lower() != "movie": return 0.0
-    g = [gg.lower() for gg in _genres_lower(it)]
-    if ("animation" not in g) and ("family" not in g): return 0.0
-    try: rt = int(float(it.get("runtime") or 0))
-    except Exception: rt = 0
-    if rt and rt >= KIDS_MOVIE_MIN_RUNTIME: return 0.0
-    studios = set(str(s).strip().lower() for s in (it.get("production_companies") or []))
-    big = {
-        "pixar","walt disney animation studios","dreamworks animation",
-        "illumination","sony pictures animation","studio ghibli","ghibli"
-    }
-    if studios & big: return 0.0
-    title=_norm(it.get("title") or "")
-    preschool=("bluey","paw patrol","peppa","cocomelon","pj masks","octonauts","bubble guppies","care bears","barney","baby shark","snoopy")
-    if any(k in title for k in preschool): return float(KIDS_CARTOON_PENALTY)
-    return float(KIDS_CARTOON_PENALTY)
-
-def _audience_prior(it: Dict[str, Any]) -> float:
-    v=it.get("audience") or it.get("tmdb_vote")
+def _audience_pct(it: Dict[str, Any]) -> float:
+    v = it.get("audience") or it.get("tmdb_vote")
     try:
-        f=float(v)
-        if f<=10.0: f*=10.0
-        return max(0.0, min(100.0, f)) * AUDIENCE_PRIOR_LAMBDA
+        f = float(v)
+        if f <= 10.0:
+            f *= 10.0
+        return max(0.0, min(100.0, f))
     except Exception:
         return 0.0
 
-def _provider_pref(it: Dict[str, Any]) -> float:
-    global _ALLOWED_PROVIDERS
-    if not _ALLOWED_PROVIDERS: return 0.0
-    provs=set()
-    for p in (it.get("providers") or it.get("providers_slugs") or []):
-        provs.add(str(p).strip().lower())
-    if provs & _ALLOWED_PROVIDERS:
-        return 6.0 * PROVIDER_PREF_LAMBDA
-    return 0.0
+def _genres(it: Dict[str, Any]) -> List[str]:
+    out=[]
+    for g in (it.get("genres") or it.get("tmdb_genres") or []):
+        if isinstance(g, dict) and g.get("name"):
+            out.append(g["name"])
+        elif isinstance(g, str):
+            out.append(g)
+    return out
 
-def _subgenre_pairs(genres: List[str]) -> List[str]:
-    pairs=[]
-    for i in range(len(genres)):
-        for j in range(i+1, len(genres)):
-            a=genres[i].lower(); b=genres[j].lower()
-            pairs.append(" & ".join(sorted([a,b])))
-    return pairs
+def _keywords(it: Dict[str, Any]) -> List[str]:
+    out=[]
+    for k in (it.get("keywords") or []):
+        if isinstance(k, str):
+            out.append(k)
+        elif isinstance(k, dict) and k.get("name"):
+            out.append(k["name"])
+    return out
 
-def _affinity_contrib(it: Dict[str, Any], model: Dict[str, Any]) -> float:
-    if not model: return 0.0
-    score=0.0
-    reasons=[]
-    actors = [a.lower() for a in _listify(it.get("cast"))][:8]
-    top_actors = {k.lower():v for k,v in (model.get("top_actors") or {}).items()}
-    hit = [a for a in actors if a in top_actors]
-    if hit:
-        score += ACTOR_WEIGHT * sum(top_actors[a] for a in hit)
-        reasons.append(f"+actor overlap ({', '.join(hit[:2])})")
-    directors = [d.lower() for d in _listify(it.get("directors"))][:4]
-    top_dirs = {k.lower():v for k,v in (model.get("top_directors") or {}).items()}
-    hit = [d for d in directors if d in top_dirs]
-    if hit:
-        score += DIRECTOR_WEIGHT * sum(top_dirs[d] for d in hit)
-        reasons.append(f"+director match ({hit[0]})")
-    writers = [w.lower() for w in _listify(it.get("writers"))][:4]
-    top_wrs = {k.lower():v for k,v in (model.get("top_writers") or {}).items()}
-    hit = [w for w in writers if w in top_wrs]
-    if hit:
-        score += WRITER_WEIGHT * sum(top_wrs[w] for w in hit)
-        reasons.append(f"+writer match")
-    genres = [g.lower() for g in _genres_lower(it)]
-    top_gen = {k.lower():v for k,v in (model.get("top_genres") or {}).items()}
-    hit = [g for g in genres if g in top_gen]
-    if hit:
-        score += GENRE_WEIGHT * sum(top_gen[g] for g in hit)
-        reasons.append(f"+genre affinity")
-    # sub-genre pairs
-    top_pairs = (model.get("top_subgenres") or {})
-    if top_pairs and len(genres) >= 2:
-        pairs = _subgenre_pairs(genres)
-        inter = [p for p in pairs if p in top_pairs]
-        if inter:
-            score += SUBGENRE_WEIGHT * sum(float(top_pairs[p]) for p in inter[:3])
-            reasons.append(f"+sub-genre ({', '.join(inter[:1])})")
-    kws = [k.lower() for k in (it.get("keywords") or [])][:20]
-    top_kw = {k.lower():v for k,v in (model.get("top_keywords") or {}).items()}
-    hit = [k for k in kws if k in top_kw]
-    if hit:
-        score += KEYWORD_WEIGHT * sum(top_kw[k] for k in hit[:5])
-        reasons.append(f"+keyword affinity")
-    if reasons:
-        prev=(it.get("why") or "").strip()
-        it["why"] = (prev + ("; " if prev else "") + "; ".join(reasons))
+def _companies(it: Dict[str, Any]) -> List[str]:
+    out=[]
+    for c in (it.get("production_companies") or []):
+        if isinstance(c, str):
+            out.append(c)
+        elif isinstance(c, dict) and c.get("name"):
+            out.append(c["name"])
+    return out
+
+def _people_score(names: List[str], pref_map: Dict[str, float], label: str, why: List[str], w: float) -> float:
+    score = 0.0
+    if not names or not pref_map:
+        return 0.0
+    hits=[]
+    for nm in names:
+        if nm in pref_map:
+            val = pref_map[nm] * w
+            score += val * 100.0
+            hits.append(nm)
+    if hits:
+        why.append(f"{label}: " + ", ".join(hits[:3]))
     return score
 
-def _feedback_contrib(it: Dict[str, Any], env: Dict[str, Any]) -> float:
-    if not env.get("FEEDBACK_FEATURES") and not env.get("FEEDBACK_ITEMS"):
-        return 0.0
-    s = 0.0
-    reasons = []
-    fb_items = env.get("FEEDBACK_ITEMS") or {}
-    key = key_for_item(it)
-    if key and key in fb_items:
-        data = fb_items[key] or {}
-        up = int(data.get("up") or 0)
-        down = int(data.get("down") or 0)
-        if up > down and FB_UP_DIRECT_BONUS > 0:
-            s += FB_UP_DIRECT_BONUS; reasons.append(f"+feedback interest")
-        elif down > up and FB_DOWN_DIRECT_PEN > 0:
-            s -= FB_DOWN_DIRECT_PEN; reasons.append(f"-feedback not for me")
-    bank = env.get("FEEDBACK_FEATURES") or {}
-    liked    = bank.get("liked")    or {}
-    disliked = bank.get("disliked") or {}
-    def acc(bucket: str, names: List[str], w_like: float, w_dis: float):
-        nonlocal s, reasons
-        if not names: return
-        bd_like = liked.get(bucket) or {}
-        bd_dis  = disliked.get(bucket) or {}
-        plus = sum(float(bd_like.get(n,0.0)) for n in names)
-        minus= sum(float(bd_dis.get(n,0.0))  for n in names)
-        if plus:
-            delta = w_like * plus; s += delta; reasons.append(f"+fb {bucket} ({int(round(delta))})")
-        if minus:
-            delta = w_dis * minus; s -= delta; reasons.append(f"-fb {bucket} ({int(round(delta))})")
-    actors    = _listify(it.get("cast"))[:8]
-    directors = _listify(it.get("directors"))[:4]
-    writers   = _listify(it.get("writers"))[:4]
-    genres    = _genres_lower(it)
-    keywords  = [str(k).lower() for k in (it.get("keywords") or [])][:20]
-    acc("actors",    actors,    FB_SIM_ACTOR_W,    FB_SIM_ACTOR_W * 0.7)
-    acc("directors", directors, FB_SIM_DIRECTOR_W, FB_SIM_DIRECTOR_W * 0.7)
-    acc("writers",   writers,   FB_SIM_WRITER_W,   FB_SIM_WRITER_W * 0.7)
-    acc("genres",    genres,    FB_SIM_GENRE_W,    FB_SIM_GENRE_W * 0.7)
-    acc("keywords",  keywords,  FB_SIM_KEYWORD_W,  FB_SIM_KEYWORD_W * 0.7)
-    if reasons:
-        prev=(it.get("why") or "").strip()
-        it["why"] = (prev + ("; " if prev else "") + "; ".join(reasons))
+def _bag_score(bag: List[str], pref_map: Dict[str, float], label: str, why: List[str], w: float) -> float:
+    s=0.0
+    hits=[]
+    for token in bag:
+        k=_norm(token)
+        if k in pref_map:
+            val = pref_map[k] * w
+            s += val * 100.0
+            hits.append(token)
+    if s>0 and hits:
+        why.append(f"{label}: " + ", ".join(hits[:5]))
     return s
 
-def _base_popularity(it: Dict[str, Any]) -> float:
-    try: p=float(it.get("popularity") or 0.0)
-    except Exception: p=0.0
-    return math.log1p(max(0.0, p)) * 0.8
+def _is_anime_like(it: Dict[str, Any]) -> bool:
+    gset = {_norm(g) for g in _genres(it)}
+    t = _norm(it.get("title") or it.get("name") or "")
+    if "anime" in gset:
+        return True
+    if "animation" in gset and any(k in t for k in ("one piece","dandadan","dragon ball","naruto","jujutsu kaisen","attack on titan","my hero academia","chainsaw man","spy x family")):
+        return True
+    if (it.get("original_language") or "").lower() == "ja" and "animation" in gset:
+        return True
+    return False
 
-def score_items(env: Dict[str, Any], items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    global _ALLOWED_PROVIDERS
-    _ALLOWED_PROVIDERS = {str(p).strip().lower() for p in (env.get("SUBS_INCLUDE") or [])}
+def _is_kids_cartoon(it: Dict[str, Any]) -> bool:
+    gset = {_norm(g) for g in _genres(it)}
+    if "animation" in gset and ("family" in gset or "kids" in gset):
+        comps = {_norm(c) for c in _companies(it)}
+        if any(ex in comps for ex in KIDS_STUDIO_EXEMPT):
+            return False
+        return True
+    return False
 
-    # user model (required; runner ensures it’s exported)
-    model = {}
-    model_path = env.get("USER_MODEL_PATH") or ""
-    if isinstance(model_path, str) and model_path:
-        try:
-            import json
-            with open(model_path, "r", encoding="utf-8", errors="replace") as fh:
-                model = json.load(fh)
-        except Exception:
-            model = {}
+def _is_romance(it: Dict[str, Any]) -> bool:
+    gset = {_norm(g) for g in _genres(it)}
+    kset = {_norm(k) for k in _keywords(it)}
+    if "romance" in gset:
+        return True
+    if any(k in kset for k in ("romantic comedy","rom com","romcom")):
+        return True
+    return False
 
-    seen_tv_roots = set(env.get("SEEN_TV_TITLE_ROOTS") or [])
+def _is_black_white(it: Dict[str, Any]) -> bool:
+    kset = {_norm(k) for k in _keywords(it)}
+    return "black and white" in kset or "black-and-white" in kset
 
+def _year(it: Dict[str, Any]) -> int:
+    if it.get("year"):
+        try: return int(it.get("year"))
+        except Exception: pass
+    for fld in ("release_date","first_air_date"):
+        s = (it.get(fld) or "").strip()
+        if len(s) >= 4 and s[:4].isdigit():
+            try: return int(s[:4])
+            except Exception: pass
+    return 0
+
+def _commit_penalty(it: Dict[str, Any]) -> float:
+    mt = (it.get("media_type") or "").lower()
+    if mt != "tv":
+        return 0.0
+    seasons = int(it.get("number_of_seasons") or 0)
+    if seasons <= 1:
+        return 0.0
+    pen = (seasons - 1) * TV_COMMIT_PENALTY_PER_SEASON
+    return min(pen, TV_COMMIT_MAX_PENALTY)
+
+def score_items(items: List[Dict[str, Any]], model: Dict[str, Any], env: Dict[str, Any]) -> List[Dict[str, Any]]:
+    top_actors    = model.get("top_actors") or {}
+    top_directors = model.get("top_directors") or {}
+    top_writers   = model.get("top_writers") or {}
+    top_genres    = model.get("top_genres") or {}
+    top_keywords  = model.get("top_keywords") or {}
+    top_subgenres = model.get("top_subgenres") or {}
+
+    out: List[Dict[str, Any]] = []
     for it in items:
-        s = 0.0
-        s += _audience_prior(it)
-        s += _provider_pref(it)
-        s += _recency_bonus(it)
-        s += _affinity_contrib(it, model)
-        if _bool("FEEDBACK_ENABLE", True):
-            s += _feedback_contrib(it, env)
-        s += _base_popularity(it)
+        why: List[str] = []
+        score = 0.0
 
-        pen = 0.0
-        if PENALIZE_ANIME and _is_anime(it): pen += ANIME_PENALTY
-        pen += _romance_penalty(it)
-        pen += _old_bw_penalty(it)
-        pen += _commitment_penalty(it, seen_tv_roots)
-        pen += _kids_cartoon_penalty(it)
+        # People
+        score += _people_score(it.get("cast") or [], top_actors, "cast", why, w=1.0)
+        score += _people_score(it.get("directors") or [], top_directors, "director", why, w=1.05)
+        score += _people_score(it.get("writers") or [], top_writers, "writer", why, w=0.8)
 
-        s -= pen
-        s = s * SCORE_SCALE + SCORE_OFFSET
-        it["score"] = float(max(0.0, min(100.0, s)))
-    return items
+        # Genres/keywords (subgenres give a tiny extra push)
+        score += _bag_score(_genres(it), top_genres, "genre", why, w=0.9)
+        score += _bag_score(_keywords(it), top_keywords, "keyword", why, w=0.6)
+        if top_subgenres:
+            # Create a synthetic bag out of sub-genre pair names (already normalized in profile builder)
+            score += _bag_score(list(top_subgenres.keys()), top_subgenres, "sub-genre", why, w=0.5)
+
+        # Audience prior blend
+        aud = _audience_pct(it)
+        score = (1 - AUDIENCE_PRIOR_LAMBDA) * score + AUDIENCE_PRIOR_LAMBDA * aud
+
+        # Provider preference (mild boost if available on your services)
+        provs = it.get("providers") or it.get("providers_slugs") or []
+        if provs:
+            score = (1 - PROVIDER_PREF_LAMBDA) * score + PROVIDER_PREF_LAMBDA * (score * 1.05)
+
+        # Penalties
+        if PENALIZE_ANIME and _is_anime_like(it):
+            score -= ANIME_PENALTY; why.append("anime penalty")
+        if PENALIZE_KIDS and _is_kids_cartoon(it):
+            score -= KIDS_CARTOON_PENALTY; why.append("kids cartoon penalty (studio exceptions apply)")
+        if _is_romance(it):
+            score -= ROMANCE_PENALTY; why.append("romance penalty")
+        yr = _year(it)
+        if yr and yr < _NON_FAV_ERA_YEAR:
+            score -= PRE1984_PENALTY; why.append(f"pre-{_NON_FAV_ERA_YEAR} penalty")
+        if _is_black_white(it):
+            score -= OLD_BW_PENALTY; why.append("black & white penalty")
+        score -= _commit_penalty(it)
+
+        it2 = dict(it)
+        it2["score"] = round(max(0.0, score), 2)
+        it2["why"] = "; ".join(why)
+        out.append(it2)
+
+    out.sort(key=lambda x: (float(x.get("score", 0.0)), float(x.get("audience", 0.0))), reverse=True)
+    return out
