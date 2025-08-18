@@ -218,7 +218,7 @@ def build_digest(items: List[Dict[str, Any]], diag: Dict[str, Any], ratings_csv:
     else:
         lines.append("_No items to show on your services right now._\n")
 
-    # Telemetry with pool growth deltas
+    # Telemetry (exclusions + pool growth deltas)
     lines.append("### 📊 Telemetry")
     if ran_at is not None:
         lines.append(f"- Ran at (UTC): **{ran_at}**" + (f" — {run_sec:.1f}s" if isinstance(run_sec, (int, float)) else ""))
@@ -235,6 +235,12 @@ def build_digest(items: List[Dict[str, Any]], diag: Dict[str, Any], ratings_csv:
     lines.append(f"- Provider map: `{json.dumps(prov_map, ensure_ascii=False)}`")
     if prov_unmatched:
         lines.append(f"- Provider slugs not matched: `{prov_unmatched}`")
+
+    # NEW: strict-exclusion counts
+    excl = (diag or {}).get("env", {}).get("EXCLUSIONS", {})
+    if excl:
+        lines.append(f"- Excluded as seen: **{excl.get('excluded_count', 0)}** "
+                     f"(ratings_ids~{excl.get('ratings_rows', 0)}, public_ids={excl.get('public_ids', 0)})")
 
     if pool_t:
         before = pool_t.get("file_lines_before")
