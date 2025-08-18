@@ -15,27 +15,39 @@ jobs:
     env:
       REGION: US
       ORIGINAL_LANGS: '["en"]'
-      SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
+      # Only list the services you actually have (email still restricts to your 7)
+      SUBS_INCLUDE: apple_tv_plus,netflix,max,paramount_plus,disney_plus,peacock,hulu
       DISCOVER_PAGES: "12"
 
       TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
       TMDB_BEARER:  ${{ secrets.TMDB_ACCESS_TOKEN }}
       IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
-      IMDB_PUBLIC_MAX_PAGES: "10"         # <— ensure recent public ratings are pulled
+      IMDB_PUBLIC_MAX_PAGES: "10"
 
-      # Make provider enrichment broader so service filtering has data
-      ENRICH_PROVIDERS_TOP_N: "150"
+      # Enrichment knobs
+      ENRICH_PROVIDERS_TOP_N: "220"
+      ENRICH_SCORING_TOP_N: "220"
 
-      # Optional @mention for notifications; set in repo Variables
+      # Profile model knobs
+      AFFINITY_K: "5"                  # shrinkage
+      DECAY_HALF_LIFE_DAYS: "270"      # taste recency
+
+      # Scoring blend knobs
+      AUDIENCE_PRIOR_LAMBDA: "0.3"
+      PROVIDER_PREF_LAMBDA: "0.5"
+
+      # Anime / Kids penalties
+      PENALIZE_KIDS: "true"
+      PENALIZE_ANIME: "true"
+      KIDS_CARTOON_PENALTY: "25"
+      ANIME_PENALTY: "20"
+
+      # Optional @mention for notifications
       NOTIFY_USER: ${{ vars.NOTIFY_USER }}
 
-      # Cache version to invalidate old pools when needed
+      # Cache version for pool (bump to invalidate)
       POOL_CACHE_VERSION: v1
-
-      # Pool knobs supported by runner/catalog
       POOL_MAX_ITEMS: "20000"
-      # POOL_PRUNE_AT: "200000"
-      # POOL_PRUNE_KEEP: "150000"
 
     steps:
       - name: Check out repository
