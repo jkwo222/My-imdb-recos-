@@ -6,8 +6,13 @@ from typing import Dict, List, Tuple, Any, Optional
 
 import requests
 
+# Accept multiple env names for the TMDB v4 token; keep v3 key support
 TMDB_KEY = os.getenv("TMDB_API_KEY")
-TMDB_BEARER = os.getenv("TMDB_BEARER")
+TMDB_BEARER = (
+    os.getenv("TMDB_BEARER")
+    or os.getenv("TMDB_ACCESS_TOKEN")
+    or os.getenv("TMDB_V4_TOKEN")
+)
 
 _API_BASE = "https://api.themoviedb.org/3"
 
@@ -44,7 +49,7 @@ def _slugify_provider_name(name: str) -> str:
         return "peacock"
     if "hulu" in n:
         return "hulu"
-    # Others we may see (downstream filters will ignore them if not allowed)
+    # Others we may see (downstream filters ignore if not allowed)
     if "prime video" in n or "amazon" in n:
         return "prime_video"
     if "starz" in n:
@@ -97,7 +102,6 @@ def providers_from_env(subs: List[str], region: str) -> Tuple[List[int], Dict[st
         used_map[s] = pid if isinstance(pid, int) else None
         if isinstance(pid, int):
             ids.append(pid)
-    # de-dup
     ids = sorted({i for i in ids if isinstance(i, int)})
     return ids, used_map
 
@@ -112,10 +116,8 @@ def _common_discover_params(region: str, langs: List[str], provider_ids: List[in
         "include_adult": "false",
     }
     if langs:
-        # TMDB allows comma-separated list for original language (best-effort)
         params["with_original_language"] = ",".join(langs)
     if provider_ids:
-        # TMDB expects comma-separated list for with_watch_providers
         params["with_watch_providers"] = ",".join(str(i) for i in provider_ids)
     return params
 
@@ -142,7 +144,7 @@ def _shape_tv_result(rec: Dict[str, Any]) -> Dict[str, Any]:
         "media_type": "tv",
         "tmdb_id": rec.get("id"),
         "name": rec.get("name") or rec.get("original_name"),
-        "title": rec.get("name") or rec.get("original_name"),  # unify downstream
+        "title": rec.get("name") or rec.get("original_name"),
         "year": _to_year(rec.get("first_air_date")),
         "tmdb_vote": rec.get("vote_average"),
         "popularity": rec.get("popularity"),
@@ -152,7 +154,6 @@ def discover_movie_page(page: int, region: str, langs: List[str], provider_ids: 
     params = _common_discover_params(region, langs, provider_ids)
     params.update({
         "page": max(1, int(page)),
-        # add a little variance between pages
         "vote_count.gte": 50 if (page % 3) else 100,
     })
     data = _tmdb_get("discover/movie", params)
@@ -181,10 +182,7 @@ def trending(kind: str, period: str = "day") -> List[Dict[str, Any]]:
     data = _tmdb_get(f"trending/{kind}/{period}")
     shaped: List[Dict[str, Any]] = []
     for r in (data or {}).get("results", []) or []:
-        if kind == "movie":
-            shaped.append(_shape_movie_result(r))
-        else:
-            shaped.append(_shape_tv_result(r))
+        shaped.append(_shape_movie_result(r) if kind == "movie" else _shape_tv_result(r))
     return shaped
 
 # ---------- external IDs (IMDb) ----------
@@ -194,7 +192,6 @@ def get_external_ids(kind: str, tmdb_id: int) -> Dict[str, Any]:
     if kind not in ("movie", "tv") or not tmdb_id:
         return {}
     data = _tmdb_get(f"{kind}/{int(tmdb_id)}/external_ids")
-    # For TV, TMDB returns imdb_id for the series in many cases; else leave blank
     return {"imdb_id": data.get("imdb_id")}
 
 # ---------- per-title watch providers (subscription-only) ----------
