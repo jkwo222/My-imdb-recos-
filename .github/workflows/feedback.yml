@@ -1,0 +1,65 @@
+name: feedback
+
+on:
+  reaction:
+    types: [created]
+
+permissions:
+  contents: write
+  issues: read
+
+jobs:
+  record:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse reaction and update feedback.json
+        id: parse
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'data/user/feedback.json';
+            const content = context.payload.reaction?.content;
+            if (content !== '+1' && content !== '-1') {
+              return core.info('Not a thumb reaction; skipping');
+            }
+            const comment = context.payload.comment;
+            if (!comment || !comment.body) {
+              return core.info('No comment payload; skipping');
+            }
+            const m = /<!--\s*reco:([^\s>]+)\s*-->/.exec(comment.body);
+            if (!m) { return core.info('No reco marker found; skipping'); }
+            const key = m[1]; // tt123... or tm:123
+
+            // load existing
+            let db = {};
+            try { db = JSON.parse(fs.readFileSync(path, 'utf8')); } catch {}
+            if (!db.items) db.items = {};
+
+            const now = new Date().toISOString();
+            const rec = db.items[key] || { up: 0, down: 0, last_reaction: null, last_at: null };
+            if (content === '+1') rec.up += 1;
+            if (content === '-1') rec.down += 1;
+            rec.last_reaction = content;
+            rec.last_at = now;
+            db.items[key] = rec;
+
+            fs.mkdirSync('data/user', { recursive: true });
+            fs.writeFileSync(path, JSON.stringify(db, null, 2));
+
+            core.setOutput('key', key);
+            core.setOutput('delta', content);
+
+      - name: Commit feedback to repo
+        if: steps.parse.outputs.key
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/user/feedback.json
+          git commit -m "feedback: ${KEY} ${DELTA}" || echo "No changes to commit"
+          git push
+        env:
+          KEY: ${{ steps.parse.outputs.key }}
+          DELTA: ${{ steps.parse.outputs.delta }}
