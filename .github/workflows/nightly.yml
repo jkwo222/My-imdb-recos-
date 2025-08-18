@@ -81,8 +81,8 @@ jobs:
 
       # TV commitment penalties
       COMMITMENT_ENABLED: "true"
-      COMMITMENT_UNSEEN_THRESHOLD: "1"   # start penalizing after S1 if you haven't seen it
-      COMMITMENT_SEEN_THRESHOLD: "4"     # gentler if you already follow it
+      COMMITMENT_UNSEEN_THRESHOLD: "1"   # start penalizing after S1 if unseen
+      COMMITMENT_SEEN_THRESHOLD: "4"     # gentler if already following
       COMMITMENT_SEASON_PENALTY: "3.0"
       COMMITMENT_MAX_PENALTY: "18.0"
 
@@ -136,10 +136,7 @@ jobs:
       # Optional @mention for notifications
       NOTIFY_USER: ${{ vars.NOTIFY_USER }}
 
-      # Save pool across runs (bump to invalidate)
-      POOL_CACHE_VERSION: v1
-
-      # Post per-title feedback comments (👍/👎)
+      # Per-title feedback comments
       POST_PER_TITLE_FEEDBACK: "true"
 
     steps:
@@ -189,7 +186,7 @@ jobs:
           p = pathlib.Path("data/out/latest/items.enriched.json")
           if not p.exists(): raise SystemExit(0)
           items = json.loads(p.read_text(encoding="utf-8", errors="replace"))
-          def normslug(s): 
+          def normslug(s):
               s=(s or "").strip().lower()
               return "max" if s in {"hbomax","hbo max","hbo","hbo_max","max"} else s
           allowed = {normslug(x) for x in (os.getenv("SUBS_INCLUDE","").split(",") if os.getenv("SUBS_INCLUDE") else [])}
