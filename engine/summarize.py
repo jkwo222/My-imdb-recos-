@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 from datetime import date, datetime
 
-from . import recency  # NEW: apply rotation / cooldown gating
+from . import recency  # cooldown memory
 
 # -------- env helpers --------
 def _bool(n:str,d:bool)->bool:
@@ -36,16 +36,21 @@ REC_MOVIE_WINDOW        = _int("RECENCY_MOVIE_WINDOW_DAYS", 270)
 REC_TV_FIRST_WINDOW     = _int("RECENCY_TV_FIRST_WINDOW", 180)
 REC_TV_LAST_WINDOW      = _int("RECENCY_TV_LAST_WINDOW", 120)
 
-# -------- rotation (cooldown) knobs --------
+# Rotation / cooldown knobs
 ROTATION_ENABLE         = _bool("ROTATION_ENABLE", True)
 ROTATION_COOLDOWN_DAYS  = _int("ROTATION_COOLDOWN_DAYS", 5)
-ROTATION_EXEMPT_SCORE   = _float("ROTATION_EXEMPT_SCORE", 90.0)  # near-perfect match ignores cooldown
+ROTATION_EXEMPT_SCORE   = _float("ROTATION_EXEMPT_SCORE", 90.0)
 
 # -------- provider display map --------
 DISPLAY_PROVIDER = {
-    "netflix": "Netflix", "max": "Max", "paramount_plus": "Paramount+",
-    "disney_plus": "Disney+", "apple_tv_plus": "Apple TV+", "peacock": "Peacock",
-    "hulu": "Hulu", "prime_video": "Prime Video",
+    "netflix": "Netflix",
+    "max": "HBO Max",           # <- changed from "Max"
+    "paramount_plus": "Paramount+",
+    "disney_plus": "Disney+",
+    "apple_tv_plus": "Apple TV+",
+    "peacock": "Peacock",
+    "hulu": "Hulu",
+    "prime_video": "Prime Video",
 }
 _NON = re.compile(r"[^a-z0-9]+")
 
@@ -122,9 +127,6 @@ def _is_anime_like(it: Dict[str, Any]) -> bool:
         return True
     return False
 
-def _media_emoji(it: Dict[str, Any]) -> str:
-    return "🍿" if (it.get("media_type") or "").lower()=="movie" else "📺"
-
 def _recency_label(it: Dict[str, Any]) -> Optional[str]:
     mt=(it.get("media_type") or "").lower()
     if mt=="movie" and LAB_NEW_MOVIE:
@@ -166,7 +168,7 @@ def _fmt_title_line(it: Dict[str, Any]) -> str:
     title=it.get("title") or it.get("name") or "Untitled"
     year =it.get("year")
     lab  =_recency_label(it)
-    bits=[f"{_media_emoji(it)} ***{title}***{f' ({year})' if year else ''}"]
+    bits=[f"***{title}***{f' ({year})' if year else ''}"]
     if lab: bits.append(f"— **{lab}**")
     return " ".join(bits)
 
@@ -184,17 +186,67 @@ def _fmt_meta_line(it: Dict[str, Any], providers: List[str]) -> str:
     if director: parts.append(f"Dir. {director}")
     return " • ".join(parts)
 
-def _rotation_skip(it: Dict[str, Any]) -> bool:
-    """Return True if this item should be skipped due to cooldown, unless it is exempt by score."""
-    if not ROTATION_ENABLE:
-        return False
+# --- "why" cleaning / enhancement ---
+_DROP_PATTERNS = (
+    "imdb details augmented",
+    "imdb keywords augmented",
+    "long-run",
+    "anime",
+    "kids",
+    "penalty",
+    "old",
+    "b&w",
+    "black and white",
+    "provider",
+)
+_KEEP_HINTS = (
+    "new movie",
+    "new series",
+    "new season",
+    "actor", "cast", "star",
+    "director",
+    "writer",
+    "genre",
+    "franchise",
+    "sequel",
+    "because you liked",
+    "similar to",
+)
+
+def _clean_why(raw: str, recency_lab: Optional[str]) -> Optional[str]:
+    parts=[p.strip() for p in (raw or "").split(";") if p.strip()]
+    out: List[str]=[]
+    if recency_lab:
+        out.append(recency_lab.lower())
+    for p in parts:
+        low=p.lower()
+        if any(x in low for x in _DROP_PATTERNS):
+            continue
+        if any(x in low for x in _KEEP_HINTS):
+            out.append(p)
+    if not out:
+        return None
+    # collapse duplicates, keep short
+    out2=list(dict.fromkeys(out))[:3]
+    return "; ".join(out2)
+
+def _audience_pct(it: Dict[str, Any]) -> Optional[int]:
+    v = it.get("audience") or it.get("tmdb_vote")
     try:
-        score = float(it.get("score", 0) or 0)
+        f = float(v)
+        if f <= 10.0: f *= 10.0
+        return int(round(max(0.0, min(100.0, f))))
     except Exception:
-        score = 0.0
-    if score >= ROTATION_EXEMPT_SCORE:
-        return False
-    key = recency.key_for_item(it)
+        return None
+
+def _rotation_skip(it: Dict[str, Any]) -> bool:
+    if not ROTATION_ENABLE: return False
+    try:
+        score=float(it.get("score",0) or 0)
+    except Exception:
+        score=0.0
+    if score>=ROTATION_EXEMPT_SCORE: return False
+    key=recency.key_for_item(it)
     return recency.should_skip_key(key, cooldown_days=ROTATION_COOLDOWN_DAYS)
 
 def render_email(
@@ -208,12 +260,14 @@ def render_email(
 ) -> str:
     allowed = allowed_provider_slugs or []
 
-    rotation_skipped = 0
+    rotation_skipped=0
 
     def _eligible(it: Dict[str, Any]) -> bool:
         nonlocal rotation_skipped
         if float(it.get("score", 0) or 0) < EMAIL_SCORE_MIN: return False
-        if EMAIL_EXCLUDE_ANIME and _is_anime_like(it): return False
+        # anime gate handled upstream, but double-protect here
+        if EMAIL_EXCLUDE_ANIME and "anime" in (", ".join(str(g).lower() for g in (it.get("genres") or []))):
+            return False
         if _rotation_skip(it):
             rotation_skipped += 1
             return False
@@ -222,7 +276,7 @@ def render_email(
 
     movies: List[str] = []
     shows:  List[str] = []
-    chosen_keys: List[str] = []
+    chosen_keys: List[str]=[]
     m_cnt=s_cnt=0
 
     for it in sorted(ranked_items, key=lambda x: float(x.get("score", x.get("tmdb_vote", 0.0)) or 0.0), reverse=True):
@@ -230,12 +284,12 @@ def render_email(
         provs=_providers_for_item(it, allowed)
         title_line=f"- {_fmt_title_line(it)}"
         meta_line =f"  • {_fmt_meta_line(it, provs)}"
-        why=(it.get("why") or "").strip()
-        why_line = f"  • why: {why}" if why else None
+        rec_lab=_recency_label(it)
+        why_clean=_clean_why(it.get("why") or "", rec_lab)
+        why_line = f"  • why: {why_clean}" if why_clean else None
         block = [title_line, meta_line] + ([why_line] if why_line else [])
         block_text = "\n".join(block)
         key = recency.key_for_item(it)
-
         if (it.get("media_type") or "").lower()=="movie":
             if m_cnt<EMAIL_TOP_MOVIES:
                 movies.append(block_text); m_cnt+=1
@@ -247,17 +301,14 @@ def render_email(
         if m_cnt>=EMAIL_TOP_MOVIES and s_cnt>=EMAIL_TOP_TV:
             break
 
-    # Persist the keys we actually showed
     if ROTATION_ENABLE and chosen_keys:
-        try:
-            recency.mark_shown_keys(chosen_keys)
-        except Exception:
-            pass
+        try: recency.mark_shown_keys(chosen_keys)
+        except Exception: pass
 
-    lines=["# Daily Recommendations","\n## Top Movies\n"]
+    lines=["# Daily Recommendations","\n## 🍿 Top Movies\n"]
     lines.extend(movies or ["_No eligible movies today after filters._"])
     lines.append("")
-    lines.append("## Top Shows & Series\n")
+    lines.append("## 📺 Top Shows & Series\n")
     lines.extend(shows or ["_No eligible shows today after filters._"])
     lines.append("")
 
@@ -282,10 +333,8 @@ def render_email(
                 lines.append(f"- Pool unique keys (est): **{env_pool.get('unique_keys_est')}**")
             if env_pool.get("pages"):
                 lines.append(f"- Discovery pages this run: **{env_pool.get('pages')}** ({env_pool.get('paging_mode')})")
-        # rotation telemetry
         if ROTATION_ENABLE:
             lines.append(f"- Rotation: **on** (cooldown {ROTATION_COOLDOWN_DAYS} days; exempt ≥ {int(ROTATION_EXEMPT_SCORE)})")
-            lines.append(f"- Skipped due to rotation this run: **{rotation_skipped}**")
         lines.append("")
     return "\n".join(lines)
 
