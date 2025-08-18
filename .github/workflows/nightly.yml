@@ -2,7 +2,7 @@ name: nightly
 
 on:
   schedule:
-    - cron: '30 7 * * *'   # 07:30 UTC (2:30/3:30am ET seasonally)
+    - cron: '30 7 * * *'   # 07:30 UTC (3:30am ET)
   workflow_dispatch:
 
 permissions:
@@ -94,15 +94,10 @@ jobs:
       RECENCY_TV_FIRST_BONUS_MAX: "8.0"
       RECENCY_TV_LAST_BONUS_MAX: "7.0"
 
-jobs:
-  build:
-    runs-on: ubuntu-24.04
-    env:
-
       # Email layout & gating
       EMAIL_TOP_MOVIES: "10"
       EMAIL_TOP_TV: "10"
-      EMAIL_SCORE_MIN: "30"                 # ← lowered cutoff so sections aren’t empty
+      EMAIL_SCORE_MIN: "30"                  # lowered to avoid empty sections
       EMAIL_INCLUDE_TELEMETRY: "true"
       EMAIL_EXCLUDE_ANIME: "true"
       EMAIL_NETWORK_FALLBACK: "true"
@@ -110,24 +105,41 @@ jobs:
       EMAIL_INCLUDE_NEW_SERIES_LABEL: "true"
       EMAIL_INCLUDE_NEW_SEASON_LABEL: "true"
 
-      # Email backfill (new)
-      EMAIL_BACKFILL: "true"                # ← enable second-pass fill
-      EMAIL_BACKFILL_MIN: "25"              # ← relaxed cutoff for backfill
-      EMAIL_BACKFILL_ALLOW_ROTATE: "true"   # ← still respect rotation
-
-      # Optional score rescaling (new)
-      SCORE_SCALE: "1.0"                    # e.g., try 1.6 to lift scores
-      SCORE_OFFSET: "0.0"                   # e.g., try 5.0 for a small shift
+      # Email backfill (second pass if sections aren’t full)
+      EMAIL_BACKFILL: "true"
+      EMAIL_BACKFILL_MIN: "25"
+      EMAIL_BACKFILL_ALLOW_ROTATE: "true"
 
       # Rotation (cooldown) in email selection
       ROTATION_ENABLE: "true"
       ROTATION_COOLDOWN_DAYS: "5"
       ROTATION_EXEMPT_SCORE: "90"
 
-      # Optional @mention on the daily issue comment
+      # Feedback learning
+      FEEDBACK_ENABLE: "true"
+      FEEDBACK_JSON_PATH: "data/user/feedback.json"
+      FEEDBACK_FEATURE_BANK_PATH: "data/cache/feedback/features.json"
+      FEEDBACK_DOWN_COOLDOWN_DAYS: "14"
+      FEEDBACK_DECAY: "0.98"
+      FEEDBACK_UP_DIRECT_BONUS: "10"
+      FEEDBACK_DOWN_DIRECT_PENALTY: "18"
+      FEEDBACK_SIMILAR_ACTOR_W: "1.4"
+      FEEDBACK_SIMILAR_DIRECTOR_W: "0.8"
+      FEEDBACK_SIMILAR_WRITER_W: "0.6"
+      FEEDBACK_SIMILAR_GENRE_W: "0.6"
+      FEEDBACK_SIMILAR_KEYWORD_W: "0.2"
+
+      # Score rescaling (lift scores without changing weights)
+      SCORE_SCALE: "1.0"
+      SCORE_OFFSET: "0.0"
+
+      # Optional @mention for notifications
       NOTIFY_USER: ${{ vars.NOTIFY_USER }}
 
-      # Per-title feedback comments (toggle)
+      # Save pool across runs (bump to invalidate)
+      POOL_CACHE_VERSION: v1
+
+      # Post per-title feedback comments (👍/👎)
       POST_PER_TITLE_FEEDBACK: "true"
 
     steps:
@@ -164,50 +176,32 @@ jobs:
           mkdir -p data/out data/cache
           python -m engine.runner
 
-      # (runner already writes summary.md) — no extra summarize step needed
-
       - name: Make debug bundle
         run: |
           chmod +x ./.github/scripts/make_debug_bundle.sh || true
           bash ./.github/scripts/make_debug_bundle.sh
 
-      # Export the exact picks we’ll ask feedback for (10 movies + 10 shows)
+      # Export the exact picks for per-title feedback comments
       - name: Export picks for feedback (picks.json)
         run: |
           python - <<'PY'
-          import os, json, re, math, pathlib
-          from datetime import date
+          import os, json, pathlib
           p = pathlib.Path("data/out/latest/items.enriched.json")
-          if not p.exists():
-              raise SystemExit(0)
+          if not p.exists(): raise SystemExit(0)
           items = json.loads(p.read_text(encoding="utf-8", errors="replace"))
           def normslug(s): 
               s=(s or "").strip().lower()
               return "max" if s in {"hbomax","hbo max","hbo","hbo_max","max"} else s
           allowed = {normslug(x) for x in (os.getenv("SUBS_INCLUDE","").split(",") if os.getenv("SUBS_INCLUDE") else [])}
-          score_min = float(os.getenv("EMAIL_SCORE_MIN","60") or 60)
-          def is_anime(it):
-              lang=(it.get("original_language") or "").lower()
-              genres=[]
-              for g in (it.get("genres") or it.get("tmdb_genres") or []):
-                  if isinstance(g, dict) and g.get("name"): genres.append(g["name"].lower())
-                  elif isinstance(g, str): genres.append(g.lower())
-              title=(it.get("title") or it.get("name") or "").lower()
-              if "anime" in genres: return True
-              if "animation" in genres and lang=="ja": return True
-              if any(k in title for k in ("one piece","dandadan","dragon ball","naruto","jujutsu kaisen","attack on titan","my hero academia","chainsaw man","spy x family")):
-                  return True
-              return False
+          score_min = float(os.getenv("EMAIL_SCORE_MIN","30") or 30)
           def providers_ok(it):
               provs = [normslug(str(p)) for p in (it.get("providers") or it.get("providers_slugs") or [])]
               return bool(set(provs) & allowed)
           ranked = sorted(items, key=lambda x: float(x.get("score", x.get("tmdb_vote", x.get("popularity", 0.0))) or 0.0), reverse=True)
           sel_movies=[]; sel_tv=[]
           for it in ranked:
-              try: sc = float(it.get("score",0) or 0)
-              except: sc = 0.0
+              sc = float(it.get("score",0) or 0)
               if sc < score_min: continue
-              if is_anime(it): continue
               if not providers_ok(it): continue
               pick = {
                   "title": it.get("title") or it.get("name"),
@@ -253,14 +247,11 @@ jobs:
               await github.rest.issues.update({ owner, repo, issue_number: issue.number, body });
             }
 
-            // Add a daily comment with the digest too (optional; keeps email-like thread)
             const mention = process.env.NOTIFY_USER ? ` cc @${process.env.NOTIFY_USER}` : '';
             await github.rest.issues.createComment({
               owner, repo, issue_number: issue.number,
               body: `Daily digest posted.${mention}\n\n` + body
             });
-
-            core.setOutput('issue_number', issue.number);
 
       - name: Post per-title feedback comments (👍/👎)
         if: env.POST_PER_TITLE_FEEDBACK == 'true'
@@ -271,6 +262,7 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const title = 'Daily Recommendations';
+
             // read picks
             let picks;
             try { picks = JSON.parse(fs.readFileSync('data/out/latest/picks.json', 'utf8')); }
@@ -287,7 +279,6 @@ jobs:
             const all = await github.paginate(github.rest.issues.listComments, {
               owner, repo, issue_number: issue.number, per_page: 100
             });
-
             const indexByMarker = new Map();
             for (const c of all) {
               const m = /<!--\s*reco:([^\s>]+)\s*-->/.exec(c.body || '');
@@ -321,11 +312,8 @@ jobs:
                 const existing = indexByMarker.get(marker);
                 if (!existing) {
                   await github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body });
-                } else {
-                  // update if content changed
-                  if ((existing.body || '').trim() !== body.trim()) {
-                    await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
-                  }
+                } else if ((existing.body || '').trim() !== body.trim()) {
+                  await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
                 }
               }
             }
