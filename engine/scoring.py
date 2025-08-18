@@ -64,9 +64,9 @@ def _listify(x) -> List[str]:
 AUDIENCE_PRIOR_LAMBDA = _float("AUDIENCE_PRIOR_LAMBDA", 0.30)
 PROVIDER_PREF_LAMBDA  = _float("PROVIDER_PREF_LAMBDA", 0.50)
 
-# People weights (director boost reduced)
+# People weights
 ACTOR_WEIGHT    = _float("ACTOR_WEIGHT", 2.2)
-DIRECTOR_WEIGHT = _float("DIRECTOR_WEIGHT", 1.0)
+DIRECTOR_WEIGHT = _float("DIRECTOR_WEIGHT", 1.0)   # reduced per your request
 WRITER_WEIGHT   = _float("WRITER_WEIGHT", 0.8)
 GENRE_WEIGHT    = _float("GENRE_WEIGHT", 0.9)
 KEYWORD_WEIGHT  = _float("KEYWORD_WEIGHT", 0.25)
@@ -102,16 +102,19 @@ REC_TV_FIRST_BONUS_MAX = _float("RECENCY_TV_FIRST_BONUS_MAX", 8.0)
 REC_TV_LAST_WINDOW     = _int("RECENCY_TV_LAST_WINDOW", 120)
 REC_TV_LAST_BONUS_MAX  = _float("RECENCY_TV_LAST_BONUS_MAX", 7.0)
 
-# Feedback knobs (also provided in env; defaults here for safety)
+# Feedback knobs
 FEEDBACK_ENABLE = _bool("FEEDBACK_ENABLE", True)
 FB_UP_DIRECT_BONUS   = _float("FEEDBACK_UP_DIRECT_BONUS", 10.0)
 FB_DOWN_DIRECT_PEN   = _float("FEEDBACK_DOWN_DIRECT_PENALTY", 18.0)
-
 FB_SIM_ACTOR_W    = _float("FEEDBACK_SIMILAR_ACTOR_W",    1.4)
 FB_SIM_DIRECTOR_W = _float("FEEDBACK_SIMILAR_DIRECTOR_W", 0.8)
 FB_SIM_WRITER_W   = _float("FEEDBACK_SIMILAR_WRITER_W",   0.6)
 FB_SIM_GENRE_W    = _float("FEEDBACK_SIMILAR_GENRE_W",    0.6)
 FB_SIM_KEYWORD_W  = _float("FEEDBACK_SIMILAR_KEYWORD_W",  0.2)
+
+# Final score rescale (new)
+SCORE_SCALE  = _float("SCORE_SCALE", 1.0)
+SCORE_OFFSET = _float("SCORE_OFFSET", 0.0)
 
 _ALLOWED_PROVIDERS = None  # filled in by score_items
 
@@ -143,8 +146,7 @@ def _genres_lower(it: Dict[str, Any]) -> List[str]:
 
 def _is_black_and_white(it: Dict[str, Any]) -> bool:
     kws=set(k.lower() for k in (it.get("keywords") or []))
-    patterns={"black and white","black-and-white","b&w","black & white"}
-    return bool(kws & patterns)
+    return bool(kws & {"black and white","black-and-white","b&w","black & white"})
 
 def _is_romance_movie(it: Dict[str, Any]) -> bool:
     if (it.get("media_type") or "").lower()!="movie": return False
@@ -199,10 +201,8 @@ def _commitment_penalty(it: Dict[str, Any], seen_tv_roots: Iterable[str]) -> flo
 def _old_bw_penalty(it: Dict[str, Any]) -> float:
     y = _to_year(it.get("year") or it.get("release_year") or it.get("first_air_year"))
     pen = 0.0
-    if y is not None and y < OLD_CONTENT_YEAR_CUTOFF:
-        pen += OLD_CONTENT_PENALTY
-    if _is_black_and_white(it):
-        pen += BLACK_WHITE_PENALTY
+    if y is not None and y < OLD_CONTENT_YEAR_CUTOFF: pen += OLD_CONTENT_PENALTY
+    if _is_black_and_white(it): pen += BLACK_WHITE_PENALTY
     return pen
 
 def _romance_penalty(it: Dict[str, Any]) -> float:
@@ -214,44 +214,39 @@ def _romance_penalty(it: Dict[str, Any]) -> float:
     return 0.0
 
 def _anime_kids_penalty(it: Dict[str, Any]) -> float:
+    # kids heuristic lives elsewhere; anime here
     pen=0.0
     if PENALIZE_ANIME and _is_anime(it): pen += ANIME_PENALTY
-    # kids cartoon heuristic handled in another module previously; keep anime here
     return pen
 
 def _affinity_contrib(it: Dict[str, Any], model: Dict[str, Any]) -> float:
     if not model: return 0.0
     score=0.0
     reasons=[]
-    # Actors
     actors = [a.lower() for a in _listify(it.get("cast"))][:8]
     top_actors = {k.lower():v for k,v in (model.get("top_actors") or {}).items()}
     hit = [a for a in actors if a in top_actors]
     if hit:
         score += ACTOR_WEIGHT * sum(top_actors[a] for a in hit)
         reasons.append(f"+actor overlap ({', '.join(hit[:2])})")
-    # Directors
     directors = [d.lower() for d in _listify(it.get("directors"))][:4]
     top_dirs = {k.lower():v for k,v in (model.get("top_directors") or {}).items()}
     hit = [d for d in directors if d in top_dirs]
     if hit:
         score += DIRECTOR_WEIGHT * sum(top_dirs[d] for d in hit)
         reasons.append(f"+director match ({hit[0]})")
-    # Writers
     writers = [w.lower() for w in _listify(it.get("writers"))][:4]
     top_wrs = {k.lower():v for k,v in (model.get("top_writers") or {}).items()}
     hit = [w for w in writers if w in top_wrs]
     if hit:
         score += WRITER_WEIGHT * sum(top_wrs[w] for w in hit)
         reasons.append(f"+writer match")
-    # Genres
     genres = [g.lower() for g in _genres_lower(it)]
     top_gen = {k.lower():v for k,v in (model.get("top_genres") or {}).items()}
     hit = [g for g in genres if g in top_gen]
     if hit:
         score += GENRE_WEIGHT * sum(top_gen[g] for g in hit)
         reasons.append(f"+genre affinity")
-    # Keywords
     kws = [k.lower() for k in (it.get("keywords") or [])][:20]
     top_kw = {k.lower():v for k,v in (model.get("top_keywords") or {}).items()}
     hit = [k for k in kws if k in top_kw]
@@ -264,14 +259,10 @@ def _affinity_contrib(it: Dict[str, Any], model: Dict[str, Any]) -> float:
     return score
 
 def _feedback_contrib(it: Dict[str, Any], env: Dict[str, Any]) -> float:
-    """Direct (per-key) and similarity (feature bank) learning from feedback."""
     if not env.get("FEEDBACK_FEATURES") and not env.get("FEEDBACK_ITEMS"):
         return 0.0
-
     s = 0.0
     reasons = []
-
-    # Direct key-level boost/penalty
     fb_items = env.get("FEEDBACK_ITEMS") or {}
     key = key_for_item(it)
     if key and key in fb_items:
@@ -279,50 +270,46 @@ def _feedback_contrib(it: Dict[str, Any], env: Dict[str, Any]) -> float:
         up = int(data.get("up") or 0)
         down = int(data.get("down") or 0)
         if up > down and FB_UP_DIRECT_BONUS > 0:
-            s += FB_UP_DIRECT_BONUS
-            reasons.append(f"+feedback interest")
+            s += FB_UP_DIRECT_BONUS; reasons.append(f"+feedback interest")
         elif down > up and FB_DOWN_DIRECT_PEN > 0:
-            s -= FB_DOWN_DIRECT_PEN
-            reasons.append(f"-feedback not for me")
-
-    # Similarity from feature bank (actors, directors, writers, genres, keywords)
+            s -= FB_DOWN_DIRECT_PEN; reasons.append(f"-feedback not for me")
     bank = env.get("FEEDBACK_FEATURES") or {}
     liked    = bank.get("liked")    or {}
     disliked = bank.get("disliked") or {}
-
     def acc(bucket: str, names: List[str], w_like: float, w_dis: float):
         nonlocal s, reasons
         if not names: return
         bd_like = liked.get(bucket) or {}
         bd_dis  = disliked.get(bucket) or {}
-        # sum weights for overlaps
         plus = sum(float(bd_like.get(n,0.0)) for n in names)
         minus= sum(float(bd_dis.get(n,0.0))  for n in names)
         if plus:
-            delta = w_like * plus
-            s += delta
-            reasons.append(f"+fb {bucket} ({int(round(delta))})")
+            delta = w_like * plus; s += delta; reasons.append(f"+fb {bucket} ({int(round(delta))})")
         if minus:
-            delta = w_dis * minus
-            s -= delta
-            reasons.append(f"-fb {bucket} ({int(round(delta))})")
-
+            delta = w_dis * minus; s -= delta; reasons.append(f"-fb {bucket} ({int(round(delta))})")
     actors    = _listify(it.get("cast"))[:8]
     directors = _listify(it.get("directors"))[:4]
     writers   = _listify(it.get("writers"))[:4]
     genres    = _genres_lower(it)
     keywords  = [str(k).lower() for k in (it.get("keywords") or [])][:20]
-
     acc("actors",    actors,    FB_SIM_ACTOR_W,    FB_SIM_ACTOR_W * 0.7)
     acc("directors", directors, FB_SIM_DIRECTOR_W, FB_SIM_DIRECTOR_W * 0.7)
     acc("writers",   writers,   FB_SIM_WRITER_W,   FB_SIM_WRITER_W * 0.7)
     acc("genres",    genres,    FB_SIM_GENRE_W,    FB_SIM_GENRE_W * 0.7)
     acc("keywords",  keywords,  FB_SIM_KEYWORD_W,  FB_SIM_KEYWORD_W * 0.7)
-
     if reasons:
         prev=(it.get("why") or "").strip()
         it["why"] = (prev + ("; " if prev else "") + "; ".join(reasons))
     return s
+
+def _audience_prior(it: Dict[str, Any]) -> float:  # redefined above, keep ordering
+    v=it.get("audience") or it.get("tmdb_vote")
+    try:
+        f=float(v)
+        if f<=10.0: f*=10.0
+        return max(0.0, min(100.0, f)) * AUDIENCE_PRIOR_LAMBDA
+    except Exception:
+        return 0.0
 
 def _base_popularity(it: Dict[str, Any]) -> float:
     try: p=float(it.get("popularity") or 0.0)
@@ -351,40 +338,27 @@ def score_items(env: Dict[str, Any], items: List[Dict[str, Any]]) -> List[Dict[s
 
     for it in items:
         s = 0.0
-        # priors
         s += _audience_prior(it)
         s += _provider_pref(it)
-        # recency
         s += _recency_bonus(it)
-        # profile affinity
         s += _affinity_contrib(it, model)
-        # feedback learning
-        if FEEDBACK_ENABLE:
+        if _bool("FEEDBACK_ENABLE", True):
             s += _feedback_contrib(it, env)
-        # popularity tie-breaker
         s += _base_popularity(it)
+
         # penalties
         pen = 0.0
-        pen += _anime_kids_penalty(it)
-        rp = _romance_penalty(it); pen += rp
-        op = _old_bw_penalty(it); pen += op
-        cp = _commitment_penalty(it, seen_tv_roots); pen += cp
-
-        if rp>0:
-            prev=(it.get("why") or "").strip()
-            it["why"] = (prev + ("; " if prev else "") + f"-{int(rp)} romance de-prioritized")
-        if op>0:
-            y=_to_year(it.get("year") or it.get("release_year") or it.get("first_air_year"))
-            msgs=[]
-            if y is not None and y < OLD_CONTENT_YEAR_CUTOFF: msgs.append(f"-{OLD_CONTENT_PENALTY} older ({y})")
-            if _is_black_and_white(it): msgs.append(f"-{BLACK_WHITE_PENALTY} black & white")
-            if msgs:
-                prev=(it.get("why") or "").strip()
-                it["why"] = (prev + ("; " if prev else "") + "; ".join(msgs))
-        if cp>0:
-            prev=(it.get("why") or "").strip()
-            it["why"] = (prev + ("; " if prev else "") + f"-{int(cp)} long-run TV")
+        if PENALIZE_ANIME and _is_anime(it): pen += ANIME_PENALTY
+        if _is_romance_movie(it):
+            pen += ROMCOM_PENALTY if ("comedy" in _genres_lower(it)) else ROMANCE_PENALTY
+        y = _to_year(it.get("year") or it.get("release_year") or it.get("first_air_year"))
+        if y is not None and y < OLD_CONTENT_YEAR_CUTOFF: pen += OLD_CONTENT_PENALTY
+        if _is_black_and_white(it): pen += BLACK_WHITE_PENALTY
+        pen += _commitment_penalty(it, seen_tv_roots)
 
         s -= pen
+
+        # final rescale
+        s = s * SCORE_SCALE + SCORE_OFFSET
         it["score"] = float(max(0.0, min(100.0, s)))
     return items
