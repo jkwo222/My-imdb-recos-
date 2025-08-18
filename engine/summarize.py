@@ -19,6 +19,7 @@ EMAIL_TOP_TV            = _int("EMAIL_TOP_TV", 10)
 EMAIL_SCORE_MIN         = _int("EMAIL_SCORE_MIN", 60)
 EMAIL_INCLUDE_TELEMETRY = _bool("EMAIL_INCLUDE_TELEMETRY", True)
 EMAIL_EXCLUDE_ANIME     = _bool("EMAIL_EXCLUDE_ANIME", True)
+EMAIL_NETWORK_FALLBACK  = _bool("EMAIL_NETWORK_FALLBACK", True)  # NEW: infer provider from TV networks if providers missing
 
 LAB_NEW_MOVIE           = _bool("EMAIL_INCLUDE_NEW_MOVIE_LABEL", True)
 LAB_NEW_SEASON          = _bool("EMAIL_INCLUDE_NEW_SEASON_LABEL", True)
@@ -67,10 +68,28 @@ def _normalize_slug(s: str) -> str:
     if s in {"hbo","hbomax","hbo_max"}: return "max"
     return s
 
+def _slugify_provider_name(name: str) -> str:
+    n=(name or "").strip().lower()
+    if not n: return ""
+    if "apple tv+" in n or n == "apple tv plus": return "apple_tv_plus"
+    if "netflix" in n: return "netflix"
+    if n in {"hbo","hbo max","hbomax","max"}: return "max"
+    if "paramount+" in n: return "paramount_plus"
+    if "disney+" in n: return "disney_plus"
+    if "peacock" in n: return "peacock"
+    if "hulu" in n: return "hulu"
+    if "prime video" in n or "amazon" in n: return "prime_video"
+    return n.replace(" ", "_")
+
 def _providers_for_item(it: Dict[str, Any], allowed: Iterable[str]) -> List[str]:
     allowed_set = {_normalize_slug(x) for x in (allowed or [])}
     provs = it.get("providers") or it.get("providers_slugs") or []
     provs = {_normalize_slug(str(p)) for p in provs}
+    # Fallback: if no providers but TV networks imply a platform, optionally map networks -> providers
+    if not provs and EMAIL_NETWORK_FALLBACK and (it.get("media_type") or "").lower() == "tv":
+        for net in it.get("networks") or []:
+            slug = _slugify_provider_name(str(net))
+            if slug: provs.add(slug)
     show = [DISPLAY_PROVIDER.get(p, p.replace("_"," ").title()) for p in sorted(provs & allowed_set)]
     return show
 
@@ -94,7 +113,6 @@ def _media_emoji(it: Dict[str, Any]) -> str:
     return "🍿" if (it.get("media_type") or "").lower()=="movie" else "📺"
 
 def _recency_label(it: Dict[str, Any]) -> Optional[str]:
-    # Prefer "New Series" when both windows could apply
     mt=(it.get("media_type") or "").lower()
     if mt=="movie" and LAB_NEW_MOVIE:
         d=_days_since(_parse_ymd(it.get("release_date")))
@@ -146,9 +164,7 @@ def render_email(
     diag: Optional[Dict[str, Any]] = None,
 ) -> str:
     allowed = allowed_provider_slugs or []
-    seen_tv_roots = seen_tv_roots or []
 
-    # Filters
     def _eligible(it: Dict[str, Any]) -> bool:
         if float(it.get("score", 0) or 0) < EMAIL_SCORE_MIN: return False
         if EMAIL_EXCLUDE_ANIME and _is_anime_like(it): return False
@@ -214,26 +230,18 @@ def write_email_markdown(
         ranked = json.loads(ranked_items_path.read_text(encoding="utf-8", errors="replace"))
     except Exception:
         ranked = []
-    seen_index = None
-    if seen_index_path and seen_index_path.exists():
-        try: seen_index = json.loads(seen_index_path.read_text(encoding="utf-8", errors="replace"))
-        except Exception: seen_index = None
-    seen_tv_roots = []
-    if seen_tv_roots_path and seen_tv_roots_path.exists():
-        try: seen_tv_roots = json.loads(seen_tv_roots_path.read_text(encoding="utf-8", errors="replace"))
-        except Exception: seen_tv_roots = []
+    # optional artifacts (not required by renderer but passed for future use)
     diag = None
     diag_path = run_dir / "diag.json"
     if diag_path.exists():
         try: diag = json.loads(diag_path.read_text(encoding="utf-8", errors="replace"))
         except Exception: diag = None
-
     body = render_email(
         ranked_items=ranked,
         region=str(env.get("REGION") or "US"),
         allowed_provider_slugs=(env.get("SUBS_INCLUDE") or []),
-        seen_index=seen_index,
-        seen_tv_roots=seen_tv_roots,
+        seen_index=None,
+        seen_tv_roots=None,
         diag=diag,
     )
     out = run_dir / "summary.md"
