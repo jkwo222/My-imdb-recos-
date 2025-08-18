@@ -14,26 +14,15 @@ def _bool(n: str, d: bool) -> bool:
     if v in {"0","false","no","off"}: return False
     return d
 def _int(n: str, d: int) -> int:
-    try: return int(os.getenv(n, "") or d)
+    try: return int(os.getenv(n, "").strip())
+    except Exception: return d
+def _float(n: str, d: float) -> float:
+    try: return float(os.getenv(n, "").strip())
     except Exception: return d
 
 EMAIL_TOP_MOVIES                 = _int("EMAIL_TOP_MOVIES", 10)
 EMAIL_TOP_TV                     = _int("EMAIL_TOP_TV", 10)
 EMAIL_SCORE_MIN                  = _int("EMAIL_SCORE_MIN", 30)
-EMAIL_INCLUDE_TELEMETRY          = _bool("EMAIL_INCLUDE_TELEMETRY", True)
-EMAIL_EXCLUDE_ANIME              = _bool("EMAIL_EXCLUDE_ANIME", True)
-EMAIL_NETWORK_FALLBACK           = _bool("EMAIL_NETWORK_FALLBACK", True)
-
-LAB_NEW_MOVIE                    = _bool("EMAIL_INCLUDE_NEW_MOVIE_LABEL", True)
-LAB_NEW_SEASON                   = _bool("EMAIL_INCLUDE_NEW_SEASON_LABEL", True)
-LAB_NEW_SERIES                   = _bool("EMAIL_INCLUDE_NEW_SERIES_LABEL", True)
-
-REC_MOVIE_WINDOW                 = _int("RECENCY_MOVIE_WINDOW_DAYS", 270)
-REC_TV_FIRST_WINDOW              = _int("RECENCY_TV_FIRST_WINDOW", 180)
-REC_TV_LAST_WINDOW               = _int("RECENCY_TV_LAST_WINDOW", 120)
-
-ROTATION_ENABLE                  = _bool("ROTATION_ENABLE", True)
-ROTATION_COOLDOWN_DAYS           = _int("ROTATION_COOLDOWN_DAYS", 5)
 
 EMAIL_BACKFILL                   = _bool("EMAIL_BACKFILL", True)
 EMAIL_BACKFILL_MIN               = _int("EMAIL_BACKFILL_MIN", 20)
@@ -56,128 +45,58 @@ DISPLAY_PROVIDER = {
 
 _NON = re.compile(r"[^a-z0-9]+")
 def _norm(s: str) -> str:
-    return _NON.sub(" ", (s or "").strip().lower()).strip()
+    return _NON.sub("-", (s or "").lower()).strip("-")
 
-def _parse_ymd(s: Optional[str]) -> Optional[date]:
-    if not s: return None
-    s=s.strip()
-    for fmt in ("%Y-%m-%d","%Y/%m/%d"):
-        try: return datetime.strptime(s, fmt).date()
-        except Exception: pass
-    if len(s)>=4 and s[:4].isdigit():
-        try: return date(int(s[:4]),1,1)
-        except Exception: return None
-    return None
-def _days_since(d: Optional[date]) -> Optional[int]:
-    if not d: return None
-    try: return (date.today()-d).days
-    except Exception: return None
+def _slugify_provider_name(name: str) -> Optional[str]:
+    if not name: return None
+    n = name.strip().lower()
+    # accept already-known slugs
+    if n in DISPLAY_PROVIDER: return n
+    # basic normalizations
+    n = n.replace("hbo max","max").replace("hbo","max").replace("hbomax","max")
+    n = n.replace("paramount plus","paramount+").replace("disney plus","disney+").replace("apple tv plus","apple tv+")
+    n = n.replace("amazon prime video","prime video").replace("amazon video","prime video")
+    # map to slugs
+    table = {
+        "netflix":"netflix","max":"max","paramount+":"paramount_plus","disney+":"disney_plus",
+        "apple tv+":"apple_tv_plus","peacock":"peacock","hulu":"hulu","prime video":"prime_video"
+    }
+    return table.get(n)
 
 def _audience_pct(it: Dict[str, Any]) -> Optional[int]:
-    v = it.get("audience") or it.get("tmdb_vote")
     try:
-        f=float(v)
-        if f<=10.0: f*=10.0
-        return int(round(max(0.0, min(100.0, f))))
+        v = it.get("audience")
+        if v is None:
+            va = it.get("vote_average")
+            if va is not None: v = float(va) * 10.0
+        if v is None: return None
+        return max(0, min(100, int(round(float(v)))))
     except Exception:
         return None
 
-def _normalize_slug(s: str) -> str:
-    s=(s or "").strip().lower()
-    if s in {"hbo","hbomax","hbo_max"}: return "max"
-    return s
-def _slugify_provider_name(name: str) -> str:
-    n=(name or "").strip().lower()
-    if not n: return ""
-    if "apple tv+" in n or n == "apple tv plus": return "apple_tv_plus"
-    if "netflix" in n: return "netflix"
-    if n in {"hbo","hbo max","hbomax","max"}: return "max"
-    if "paramount+" in n: return "paramount_plus"
-    if "disney+" in n: return "disney_plus"
-    if "peacock" in n: return "peacock"
-    if "hulu" in n: return "hulu"
-    if "prime video" in n or "amazon" in n: return "prime_video"
-    return n.replace(" ", "_")
-
-def _providers_for_item(it: Dict[str, Any], allowed: Iterable[str]) -> List[str]:
-    allowed_set = {_normalize_slug(x) for x in (allowed or [])}
-    provs = it.get("providers") or it.get("providers_slugs") or []
-    provs = {_normalize_slug(str(p)) for p in provs}
-    if not provs and EMAIL_NETWORK_FALLBACK and (it.get("media_type") or "").lower()=="tv":
-        for net in it.get("networks") or []:
-            if isinstance(net, dict):
-                name = str(net.get("name") or "").strip()
-            else:
-                name = str(net).strip()
-            if not name: continue
-            slug = _slugify_provider_name(name)
-            if slug: provs.add(slug)
-    show = [DISPLAY_PROVIDER.get(p, p.replace("_"," ").title()) for p in sorted(provs & allowed_set)]
-    return show
-
-def _ensure_providers(it: Dict[str, Any], region: str) -> None:
+def _fmt_runtime(it: Dict[str, Any]) -> Optional[str]:
     kind=(it.get("media_type") or "").lower()
-    tid = it.get("tmdb_id")
-    if not kind or not tid: return
-    if it.get("providers"): return
-    try:
-        provs = tmdb.get_title_watch_providers(kind, int(tid), region)
-        if provs: it["providers"] = provs
-    except Exception:
-        pass
-
-def _is_anime_like(it: Dict[str, Any]) -> bool:
-    title=_norm(it.get("title") or it.get("name") or "")
-    genres=[]
-    for g in (it.get("genres") or it.get("tmdb_genres") or []):
-        if isinstance(g, dict) and g.get("name"): genres.append(g["name"].lower())
-        elif isinstance(g, str): genres.append(g.lower())
-    genres=set(genres)
-    lang=(it.get("original_language") or "").lower()
-    countries=set(str(c).upper() for c in (it.get("production_countries") or []))
-    if "anime" in genres: return True
-    if "animation" in genres and (lang=="ja" or "JP" in countries): return True
-    if any(k in title for k in ("one piece","dandadan","dragon ball","naruto","jujutsu kaisen",
-                                 "attack on titan","my hero academia","chainsaw man","spy x family")):
-        return True
-    return False
-
-def _recency_label(it: Dict[str, Any]) -> Optional[str]:
-    mt=(it.get("media_type") or "").lower()
-    if mt=="movie":
-        d=_days_since(_parse_ymd(it.get("release_date")))
-        if d is not None and d<=REC_MOVIE_WINDOW and LAB_NEW_MOVIE: return "New Movie"
-    if mt=="tv":
-        seasons=int(it.get("number_of_seasons") or 0)
-        df=_days_since(_parse_ymd(it.get("first_air_date")))
-        if df is not None and df<=REC_TV_FIRST_WINDOW and LAB_NEW_SERIES: return "New Series"
-        if seasons>=2:
-            dl=_days_since(_parse_ymd(it.get("last_air_date")))
-            if dl is not None and dl<=REC_TV_LAST_WINDOW and LAB_NEW_SEASON: return "New Season"
+    if kind=="movie":
+        rt = it.get("runtime")
+        if isinstance(rt, int) and rt>0: return f"{rt}m" if rt<60 else f"{rt//60}h {rt%60}m"
+    else:
+        ep = it.get("episode_run_time") or []
+        if isinstance(ep, list) and ep:
+            m = [e for e in ep if isinstance(e,int) and e>0]
+            if m: return f"{min(m)}–{max(m)}m" if len(set(m))>1 else f"{m[0]}m"
     return None
 
-def _fmt_runtime(it: Dict[str, Any]) -> Optional[str]:
-    if (it.get("media_type") or "").lower()=="movie":
-        try:
-            m=int(float(it.get("runtime") or 0))
-            if m<=0: return None
-            h,mm=divmod(m,60)
-            return f"{h}h {mm}m" if h else f"{mm}m"
-        except Exception: return None
-    else:
-        ert=it.get("episode_run_time") or []
-        try:
-            m=int(float(ert[0])) if ert else 0
-            return f"{m}m" if m>0 else None
-        except Exception: return None
-
-def _fmt_title_line(it: Dict[str, Any]) -> str:
-    title=it.get("title") or it.get("name") or "Untitled"
-    year =it.get("year")
-    lab  =_recency_label(it)
-    bits=[f"***{title}***{f' ({year})' if year else ''}"]
-    if lab: bits.append(f"— **{lab}**")
-    return " ".join(bits)
+def _fmt_title_line(it: Dict[str, Any], recency_lab: Optional[str]) -> str:
+    kind=(it.get("media_type") or "").lower()
+    title = it.get("title") or it.get("name") or "Untitled"
+    year = it.get("year")
+    label = ""
+    if recency_lab:
+        if recency_lab=="NEW_MOVIE" and kind=="movie": label = " — **New Movie**"
+        elif recency_lab=="NEW_SERIES" and kind=="tv": label = " — **New Series**"
+        elif recency_lab=="NEW_SEASON" and kind=="tv": label = " — **New Season**"
+    if year: return f"- ***{title}*** ({year}){label}"
+    return f"- ***{title}***{label}"
 
 def _fmt_meta_line(it: Dict[str, Any], providers: List[str]) -> str:
     try: match=int(round(float(it.get("score",0) or 0)))
@@ -194,8 +113,8 @@ def _fmt_meta_line(it: Dict[str, Any], providers: List[str]) -> str:
     if director: parts.append(f"Dir. {director}")
     return " • ".join(parts)
 
-_DROP_PATTERNS = ("imdb details augmented","imdb keywords augmented","penalty","black & white","b&w","old","provider","anime","kids","long-run")
-_KEEP_HINTS = ("new movie","new series","new season","actor","cast","star","director","writer","genre","keyword","because you liked","similar")
+_DROP_PATTERNS = ("imdb details augmented","imdb keywords augmented","provider","anime","kids","long-run","black & white","b&w","old")
+_KEEP_HINTS = ("new movie","new series","new season","actor","cast","director","writer","genre","keyword","because you liked","similar")
 
 def _clean_why(raw: str, recency_lab: Optional[str]) -> Optional[str]:
     parts=[p.strip() for p in (raw or "").split(";") if p.strip()]
@@ -209,177 +128,126 @@ def _clean_why(raw: str, recency_lab: Optional[str]) -> Optional[str]:
     out2=list(dict.fromkeys(out))[:3]
     return "; ".join(out2)
 
-def _marker_key_for_item(it: Dict[str, Any]) -> Optional[str]:
-    # Prefer IMDb id when present; else stable tmdb marker.
-    imdb = (it.get("imdb_id") or "").strip()
-    if imdb:
-        return imdb
-    tid = it.get("tmdb_id") or it.get("id")
-    mt = (it.get("media_type") or "").lower() or "movie"
-    if tid:
-        return f"tm:{mt}:{tid}"
-    return None
+def _recency_label(it: Dict[str, Any]) -> Optional[str]:
+    kind=(it.get("media_type") or "").lower()
+    if kind=="movie":
+        return recency.is_recent_movie(it)
+    else:
+        return recency.is_recent_show(it)
 
-def render_email(ranked_items: List[Dict[str, Any]], *, region: str="US",
-                 allowed_provider_slugs: Optional[List[str]]=None,
-                 env_extra: Optional[Dict[str, Any]]=None,
-                 diag: Optional[Dict[str, Any]]=None) -> str:
-    allowed = allowed_provider_slugs or []
-    env_extra = env_extra or {}
-    rotation_skipped = 0
-    feedback_skipped = 0
-    suppress_keys = set(env_extra.get("FEEDBACK_SUPPRESS_KEYS") or [])
-    breakdown = {
-        "score_below_cutoff": 0,
-        "anime_excluded": 0,
-        "feedback_suppressed": 0,
-        "rotation_cooldown": 0,
-        "no_allowed_provider": 0,
-        "selected_movies": 0,
-        "selected_tv": 0,
-    }
-    # NEW: collect feedback targets (one per chosen title)
-    feedback_targets: List[Dict[str, Any]] = []
+def _ensure_providers(it: Dict[str, Any], region: str) -> None:
+    kind=(it.get("media_type") or "").lower()
+    tid = it.get("tmdb_id")
+    if not kind or not tid: return
+    if it.get("providers"): return
+    try:
+        provs = tmdb.get_title_watch_providers(kind, int(tid), region)
+        if provs: it["providers"] = provs
+    except Exception:
+        pass
 
-    def _elig_reason(it: Dict[str, Any], min_score: int, allow_rotate: bool) -> Optional[str]:
-        nonlocal rotation_skipped, feedback_skipped
-        if float(it.get("score",0) or 0) < min_score: return "score_below_cutoff"
-        if EMAIL_EXCLUDE_ANIME and _is_anime_like(it): return "anime_excluded"
-        k = recency.key_for_item(it)
-        if k and k in suppress_keys:
-            feedback_skipped += 1
-            return "feedback_suppressed"
-        if not allow_rotate and k and recency.should_skip_key(k, cooldown_days=ROTATION_COOLDOWN_DAYS):
-            rotation_skipped += 1
-        provs = _providers_for_item(it, allowed)
-        if not provs: return "no_allowed_provider"
-        if ROTATION_ENABLE and allow_rotate and recency.should_skip_key(k, cooldown_days=ROTATION_COOLDOWN_DAYS):
-            rotation_skipped += 1
-            return "rotation_cooldown"
-        return None
+def _is_anime_like(it: Dict[str, Any]) -> bool:
+    g=[(x or "").lower() for x in (it.get("genres") or [])]
+    k=[(x or "").lower() for x in (it.get("keywords") or [])]
+    return any("anime" in x for x in g+k)
 
-    def _append_feedback_target(it: Dict[str, Any], providers: List[str], why_clean: Optional[str]):
-        key = _marker_key_for_item(it)
-        if not key: return
-        title = it.get("title") or it.get("name") or "Untitled"
-        year  = it.get("year")
-        mt    = (it.get("media_type") or "").lower()
-        try: score = int(round(float(it.get("score",0) or 0)))
-        except Exception: score = None
-        aud = _audience_pct(it)
-        # Minimal one-paragraph comment content
-        parts = [f"Feedback for ***{title}***{f' ({year})' if year else ''} — react 👍 if interested, 👎 if not."]
-        md = " • ".join(
-            [x for x in (
-                f"Match {score}" if isinstance(score,(int,float)) else None,
-                f"Audience {aud}" if isinstance(aud,int) else None,
-                ", ".join(f"**{p}**" for p in providers) if providers else None
-            ) if x]
-        )
-        if md:
-            parts.append(md)
-        if why_clean:
-            parts.append(f"why: {why_clean}")
-        parts.append(f"\n<!-- reco:{key} -->")
-        comment_md = "\n\n".join(parts)
-        feedback_targets.append({
-            "key": key,
-            "media_type": mt,
-            "title": title,
-            "year": year,
-            "providers": providers,
-            "score": score,
-            "audience": aud,
-            "comment_md": comment_md
-        })
+def _is_kids_cartoon(it: Dict[str, Any]) -> bool:
+    g=[(x or "").lower() for x in (it.get("genres") or [])]
+    k=[(x or "").lower() for x in (it.get("keywords") or [])]
+    t=(it.get("title") or it.get("name") or "").lower()
+    return ("animation" in g and "children" in g) or "preschool" in " ".join(k) or "bluey" in t
 
-    def _collect(min_score: int, *, allow_rotate: bool, try_fetch_providers: bool):
-        movies, shows, chosen_keys = [], [], []
-        m_cnt = s_cnt = 0
-        for it in sorted(ranked_items, key=lambda x: float(x.get("score", x.get("tmdb_vote", 0.0)) or 0.0), reverse=True):
-            if try_fetch_providers and not (it.get("providers") or it.get("providers_slugs")):
-                _ensure_providers(it, region)
-            reason = _elig_reason(it, min_score, allow_rotate)
-            if reason == "no_allowed_provider" and not try_fetch_providers:
-                _ensure_providers(it, region)
-                reason = _elig_reason(it, min_score, allow_rotate)
-            if reason:
-                breakdown[reason] += 1
+def _providers_display_for_item(it: Dict[str, Any], allowed_slugs: Iterable[str], region: str) -> List[str]:
+    # Use embedded providers when available; optionally fetch early
+    slugs = set([p for p in (it.get("providers") or []) if isinstance(p,str)])
+    if not slugs and EMAIL_EARLY_FETCH_PROVIDERS:
+        _ensure_providers(it, region)
+        slugs = set([p for p in (it.get("providers") or []) if isinstance(p,str)])
+    allowed_set = set([s.strip().lower() for s in allowed_slugs if s])
+    provs=set()
+    # include actual providers
+    for s in slugs:
+        if s in allowed_set: provs.add(s)
+    # include TV network names if they map to providers
+    nets = it.get("networks") or []
+    for n in nets:
+        name = None
+        if isinstance(n, dict):
+            name = n.get("name") or n.get("abbr") or n.get("network")
+        elif isinstance(n, str):
+            name = n
+        if not name: continue
+        slug = _slugify_provider_name(name)
+        if slug: provs.add(slug)
+    show = [DISPLAY_PROVIDER.get(p, p.replace("_"," ").title()) for p in sorted(provs & allowed_set)]
+    return show
+
+def _build_lines(ranked_items: List[Dict[str,Any]], *, region: str, allowed_provider_slugs: List[str], env_extra: Dict[str,Any], diag: Optional[Dict[str,Any]]):
+    # Split by type and apply score threshold
+    movies=[it for it in ranked_items if (it.get("media_type") or "").lower()=="movie" and (it.get("score") or 0)>=EMAIL_SCORE_MIN]
+    shows=[it for it in ranked_items if (it.get("media_type") or "").lower()=="tv" and (it.get("score") or 0)>=EMAIL_SCORE_MIN]
+
+    # Backfill within type if requested
+    if EMAIL_BACKFILL:
+        if len(movies)<EMAIL_TOP_MOVIES:
+            # consider sub-threshold movies down to MOVIE_MIN
+            mmin=EMAIL_BACKFILL_MOVIE_MIN
+            extras=[it for it in ranked_items if (it.get("media_type") or "").lower()=="movie" and (it.get("score") or 0)>=mmin and it not in movies]
+            movies = (movies + extras)[:max(EMAIL_TOP_MOVIES, len(movies))]
+        if len(shows)<EMAIL_TOP_TV:
+            tmin=EMAIL_BACKFILL_TV_MIN
+            extras=[it for it in ranked_items if (it.get("media_type") or "").lower()=="tv" and (it.get("score") or 0)>=tmin and it not in shows]
+            shows = (shows + extras)[:max(EMAIL_TOP_TV, len(shows))]
+
+    # Enforce provider restriction at render time
+    def render_items(items: List[Dict[str,Any]], top_n: int) -> List[str]:
+        out=[]
+        for it in items:
+            providers = _providers_display_for_item(it, allowed_provider_slugs, region)
+            if not providers:
                 continue
+            rec = _recency_label(it)
+            title_line = _fmt_title_line(it, rec)
+            meta_line = _fmt_meta_line(it, providers)
+            why = _clean_why(it.get("why"), rec)
+            out.append(title_line)
+            out.append(f"  • {meta_line}")
+            if why:
+                out.append(f"  • why: {why}")
+        return out[:top_n*3]  # 3 lines per item
 
-            provs=_providers_for_item(it, allowed)
-            title_line=f"- {_fmt_title_line(it)}"
-            meta_line =f"  • {_fmt_meta_line(it, provs)}"
-            rec_lab=_recency_label(it)
-            why_clean=_clean_why(it.get("why") or "", rec_lab)
-            why_line = f"  • why: {why_clean}" if why_clean else None
-            block = [title_line, meta_line] + ([why_line] if why_line else [])
-            block_text = "\n".join(block)
+    movie_lines = render_items(movies, EMAIL_TOP_MOVIES)
+    show_lines  = render_items(shows, EMAIL_TOP_TV)
 
-            # record feedback target
-            _append_feedback_target(it, provs, why_clean)
+    # Selection breakdown for diagnostics
+    breakdown = {
+        "score_below_cutoff": len([it for it in ranked_items if (it.get("score") or 0) < EMAIL_SCORE_MIN]),
+        "anime_excluded": len([it for it in ranked_items if _is_anime_like(it)]),
+        "feedback_suppressed": 0,  # deprecated, kept for telemetry continuity
+        "rotation_cooldown": 0,    # computed elsewhere; placeholder
+        "no_allowed_provider": len([it for it in ranked_items if not _providers_display_for_item(it, allowed_provider_slugs, region)]),
+        "selected_movies": len(movie_lines)//3,
+        "selected_tv": len(show_lines)//3,
+    }
 
-            key = recency.key_for_item(it)
-            if (it.get("media_type") or "").lower()=="movie":
-                if m_cnt<EMAIL_TOP_MOVIES:
-                    movies.append(block_text); m_cnt+=1; breakdown["selected_movies"]+=1
-                    if key: chosen_keys.append(key)
-            else:
-                if s_cnt<EMAIL_TOP_TV:
-                    shows.append(block_text); s_cnt+=1; breakdown["selected_tv"]+=1
-                    if key: chosen_keys.append(key)
-            if m_cnt>=EMAIL_TOP_MOVIES and s_cnt>=EMAIL_TOP_TV:
-                break
-        return movies, shows, chosen_keys
-
-    movies, shows, keys = _collect(EMAIL_SCORE_MIN, allow_rotate=True, try_fetch_providers=EMAIL_EARLY_FETCH_PROVIDERS)
-
-    used_backfill=False
-    if EMAIL_BACKFILL and (len(movies)<EMAIL_TOP_MOVIES or len(shows)<EMAIL_TOP_TV):
-        used_backfill=True
-        bf_movies, bf_shows, bf_keys = _collect(
-            min_score=EMAIL_BACKFILL_MIN, allow_rotate=EMAIL_BACKFILL_ALLOW_ROTATE, try_fetch_providers=EMAIL_BACKFILL_FETCH_PROVIDERS
-        )
-        if len(movies) < EMAIL_TOP_MOVIES:
-            need = EMAIL_TOP_MOVIES - len(movies)
-            movies.extend(bf_movies[:need]); keys.extend(bf_keys[:need])
-        if len(shows) < EMAIL_TOP_TV:
-            need = EMAIL_TOP_TV - len(shows)
-            shows.extend(bf_shows[:need]); keys.extend(bf_keys[:need])
-
-    if len(shows) < EMAIL_TOP_TV and EMAIL_BACKFILL:
-        low = max(12, EMAIL_BACKFILL_TV_MIN - 5)
-        bf_movies, bf_shows, bf_keys = _collect(min_score=low, allow_rotate=EMAIL_BACKFILL_ALLOW_ROTATE, try_fetch_providers=True)
-        if len(shows) < EMAIL_TOP_TV:
-            need = EMAIL_TOP_TV - len(shows)
-            shows.extend(bf_shows[:need]); keys.extend(bf_keys[:need])
-
-    if ROTATION_ENABLE and keys:
-        try: recency.mark_shown_keys(keys)
-        except Exception: pass
-
+    # Build body
     lines=["# Daily Recommendations","","## 🍿 Top Movies",""]
-    lines.extend(movies or ["_No eligible movies today after filters._"])
+    lines.extend(movie_lines or ["_No eligible movies today after filters._"])
     lines.append("")
     lines.append("## 📺 Top Shows & Series"); lines.append("")
-    lines.extend(shows or ["_No eligible shows today after filters._"])
-    lines.append("")
-    lines.append("_Tip: react 👍/👎 on the per-title comments below the issue to teach future runs._")
+    lines.extend(show_lines or ["_No eligible shows today after filters._"])
     lines.append("")
 
-    if EMAIL_INCLUDE_TELEMETRY:
+    if _bool("EMAIL_INCLUDE_TELEMETRY", True):
         lines.append("## Telemetry")
         subs = os.getenv("SUBS_INCLUDE","")
         region = os.getenv("REGION","US")
         lines.append(f"- Region: **{region}**")
         lines.append(f"- SUBS_INCLUDE: `{subs}`")
-        # Pull nicer counts if runner wrote diag.json
-        # (the caller may pass diag dict; otherwise we skip)
-        # The caller handles attaching diag if available.
         lines.append("")
 
     body = "\n".join(lines)
-    return body, breakdown, feedback_targets
+    return body, breakdown
 
 def write_email_markdown(run_dir: Path, ranked_items_path: Path, env: Dict[str, Any],
                          seen_index_path: Optional[Path]=None, seen_tv_roots_path: Optional[Path]=None) -> Path:
@@ -387,13 +255,14 @@ def write_email_markdown(run_dir: Path, ranked_items_path: Path, env: Dict[str, 
         ranked = json.loads(ranked_items_path.read_text(encoding="utf-8", errors="replace"))
     except Exception:
         ranked = []
-    diag = None
+    # Optional diag for future: attach counts if you want
     diag_path = run_dir / "diag.json"
-    if diag_path.exists():
-        try: diag = json.loads(diag_path.read_text(encoding="utf-8", errors="replace"))
-        except Exception: diag = None
+    try:
+        diag = json.loads(diag_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        diag = None
 
-    body, breakdown, feedback_targets = render_email(
+    body, breakdown = _build_lines(
         ranked_items=ranked,
         region=str(env.get("REGION") or "US"),
         allowed_provider_slugs=(env.get("SUBS_INCLUDE") or []),
@@ -406,6 +275,4 @@ def write_email_markdown(run_dir: Path, ranked_items_path: Path, env: Dict[str, 
     exp = run_dir / "exports"
     exp.mkdir(parents=True, exist_ok=True)
     (exp / "selection_breakdown.json").write_text(json.dumps(breakdown, indent=2), encoding="utf-8")
-    # NEW: export feedback targets for the workflow to create per-title comments
-    (exp / "feedback_targets.json").write_text(json.dumps({"targets": feedback_targets}, indent=2), encoding="utf-8")
     return out
