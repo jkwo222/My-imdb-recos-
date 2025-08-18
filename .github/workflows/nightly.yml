@@ -108,9 +108,11 @@ jobs:
           restore-keys: |
             pool-${{ runner.os }}-${{ env.REGION }}-${{ env.POOL_CACHE_VERSION }}-
 
-      - name: Run engine
+      - name: Run engine (capture log safely)
+        shell: bash
         run: |
-          mkdir -p data/out data/cache
+          set -o pipefail
+          mkdir -p data/out data/cache data/out/latest
           python -m engine.runner | tee data/out/latest/runner.log
 
       # Build digest using summarize module (exports feedback targets too)
@@ -179,7 +181,6 @@ jobs:
               targets = parsed.targets || [];
             } catch (e) {
               core.warning('No feedback_targets.json found; skipping per-title comments.');
-              targets = [];
             }
 
             // 4) Map existing comments by marker key <!-- reco:KEY -->
