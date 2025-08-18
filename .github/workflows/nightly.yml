@@ -94,16 +94,30 @@ jobs:
       RECENCY_TV_FIRST_BONUS_MAX: "8.0"
       RECENCY_TV_LAST_BONUS_MAX: "7.0"
 
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+
       # Email layout & gating
       EMAIL_TOP_MOVIES: "10"
       EMAIL_TOP_TV: "10"
-      EMAIL_SCORE_MIN: "60"
+      EMAIL_SCORE_MIN: "30"                 # ← lowered cutoff so sections aren’t empty
       EMAIL_INCLUDE_TELEMETRY: "true"
       EMAIL_EXCLUDE_ANIME: "true"
       EMAIL_NETWORK_FALLBACK: "true"
       EMAIL_INCLUDE_NEW_MOVIE_LABEL: "true"
       EMAIL_INCLUDE_NEW_SERIES_LABEL: "true"
       EMAIL_INCLUDE_NEW_SEASON_LABEL: "true"
+
+      # Email backfill (new)
+      EMAIL_BACKFILL: "true"                # ← enable second-pass fill
+      EMAIL_BACKFILL_MIN: "25"              # ← relaxed cutoff for backfill
+      EMAIL_BACKFILL_ALLOW_ROTATE: "true"   # ← still respect rotation
+
+      # Optional score rescaling (new)
+      SCORE_SCALE: "1.0"                    # e.g., try 1.6 to lift scores
+      SCORE_OFFSET: "0.0"                   # e.g., try 5.0 for a small shift
 
       # Rotation (cooldown) in email selection
       ROTATION_ENABLE: "true"
