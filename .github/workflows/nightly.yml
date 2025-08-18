@@ -5,52 +5,56 @@ on:
     - cron: '30 7 * * *'   # 07:30 UTC (3:30am ET)
   workflow_dispatch:
 
-permissions:
-  contents: read
-  issues: write
-
 jobs:
   build:
     runs-on: ubuntu-24.04
+
     env:
+      # ---------- Core config ----------
       REGION: US
       ORIGINAL_LANGS: '["en"]'
-      # Only list the services you actually have (email still restricts to your 7)
-      SUBS_INCLUDE: apple_tv_plus,netflix,max,paramount_plus,disney_plus,peacock,hulu
+      SUBS_INCLUDE: netflix,prime_video,hulu,max,disney_plus,apple_tv_plus,peacock,paramount_plus
       DISCOVER_PAGES: "12"
 
-      TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
-      TMDB_BEARER:  ${{ secrets.TMDB_ACCESS_TOKEN }}
+      # TMDB auth (runner accepts either v3 or v4)
+      TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}          # v3 key
+      TMDB_BEARER:  ${{ secrets.TMDB_ACCESS_TOKEN }}     # v4 bearer
+      # IMDb (CSV expected at data/user/ratings.csv)
       IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
-      IMDB_PUBLIC_MAX_PAGES: "10"
+      # Optional extra public lists to exclude (comma-separated lsXXXXXXXX IDs)
+      # IMDB_EXTRA_LIST_IDS: "ls012345678,ls098765432"
 
-      # Enrichment knobs
-      ENRICH_PROVIDERS_TOP_N: "220"
-      ENRICH_SCORING_TOP_N: "220"
+      # ---------- Scoring / enrichment knobs ----------
+      ENRICH_EXTERNALIDS_EXCL_TOP_N: "800"   # ext-ids before exclusions (hardens never-seen)
+      ENRICH_SCORING_TOP_N: "260"            # details/credits/keywords enrichment set
+      ENRICH_PROVIDERS_FINAL_TOP_N: "50"     # providers enrichment for final Top K
+      ENRICH_EXTERNALIDS_TOP_N: "60"         # ext-ids enrichment for final Top K
 
-      # Profile model knobs
-      AFFINITY_K: "5"                  # shrinkage
-      DECAY_HALF_LIFE_DAYS: "270"      # taste recency
+      # TV commitment penalty
+      COMMITMENT_ENABLED: "true"
+      COMMITMENT_SEASONS_THRESHOLD: "4"
+      COMMITMENT_SEASON_PENALTY: "3"
+      COMMITMENT_MAX_PENALTY: "18"
 
-      # Scoring blend knobs
-      AUDIENCE_PRIOR_LAMBDA: "0.3"
-      PROVIDER_PREF_LAMBDA: "0.5"
+      # Recency boosts
+      RECENCY_MOVIE_WINDOW_DAYS: "270"
+      RECENCY_MOVIE_BONUS_MAX: "10"
+      RECENCY_TV_FIRST_WINDOW: "180"
+      RECENCY_TV_FIRST_BONUS_MAX: "8"
+      RECENCY_TV_LAST_WINDOW: "120"
+      RECENCY_TV_LAST_BONUS_MAX: "10"
+      RECENCY_TV_FOLLOWUP_BONUS_MAX: "6"
+      RECENCY_PROVIDER_MULTIPLIER: "1.15"
 
-      # Anime / Kids penalties
-      PENALIZE_KIDS: "true"
-      PENALIZE_ANIME: "true"
-      KIDS_CARTOON_PENALTY: "25"
-      ANIME_PENALTY: "20"
-
-      # Optional @mention for notifications
-      NOTIFY_USER: ${{ vars.NOTIFY_USER }}
-
-      # Cache version for pool (bump to invalidate)
-      POOL_CACHE_VERSION: v1
-      POOL_MAX_ITEMS: "20000"
+      # Email rendering (Top Picks + inline labels)
+      EMAIL_TOPK: "10"
+      EMAIL_SCORE_MIN: "60"
+      EMAIL_INCLUDE_NEW_MOVIE_LABEL: "true"
+      EMAIL_INCLUDE_NEW_SEASON_LABEL: "true"
+      EMAIL_INCLUDE_NEW_SERIES_LABEL: "false"
 
     steps:
-      - name: Check out repository
+      - name: Check out
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -63,71 +67,36 @@ jobs:
           python -m pip install -U pip
           pip install -r requirements.txt
 
-      # Restore persistent caches so the pool truly grows
-      - name: Restore pool/tmdb caches
-        id: cache-restore
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            data/cache/pool
-            data/cache/tmdb
-          key: pool-${{ runner.os }}-${{ env.REGION }}-${{ env.POOL_CACHE_VERSION }}-${{ github.run_id }}
-          restore-keys: |
-            pool-${{ runner.os }}-${{ env.REGION }}-${{ env.POOL_CACHE_VERSION }}-
+      - name: Ensure scripts executable
+        run: |
+          chmod +x .github/scripts/make_debug_bundle.sh || true
+          chmod +x .github/scripts/collect_diag.py || true
 
       - name: Run engine
         run: |
           mkdir -p data/out data/cache
           python -m engine.runner
 
-      - name: Build digest summary (Top Picks on your services, bold providers)
-        run: |
-          python -m engine.summarize \
-            --in "data/out/latest/items.enriched.json" \
-            --diag "data/out/latest/diag.json" \
-            --ratings "data/user/ratings.csv" \
-            --out "data/out/latest/summary.md" \
-            --top 12
+      - name: Make debug bundle (full + compact snapshot)
+        run: bash .github/scripts/make_debug_bundle.sh
 
-      - name: Make debug bundle
-        run: |
-          chmod +x ./.github/scripts/make_debug_bundle.sh || true
-          bash ./.github/scripts/make_debug_bundle.sh
-
-      - name: Post/update Daily Recommendations issue + comment
-        uses: actions/github-script@v7
+      - name: Upload compact debug snapshot
+        uses: actions/upload-artifact@v4
         with:
-          script: |
-            const fs = require('fs');
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const title = 'Daily Recommendations';
-            let body = '';
-            try { body = fs.readFileSync('data/out/latest/summary.md', 'utf8'); }
-            catch { body = 'No summary.md found. Check debug bundle.'; }
+          name: debug-snapshot
+          path: debug-snapshot.zip
+          if-no-files-found: warn
 
-            const { data: issues } = await github.rest.issues.listForRepo({
-              owner, repo, state: 'open', labels: 'daily-recos', per_page: 100
-            });
-            let issue = issues.find(i => i.title === title);
-            if (!issue) {
-              issue = (await github.rest.issues.create({ owner, repo, title, body, labels: ['daily-recos'] })).data;
-            } else {
-              await github.rest.issues.update({ owner, repo, issue_number: issue.number, body });
-            }
-
-            const mention = process.env.NOTIFY_USER ? ` cc @${process.env.NOTIFY_USER}` : '';
-            await github.rest.issues.createComment({
-              owner, repo, issue_number: issue.number,
-              body: `Daily digest posted.${mention}\n\n` + body
-            });
-
-      - name: Upload debug bundle
+      - name: Upload full debug bundle
         uses: actions/upload-artifact@v4
         with:
           name: debug-data
           path: debug-data.zip
           if-no-files-found: warn
+
+      - name: Create repo snapshot (current code)
+        run: |
+          git archive -o repo-snapshot.zip HEAD
 
       - name: Upload repo snapshot
         uses: actions/upload-artifact@v4
@@ -136,7 +105,7 @@ jobs:
           path: repo-snapshot.zip
           if-no-files-found: warn
 
-      - name: Upload latest outputs
+      - name: Upload latest outputs (convenience)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -150,12 +119,32 @@ jobs:
             data/out/latest/summary.md
             data/out/latest/diag.json
 
-      # Save caches so next run restores an ever-growing pool
-      - name: Save pool/tmdb caches
-        if: always()
-        uses: actions/cache/save@v4
+      - name: Post/update Daily Recommendations issue
+        uses: actions/github-script@v7
         with:
-          path: |
-            data/cache/pool
-            data/cache/tmdb
-          key: pool-${{ runner.os }}-${{ env.REGION }}-${{ env.POOL_CACHE_VERSION }}-${{ github.run_id }}
+          script: |
+            const fs = require('fs');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const title = 'Daily Recommendations';
+            let body = '';
+            try {
+              body = fs.readFileSync('data/out/latest/summary.md', 'utf8');
+            } catch (e) {
+              body = 'No summary.md found. Check debug snapshot/bundle.';
+            }
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: 'daily-recos', per_page: 100
+            });
+            let issue = issues.find(i => i.title === title);
+            if (!issue) {
+              const res = await github.rest.issues.create({
+                owner, repo, title, body, labels: ['daily-recos']
+              });
+              issue = res.data;
+            } else {
+              await github.rest.issues.update({
+                owner, repo, issue_number: issue.number, body
+              });
+            }
+            core.info(`Issue #${issue.number} updated`);
