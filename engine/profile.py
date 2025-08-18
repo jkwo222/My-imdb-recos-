@@ -1,81 +1,214 @@
 # engine/profile.py
 from __future__ import annotations
 import csv
-import json
+import math
+import os
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, List, Tuple, Any, Iterable
 
-ROOT = Path(__file__).resolve().parents[1]
+# ---------- config knobs (from env) ----------
 
-# Where we look for your local data:
-RATINGS_CSV = ROOT / "data" / "user" / "ratings.csv"
-# Optional cache of your public IMDb list (to catch new titles not yet in ratings.csv).
-# This is expected to be a JSON Lines file with objects that at least include {"tconst": "tt..."}.
-IMDB_LIST_CACHE = ROOT / "data" / "cache" / "imdb" / "public_list.jsonl"
+def _int_env(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name, "")
+        return int(v) if v else default
+    except Exception:
+        return default
 
+def _float_env(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name, "")
+        return float(v) if v else default
+    except Exception:
+        return default
 
-def _load_ratings_csv() -> Dict[str, Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
-    if not RATINGS_CSV.exists():
-        return out
+AFFINITY_K = _float_env("AFFINITY_K", 5.0)                # Bayesian shrinkage K
+DECAY_HALF_LIFE_DAYS = _float_env("DECAY_HALF_LIFE_DAYS", 270.0)  # ~9 months
 
-    with RATINGS_CSV.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        # Expected columns: tconst,my_rating (others ignored)
-        for row in reader:
-            tconst = (row.get("tconst") or "").strip()
-            if not tconst:
-                continue
-            rating = row.get("my_rating")
+# ---------- utils ----------
+
+def _parse_date(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    s = s.strip()
+    for fmt in ("%Y-%m-%d", "%d %b %Y", "%m/%d/%Y", "%b %d %Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+    return None
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def _decay_weight(d: datetime | None) -> float:
+    if d is None:
+        return 1.0
+    age_days = max(0.0, (_now_utc() - d).total_seconds() / 86400.0)
+    if DECAY_HALF_LIFE_DAYS <= 0:
+        return 1.0
+    tau = DECAY_HALF_LIFE_DAYS / math.log(2.0)  # half-life -> exp time constant
+    return math.exp(-age_days / tau)
+
+def _bucket_runtime(mins: float | int | str | None) -> str:
+    try:
+        m = float(str(mins).strip())
+    except Exception:
+        return "unknown"
+    if m <= 90:   return "<=90"
+    if m <= 120:  return "91-120"
+    if m <= 150:  return "121-150"
+    return ">150"
+
+def _bucket_era(year: int | str | None) -> str:
+    try:
+        y = int(str(year)[:4])
+    except Exception:
+        return "unknown"
+    if 1960 <= y < 1980: return "60-79"
+    if 1980 <= y < 1990: return "80s"
+    if 1990 <= y < 2000: return "90s"
+    if 2000 <= y < 2010: return "00s"
+    if 2010 <= y < 2020: return "10s"
+    if 2020 <= y < 2030: return "20s"
+    return "unknown"
+
+def _split_csv(s: str | None) -> List[str]:
+    if not s:
+        return []
+    return [t.strip() for t in str(s).split(",") if t.strip()]
+
+@dataclass
+class Obs:
+    rating: float
+    w: float   # decay weight
+
+def _weighted_avg(observations: List[Obs]) -> Tuple[float, float]:
+    if not observations:
+        return 0.0, 0.0
+    sw = sum(o.w for o in observations)
+    if sw <= 0:
+        return 0.0, 0.0
+    avg = sum(o.rating * o.w for o in observations) / sw
+    return avg, sw  # sw = effective n
+
+# ---------- model builder ----------
+
+def build_user_model(ratings_csv: Path, out_dir: Path) -> Dict[str, Any]:
+    """
+    Build a compact user model:
+      - baseline averages (global, by media type)
+      - affinities for: directors, genres, title_type, runtime_bucket, era
+    Writes: out_dir/user_model.json and out_dir/profile_report.md
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows: List[Dict[str, Any]] = []
+    if not ratings_csv.exists():
+        model = {"meta": {"count": 0, "note": "ratings.csv missing"}}
+        (out_dir / "user_model.json").write_text("{}", encoding="utf-8")
+        return model
+
+    with ratings_csv.open("r", encoding="utf-8", errors="replace") as fh:
+        reader = csv.DictReader(fh)
+        for r in reader:
             try:
-                my_rating = float(rating) if rating not in (None, "", "NaN") else None
+                rating = float(r.get("Your Rating") or r.get("YourRating") or r.get("Rating") or 0.0)
             except Exception:
-                my_rating = None
-            out[tconst] = {"my_rating": my_rating}
-    return out
+                rating = 0.0
+            date_rated = _parse_date(r.get("Date Rated") or r.get("Date Added"))
+            w = _decay_weight(date_rated)
+            title_type = (r.get("Title Type") or "").strip()
+            year = r.get("Year")
+            runtime = r.get("Runtime (mins)")
+            directors = _split_csv(r.get("Directors") or r.get("Director"))
+            genres = _split_csv(r.get("Genres") or r.get("Genre"))
 
+            rows.append({
+                "rating": rating, "w": w, "title_type": title_type,
+                "year": year, "runtime": runtime,
+                "directors": directors, "genres": genres,
+            })
 
-def _load_public_list_cache() -> Dict[str, Dict[str, Any]]:
-    """
-    Pulls tconsts from a local cache of your public IMDb list (no network here).
-    If an item isn't in ratings.csv we add it with a neutral rating baseline (6.0)
-    so your genre weights start to see it as 'watched/added'.
-    """
-    out: Dict[str, Dict[str, Any]] = {}
-    if not IMDB_LIST_CACHE.exists():
-        return out
+    # baselines
+    global_avg, global_n = _weighted_avg([Obs(r["rating"], r["w"]) for r in rows])
+    by_type: Dict[str, Tuple[float, float]] = {}
+    for t in set(r["title_type"] for r in rows):
+        obs = [Obs(r["rating"], r["w"]) for r in rows if r["title_type"] == t]
+        by_type[t] = _weighted_avg(obs)
 
-    with IMDB_LIST_CACHE.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
+    # collect token observations
+    def collect_token_affinity(get_tokens, label: str) -> Dict[str, float]:
+        tok_obs: Dict[str, List[Obs]] = {}
+        for r in rows:
+            toks = get_tokens(r)
+            if not toks:
                 continue
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            tconst = (obj.get("tconst") or "").strip()
-            if not tconst:
-                continue
-            # Neutral baseline if not explicitly rated
-            out[tconst] = {"my_rating": 6.0}
-    return out
+            for t in toks:
+                tok_obs.setdefault(t, []).append(Obs(r["rating"], r["w"]))
 
+        weights: Dict[str, float] = {}
+        for tok, obs in tok_obs.items():
+            avg, n_eff = _weighted_avg(obs)
+            shrink = n_eff / (n_eff + AFFINITY_K)
+            weights[tok] = (avg - global_avg) * shrink
+        return weights
 
-def load_user_profile(env: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
-    """
-    Returns a dict keyed by tconst -> {"my_rating": float | None}.
+    directors_w = collect_token_affinity(lambda r: r["directors"], "directors")
+    genres_w    = collect_token_affinity(lambda r: r["genres"], "genres")
+    runtime_w   = collect_token_affinity(lambda r: [_bucket_runtime(r["runtime"])], "runtime")
+    era_w       = collect_token_affinity(lambda r: [_bucket_era(r["year"])], "era")
+    type_w      = collect_token_affinity(lambda r: [r["title_type"].strip() or "unknown"], "title_type")
 
-    Sources:
-      1) data/user/ratings.csv         (authoritative when present)
-      2) data/cache/imdb/public_list.jsonl  (optional; neutral baseline)
+    model: Dict[str, Any] = {
+        "meta": {
+            "count": len(rows),
+            "global_avg": round(global_avg, 4),
+            "AFFINITY_K": AFFINITY_K,
+            "DECAY_HALF_LIFE_DAYS": DECAY_HALF_LIFE_DAYS,
+            "by_type": {k: {"avg": round(v[0], 4), "n_eff": round(v[1], 3)} for k, v in by_type.items()},
+        },
+        "people": {"director": directors_w},   # you can add writer/actor later if present
+        "form": {
+            "runtime_bucket": runtime_w,
+            "title_type": type_w,
+            "era": era_w,
+        },
+        "genres": genres_w,
+        # stubs for future signals; scoring handles missing gracefully:
+        "language": {},
+        "country": {},
+        "studio": {},
+        "network": {},
+        "keywords": {},
+        "provider": {},  # small priors can be learned later
+    }
 
-    If a tconst appears in both, ratings.csv wins.
-    """
-    ratings = _load_ratings_csv()
-    cached_list = _load_public_list_cache()
+    # Write artifacts
+    (out_dir / "user_model.json").write_text(
+        __import__("json").dumps(model, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
-    # Merge with ratings priority
-    merged = dict(cached_list)
-    merged.update(ratings)
-    return merged
+    # human summary
+    def topn(d: Dict[str, float], n=12):
+        return "\n".join(f"- {k}: {round(v,2)}" for k, v in sorted(d.items(), key=lambda kv: kv[1], reverse=True)[:n])
+
+    report = [
+        "# User model",
+        f"- rows: {len(rows)}",
+        f"- global_avg: {round(global_avg,2)}",
+        "## Directors (top +)",
+        topn(directors_w),
+        "## Genres (top +)",
+        topn(genres_w),
+        "## Runtime bucket (signal)",
+        topn(runtime_w),
+        "## Era (signal)",
+        topn(era_w),
+        "## Title type (signal)",
+        topn(type_w),
+    ]
+    (out_dir / "profile_report.md").write_text("\n".join(report), encoding="utf-8")
+
+    return model
