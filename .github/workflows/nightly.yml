@@ -223,7 +223,7 @@ jobs:
           outp.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
           PY
 
-      - name: Post/update Daily Recommendations issue
+            - name: Post/update Daily Recommendations issue + per-title feedback comments
         uses: actions/github-script@v7
         with:
           script: |
@@ -231,10 +231,13 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const title = 'Daily Recommendations';
+
+            // 1) Load the summary body
             let body = '';
             try { body = fs.readFileSync('data/out/latest/summary.md', 'utf8'); }
             catch { body = 'No summary.md found. Check debug bundle.'; }
 
+            // 2) Ensure the issue exists (label: daily-recos)
             const { data: issues } = await github.rest.issues.listForRepo({
               owner, repo, state: 'open', labels: 'daily-recos', per_page: 100
             });
@@ -244,11 +247,47 @@ jobs:
             } else {
               await github.rest.issues.update({ owner, repo, issue_number: issue.number, body });
             }
+
+            // 3) Load feedback targets (exported by summarize.py)
+            let targets = [];
+            try {
+              const raw = fs.readFileSync('data/out/latest/exports/feedback_targets.json', 'utf8');
+              const parsed = JSON.parse(raw);
+              targets = parsed.targets || [];
+            } catch (e) {
+              core.warning('No feedback_targets.json found; skipping per-title comments.');
+              return;
+            }
+
+            // 4) Map existing comments by marker key <!-- reco:KEY -->
+            const markerRe = /<!--\s*reco:([^\s>]+)\s*-->/;
+            const allComments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: issue.number, per_page: 100 });
+            const existingByKey = new Map();
+            for (const c of allComments) {
+              const m = markerRe.exec(c.body || "");
+              if (m) existingByKey.set(m[1], c);
+            }
+
+            // 5) Upsert per-title comments
+            for (const t of targets) {
+              const key = t.key;
+              const desired = t.comment_md || `Feedback for ${t.title}${t.year ? ' ('+t.year+')' : ''}\n\n<!-- reco:${key} -->`;
+              const ex = existingByKey.get(key);
+              if (!ex) {
+                await github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body: desired });
+              } else if ((ex.body || '') !== desired) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: ex.id, body: desired });
+              }
+            }
+
+            // (Optional) Mention user
             const mention = process.env.NOTIFY_USER ? ` cc @${process.env.NOTIFY_USER}` : '';
-            await github.rest.issues.createComment({
-              owner, repo, issue_number: issue.number,
-              body: `Daily digest posted.${mention}\n\n` + body
-            });
+            if (mention) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: issue.number,
+                body: `Daily digest posted.${mention}`
+              });
+            }
 
       - name: Post per-title feedback comments (👍/👎)
         if: env.POST_PER_TITLE_FEEDBACK == 'true'
