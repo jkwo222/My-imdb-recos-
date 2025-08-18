@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 from datetime import date, datetime
 
+from . import recency  # NEW: apply rotation / cooldown gating
+
+# -------- env helpers --------
 def _bool(n:str,d:bool)->bool:
     v=(os.getenv(n,"") or "").strip().lower()
     if v in {"1","true","yes","on"}: return True
@@ -13,7 +16,11 @@ def _bool(n:str,d:bool)->bool:
 def _int(n:str,d:int)->int:
     try: return int(os.getenv(n,"") or d)
     except Exception: return d
+def _float(n:str,d:float)->float:
+    try: return float(os.getenv(n,"") or d)
+    except Exception: return d
 
+# -------- email layout knobs --------
 EMAIL_TOP_MOVIES        = _int("EMAIL_TOP_MOVIES", 10)
 EMAIL_TOP_TV            = _int("EMAIL_TOP_TV", 10)
 EMAIL_SCORE_MIN         = _int("EMAIL_SCORE_MIN", 60)
@@ -29,6 +36,12 @@ REC_MOVIE_WINDOW        = _int("RECENCY_MOVIE_WINDOW_DAYS", 270)
 REC_TV_FIRST_WINDOW     = _int("RECENCY_TV_FIRST_WINDOW", 180)
 REC_TV_LAST_WINDOW      = _int("RECENCY_TV_LAST_WINDOW", 120)
 
+# -------- rotation (cooldown) knobs --------
+ROTATION_ENABLE         = _bool("ROTATION_ENABLE", True)
+ROTATION_COOLDOWN_DAYS  = _int("ROTATION_COOLDOWN_DAYS", 5)
+ROTATION_EXEMPT_SCORE   = _float("ROTATION_EXEMPT_SCORE", 90.0)  # near-perfect match ignores cooldown
+
+# -------- provider display map --------
 DISPLAY_PROVIDER = {
     "netflix": "Netflix", "max": "Max", "paramount_plus": "Paramount+",
     "disney_plus": "Disney+", "apple_tv_plus": "Apple TV+", "peacock": "Peacock",
@@ -133,7 +146,6 @@ def _recency_label(it: Dict[str, Any]) -> Optional[str]:
     return None
 
 def _fmt_runtime(it: Dict[str, Any]) -> Optional[str]:
-    # movies: runtime (mins) → "2h 04m"; tv: episode_run_time list → "45m" (first bucket)
     if (it.get("media_type") or "").lower()=="movie":
         try:
             m = int(float(it.get("runtime") or 0))
@@ -172,6 +184,19 @@ def _fmt_meta_line(it: Dict[str, Any], providers: List[str]) -> str:
     if director: parts.append(f"Dir. {director}")
     return " • ".join(parts)
 
+def _rotation_skip(it: Dict[str, Any]) -> bool:
+    """Return True if this item should be skipped due to cooldown, unless it is exempt by score."""
+    if not ROTATION_ENABLE:
+        return False
+    try:
+        score = float(it.get("score", 0) or 0)
+    except Exception:
+        score = 0.0
+    if score >= ROTATION_EXEMPT_SCORE:
+        return False
+    key = recency.key_for_item(it)
+    return recency.should_skip_key(key, cooldown_days=ROTATION_COOLDOWN_DAYS)
+
 def render_email(
     ranked_items: List[Dict[str, Any]],
     *,
@@ -183,14 +208,21 @@ def render_email(
 ) -> str:
     allowed = allowed_provider_slugs or []
 
+    rotation_skipped = 0
+
     def _eligible(it: Dict[str, Any]) -> bool:
+        nonlocal rotation_skipped
         if float(it.get("score", 0) or 0) < EMAIL_SCORE_MIN: return False
         if EMAIL_EXCLUDE_ANIME and _is_anime_like(it): return False
+        if _rotation_skip(it):
+            rotation_skipped += 1
+            return False
         if not _providers_for_item(it, allowed): return False
         return True
 
     movies: List[str] = []
     shows:  List[str] = []
+    chosen_keys: List[str] = []
     m_cnt=s_cnt=0
 
     for it in sorted(ranked_items, key=lambda x: float(x.get("score", x.get("tmdb_vote", 0.0)) or 0.0), reverse=True):
@@ -202,14 +234,25 @@ def render_email(
         why_line = f"  • why: {why}" if why else None
         block = [title_line, meta_line] + ([why_line] if why_line else [])
         block_text = "\n".join(block)
+        key = recency.key_for_item(it)
+
         if (it.get("media_type") or "").lower()=="movie":
             if m_cnt<EMAIL_TOP_MOVIES:
                 movies.append(block_text); m_cnt+=1
+                if key: chosen_keys.append(key)
         else:
             if s_cnt<EMAIL_TOP_TV:
                 shows.append(block_text); s_cnt+=1
+                if key: chosen_keys.append(key)
         if m_cnt>=EMAIL_TOP_MOVIES and s_cnt>=EMAIL_TOP_TV:
             break
+
+    # Persist the keys we actually showed
+    if ROTATION_ENABLE and chosen_keys:
+        try:
+            recency.mark_shown_keys(chosen_keys)
+        except Exception:
+            pass
 
     lines=["# Daily Recommendations","\n## Top Movies\n"]
     lines.extend(movies or ["_No eligible movies today after filters._"])
@@ -239,6 +282,10 @@ def render_email(
                 lines.append(f"- Pool unique keys (est): **{env_pool.get('unique_keys_est')}**")
             if env_pool.get("pages"):
                 lines.append(f"- Discovery pages this run: **{env_pool.get('pages')}** ({env_pool.get('paging_mode')})")
+        # rotation telemetry
+        if ROTATION_ENABLE:
+            lines.append(f"- Rotation: **on** (cooldown {ROTATION_COOLDOWN_DAYS} days; exempt ≥ {int(ROTATION_EXEMPT_SCORE)})")
+            lines.append(f"- Skipped due to rotation this run: **{rotation_skipped}**")
         lines.append("")
     return "\n".join(lines)
 
