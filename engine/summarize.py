@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 from datetime import date, datetime
 
-from . import recency  # cooldown memory
+from . import recency  # rotation memory
 
 # -------- env helpers --------
 def _bool(n:str,d:bool)->bool:
@@ -20,7 +20,7 @@ def _int(n:str,d:int)->int:
 # -------- email layout knobs --------
 EMAIL_TOP_MOVIES        = _int("EMAIL_TOP_MOVIES", 10)
 EMAIL_TOP_TV            = _int("EMAIL_TOP_TV", 10)
-EMAIL_SCORE_MIN         = _int("EMAIL_SCORE_MIN", 60)
+EMAIL_SCORE_MIN         = _int("EMAIL_SCORE_MIN", 30)   # lowered default so you get picks now
 EMAIL_INCLUDE_TELEMETRY = _bool("EMAIL_INCLUDE_TELEMETRY", True)
 EMAIL_EXCLUDE_ANIME     = _bool("EMAIL_EXCLUDE_ANIME", True)
 EMAIL_NETWORK_FALLBACK  = _bool("EMAIL_NETWORK_FALLBACK", True)
@@ -36,7 +36,11 @@ REC_TV_LAST_WINDOW      = _int("RECENCY_TV_LAST_WINDOW", 120)
 # Rotation / cooldown knobs
 ROTATION_ENABLE         = _bool("ROTATION_ENABLE", True)
 ROTATION_COOLDOWN_DAYS  = _int("ROTATION_COOLDOWN_DAYS", 5)
-# Exempt handled in scoring; selection-level rotation still applies
+
+# Backfill knobs (new)
+EMAIL_BACKFILL              = _bool("EMAIL_BACKFILL", True)
+EMAIL_BACKFILL_MIN          = _int("EMAIL_BACKFILL_MIN", 25)   # second-pass cutoff
+EMAIL_BACKFILL_ALLOW_ROTATE = _bool("EMAIL_BACKFILL_ALLOW_ROTATE", True)  # still respect rotation by default
 
 # Provider display map (HBO Max label)
 DISPLAY_PROVIDER = {
@@ -176,24 +180,21 @@ def _fmt_meta_line(it: Dict[str, Any], providers: List[str]) -> str:
     if director: parts.append(f"Dir. {director}")
     return " • ".join(parts)
 
-# why-line cleaner (keep meaningful; drop filler)
+# why-line cleaner
 _DROP_PATTERNS = ("imdb details augmented","imdb keywords augmented","penalty","black & white","b&w","old","provider","anime","kids","long-run")
 _KEEP_HINTS = ("new movie","new series","new season","actor","cast","star","director","writer","genre","keyword","because you liked","similar")
 
 def _clean_why(raw: str, recency_lab: Optional[str]) -> Optional[str]:
     parts=[p.strip() for p in (raw or "").split(";") if p.strip()]
     out: List[str]=[]
-    if recency_lab:
-        out.append(recency_lab.lower())
+    if recency_lab: out.append(recency_lab.lower())
     for p in parts:
         low=p.lower()
         if any(x in low for x in _DROP_PATTERNS): 
-            # we drop the literal text, but keep overall reason set minimal & helpful
             continue
         if any(x in low for x in _KEEP_HINTS):
             out.append(p)
-    if not out:
-        return None
+    if not out: return None
     out2=list(dict.fromkeys(out))[:3]
     return "; ".join(out2)
 
@@ -211,52 +212,73 @@ def render_email(
     feedback_skipped = 0
     suppress_keys = set(env_extra.get("FEEDBACK_SUPPRESS_KEYS") or [])
 
-    def _eligible(it: Dict[str, Any]) -> bool:
+    def _eligible(it: Dict[str, Any], min_score: int) -> bool:
         nonlocal rotation_skipped, feedback_skipped
-        if float(it.get("score", 0) or 0) < EMAIL_SCORE_MIN: return False
+        if float(it.get("score", 0) or 0) < min_score: return False
         if EMAIL_EXCLUDE_ANIME and _is_anime_like(it): return False
-        # Feedback suppression (recent 👎)
         k = recency.key_for_item(it)
         if k and k in suppress_keys:
             feedback_skipped += 1
             return False
-        # Basic provider check
         if not _providers_for_item(it, allowed): return False
-        # Rotation (cooldown by last-shown)
         if ROTATION_ENABLE and recency.should_skip_key(k, cooldown_days=ROTATION_COOLDOWN_DAYS):
             rotation_skipped += 1
             return False
         return True
 
-    movies: List[str] = []
-    shows:  List[str] = []
-    chosen_keys: List[str] = []
-    m_cnt=s_cnt=0
+    def _collect(min_score: int, allow_rotate: bool = True):
+        nonlocal rotation_skipped
+        movies: List[str] = []
+        shows:  List[str] = []
+        chosen_keys: List[str] = []
+        m_cnt=s_cnt=0
 
-    for it in sorted(ranked_items, key=lambda x: float(x.get("score", x.get("tmdb_vote", 0.0)) or 0.0), reverse=True):
-        if not _eligible(it): continue
-        provs=_providers_for_item(it, allowed)
-        title_line=f"- {_fmt_title_line(it)}"
-        meta_line =f"  • {_fmt_meta_line(it, provs)}"
-        rec_lab=_recency_label(it)
-        why_clean=_clean_why(it.get("why") or "", rec_lab)
-        why_line = f"  • why: {why_clean}" if why_clean else None
-        block = [title_line, meta_line] + ([why_line] if why_line else [])
-        block_text = "\n".join(block)
-        key = recency.key_for_item(it)
-        if (it.get("media_type") or "").lower()=="movie":
-            if m_cnt<EMAIL_TOP_MOVIES:
-                movies.append(block_text); m_cnt+=1
-                if key: chosen_keys.append(key)
-        else:
-            if s_cnt<EMAIL_TOP_TV:
-                shows.append(block_text); s_cnt+=1
-                if key: chosen_keys.append(key)
-        if m_cnt>=EMAIL_TOP_MOVIES and s_cnt>=EMAIL_TOP_TV:
-            break
+        for it in sorted(ranked_items, key=lambda x: float(x.get("score", x.get("tmdb_vote", 0.0)) or 0.0), reverse=True):
+            key = recency.key_for_item(it)
+            if not allow_rotate and key and recency.should_skip_key(key, cooldown_days=ROTATION_COOLDOWN_DAYS):
+                # pretend rotation didn't skip, just for counting accuracy
+                pass
+            if not _eligible(it, min_score=min_score):
+                continue
+            provs=_providers_for_item(it, allowed)
+            title_line=f"- {_fmt_title_line(it)}"
+            meta_line =f"  • {_fmt_meta_line(it, provs)}"
+            rec_lab=_recency_label(it)
+            why_clean=_clean_why(it.get("why") or "", rec_lab)
+            why_line = f"  • why: {why_clean}" if why_clean else None
+            block = [title_line, meta_line] + ([why_line] if why_line else [])
+            block_text = "\n".join(block)
+            if (it.get("media_type") or "").lower()=="movie":
+                if m_cnt<EMAIL_TOP_MOVIES:
+                    movies.append(block_text); m_cnt+=1
+                    if key: chosen_keys.append(key)
+            else:
+                if s_cnt<EMAIL_TOP_TV:
+                    shows.append(block_text); s_cnt+=1
+                    if key: chosen_keys.append(key)
+            if m_cnt>=EMAIL_TOP_MOVIES and s_cnt>=EMAIL_TOP_TV:
+                break
+        return movies, shows, chosen_keys
 
-    if ROTATION_ENABLE and chosen_keys:
-        try: recency.mark_shown_keys(chosen_keys)
+    # Pass 1: normal threshold
+    movies, shows, keys = _collect(EMAIL_SCORE_MIN, allow_rotate=True)
+
+    # Pass 2 (optional): backfill if short
+    if EMAIL_BACKFILL and (len(movies) < EMAIL_TOP_MOVIES or len(shows) < EMAIL_TOP_TV):
+        bf_movies, bf_shows, bf_keys = _collect(EMAIL_BACKFILL_MIN, allow_rotate=EMAIL_BACKFILL_ALLOW_ROTATE)
+        # merge only for the missing slots (keep original order)
+        if len(movies) < EMAIL_TOP_MOVIES:
+            need = EMAIL_TOP_MOVIES - len(movies)
+            movies.extend(bf_movies[:need])
+            keys.extend(bf_keys[:need])
+        if len(shows) < EMAIL_TOP_TV:
+            need = EMAIL_TOP_TV - len(shows)
+            shows.extend(bf_shows[:need])
+            keys.extend(bf_keys[:need])
+
+    # mark shown for rotation memory
+    if ROTATION_ENABLE and keys:
+        try: recency.mark_shown_keys(keys)
         except Exception: pass
 
     lines=["# Daily Recommendations","\n## 🍿 Top Movies\n"]
@@ -282,8 +304,8 @@ def render_email(
             if fb:
                 lines.append(f"- Feedback items: **{fb.get('feedback_items', 0)}** (in pool: **{fb.get('feedback_items_in_pool', 0)}**)")
                 lines.append(f"- Suppressed by 👎 cooldown: **{fb.get('suppress_keys', 0)}**")
-        lines.append(f"- Skipped by rotation (last-shown cooldown): **{rotation_skipped}**")
-        lines.append(f"- Skipped by feedback cooldown in selection: **{feedback_skipped}**")
+        lines.append(f"- Skipped by rotation (cooldown): **{rotation_skipped}**")
+        lines.append(f"- Backfill used: **{'yes' if EMAIL_BACKFILL and (len(movies)<EMAIL_TOP_MOVIES or len(shows)<EMAIL_TOP_TV) else 'no'}**")
         lines.append("")
     return "\n".join(lines)
 
