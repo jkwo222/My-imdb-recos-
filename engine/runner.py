@@ -6,7 +6,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List
 
 try:
     from .env import Env
@@ -92,8 +92,11 @@ def _env_from_os() -> Env:
     pool_max = _int_env("POOL_MAX_ITEMS", 20000)
     prune_at = _int_env("POOL_PRUNE_AT", 0)
     prune_keep = _int_env("POOL_PRUNE_KEEP", max(0, prune_at - 5000) if prune_at > 0 else 0)
-    enrich_top_n = _int_env("ENRICH_PROVIDERS_TOP_N", 220)
+    enrich_providers_n = _int_env("ENRICH_PROVIDERS_TOP_N", 220)
     enrich_scoring_n = _int_env("ENRICH_SCORING_TOP_N", 220)
+    enrich_extids_excl_n = _int_env("ENRICH_EXTERNALIDS_EXCL_TOP_N", 800)
+    enrich_extids_final_n = _int_env("ENRICH_EXTERNALIDS_TOP_N", 60)
+    enrich_providers_final_n = _int_env("ENRICH_PROVIDERS_FINAL_TOP_N", 40)
 
     return Env.from_mapping({
         "REGION": os.getenv("REGION", "US").strip() or "US",
@@ -103,8 +106,11 @@ def _env_from_os() -> Env:
         "POOL_MAX_ITEMS": pool_max,
         "POOL_PRUNE_AT": prune_at,
         "POOL_PRUNE_KEEP": prune_keep,
-        "ENRICH_PROVIDERS_TOP_N": enrich_top_n,
+        "ENRICH_PROVIDERS_TOP_N": enrich_providers_n,
         "ENRICH_SCORING_TOP_N": enrich_scoring_n,
+        "ENRICH_EXTERNALIDS_EXCL_TOP_N": enrich_extids_excl_n,
+        "ENRICH_EXTERNALIDS_TOP_N": enrich_extids_final_n,
+        "ENRICH_PROVIDERS_FINAL_TOP_N": enrich_providers_final_n,
     })
 
 def _build_run_dir() -> Path:
@@ -114,7 +120,7 @@ def _build_run_dir() -> Path:
     rd.mkdir(parents=True, exist_ok=True)
     return rd
 
-def _markdown_summary(items: List[Dict[str, Any]], env: Env, top_n: int = 25) -> str:
+def _markdown_summary(items: List[Dict[str, Any]], env: Env) -> str:
     discovered = int(env.get("DISCOVERED_COUNT", 0))
     eligible = int(env.get("ELIGIBLE_COUNT", 0))
     subs = env.get("SUBS_INCLUDE", [])
@@ -123,6 +129,7 @@ def _markdown_summary(items: List[Dict[str, Any]], env: Env, top_n: int = 25) ->
     prov_map = env.get("PROVIDER_MAP", {})
     unmatched = env.get("PROVIDER_UNMATCHED", [])
     pool_t = env.get("POOL_TELEMETRY", {}) or {}
+    prof_t = env.get("PROFILE_TELEMETRY", {}) or {}
 
     lines = []
     lines.append("# Daily recommendations\n")
@@ -141,42 +148,41 @@ def _markdown_summary(items: List[Dict[str, Any]], env: Env, top_n: int = 25) ->
                      f"appended_this_run={pool_t.get('appended_this_run')}, cap={pool_t.get('pool_max_items')}")
         if pool_t.get("prune_at", 0):
             lines.append(f"- Pool prune policy: prune_at={pool_t.get('prune_at')}, keep={pool_t.get('prune_keep')}")
+    if prof_t:
+        lines.append(f"- Profile: rows={prof_t.get('rows')} global_avg={prof_t.get('global_avg')} model={prof_t.get('path')}")
     lines.append("")
     return "\n".join(lines)
 
-def _enrich_top_providers(items: List[Dict[str, Any]], env: Env, top_n: int = 220) -> None:
-    region = env.get("REGION", "US")
-    for it in items[:top_n]:
+# ---------- enrichment helpers ----------
+def _base_for_select(it: Dict[str, Any]) -> float:
+    try:
+        v = float(it.get("tmdb_vote") or 0.0)
+    except Exception:
+        v = 0.0
+    try:
+        p = float(it.get("popularity") or 0.0)
+    except Exception:
+        p = 0.0
+    import math
+    return (v * 2.0) + (math.log1p(p) * 0.5)
+
+def _select_top(items: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
+    return sorted(items, key=_base_for_select, reverse=True)[:max(0, n)]
+
+def _enrich_providers(items: List[Dict[str, Any]], region: str, top_n: int) -> None:
+    for it in _select_top(items, top_n):
         if it.get("providers"): continue
-        kind = it.get("media_type"); tid = it.get("tmdb_id")
+        kind = (it.get("media_type") or "").lower()
+        tid = it.get("tmdb_id")
         if not kind or not tid: continue
         try:
             provs = tmdb.get_title_watch_providers(kind, int(tid), region)
             if provs: it["providers"] = provs
-        except Exception: pass
-
-def _enrich_for_scoring(items: List[Dict[str, Any]], env: Env, top_n: int = 220) -> None:
-    """
-    Fetch details/credits/keywords for top-N candidates (by popularity/vote heuristic).
-    """
-    # choose candidates by quick heuristic
-    def _base(it):
-        try:
-            v = float(it.get("tmdb_vote") or 0.0)
         except Exception:
-            v = 0.0
-        try:
-            p = float(it.get("popularity") or 0.0)
-        except Exception:
-            p = 0.0
-        return (v * 2.0) + (math_log1p(p) * 0.5)
-    def math_log1p(x):
-        import math
-        try: return math.log1p(float(x))
-        except Exception: return 0.0
+            pass
 
-    cands = sorted(items, key=_base, reverse=True)[:top_n]
-    for it in cands:
+def _enrich_scoring_signals(items: List[Dict[str, Any]], top_n: int) -> None:
+    for it in _select_top(items, top_n):
         kind = (it.get("media_type") or "").lower()
         tid = it.get("tmdb_id")
         if not kind or not tid: continue
@@ -190,7 +196,6 @@ def _enrich_for_scoring(items: List[Dict[str, Any]], env: Env, top_n: int = 220)
             pass
         try:
             cred = tmdb.get_credits(kind, tid)
-            # Keep top N cast small
             if cred.get("directors"): it["directors"] = cred["directors"]
             if cred.get("writers"):   it["writers"] = cred["writers"][:4]
             if cred.get("cast"):      it["cast"] = cred["cast"][:6]
@@ -199,6 +204,21 @@ def _enrich_for_scoring(items: List[Dict[str, Any]], env: Env, top_n: int = 220)
         try:
             kws = tmdb.get_keywords(kind, tid)
             if kws: it["keywords"] = kws[:20]
+        except Exception:
+            pass
+
+def _enrich_external_ids(items: List[Dict[str, Any]], top_n: int) -> None:
+    for it in _select_top(items, top_n):
+        if it.get("imdb_id"): 
+            continue
+        kind = (it.get("media_type") or "").lower()
+        tid = it.get("tmdb_id")
+        if not kind or not tid: 
+            continue
+        try:
+            ex = tmdb.get_external_ids(kind, int(tid))
+            if ex.get("imdb_id"):
+                it["imdb_id"] = ex["imdb_id"]
         except Exception:
             pass
 
@@ -226,7 +246,7 @@ def main() -> None:
 
     env = _env_from_os()
 
-    # TMDB auth check (accept key or any bearer env)
+    # TMDB auth (v3 key or any v4 token)
     if not (
         os.getenv("TMDB_API_KEY")
         or os.getenv("TMDB_BEARER")
@@ -251,8 +271,13 @@ def main() -> None:
          f"pooled={len(items)} pool_file_lines={pool_t.get('file_lines_after')} loaded_unique={pool_t.get('loaded_unique')}")
 
     discovered = int(env.get("DISCOVERED_COUNT", 0))
-    eligible = len(items)
     _safe_json_dump(run_dir / "items.discovered.json", items)
+
+    # ---------- enrich external IDs (pre-exclusion) ----------
+    try:
+        _enrich_external_ids(items, top_n=int(env.get("ENRICH_EXTERNALIDS_EXCL_TOP_N", 800)))
+    except Exception as ex:
+        _log(f"[extids-pre] FAILED: {ex!r}")
 
     # ---------- exclusions ----------
     excl_info = {"ratings_rows": 0, "public_ids": 0, "excluded_count": 0}
@@ -273,18 +298,19 @@ def main() -> None:
         seen_export["imdb_ids"] = [k for k in seen_idx.keys() if isinstance(k, str) and k.startswith("tt")]
         seen_export["title_year_keys"] = [k for k in seen_idx.keys() if "::" in k]
         _safe_json_dump(exports_dir / "seen_index.json", seen_export)
-        _log(f"[exclusions] strict filter applied: removed={excl_info['excluded_count']} "
-             f"(ratings_ids~{excl_info['ratings_rows']}, public_ids={excl_info['public_ids']})")
-        eligible = len(items)
+        _log(f"[exclusions] strict filter: removed={excl_info['excluded_count']} "
+             f"(ratings_ids~{excl_info['ratings_rows']}, public_ids_add={excl_info['public_ids']})")
     except Exception as ex:
         _log(f"[exclusions] FAILED: {ex!r}")
         traceback.print_exc()
 
-    # ---------- provider enrichment (to support service filtering) ----------
+    eligible = len(items)
+
+    # ---------- provider enrichment (pre-scoring broad) ----------
     try:
-        _enrich_top_providers(items, env, top_n=int(env.get("ENRICH_PROVIDERS_TOP_N", 220)))
+        _enrich_providers(items, env.get("REGION", "US"), top_n=int(env.get("ENRICH_PROVIDERS_TOP_N", 220)))
     except Exception as ex:
-        _log(f"[providers] enrichment failed: {ex!r}")
+        _log(f"[providers-pre] FAILED: {ex!r}")
 
     # ---------- build user profile model ----------
     profile_t = {}
@@ -302,7 +328,9 @@ def main() -> None:
 
     # ---------- enrichment for scoring (details/credits/keywords) ----------
     try:
-        _enrich_for_scoring(items, env, top_n=int(env.get("ENRICH_SCORING_TOP_N", 220)))
+        _enrich_scoring_signals(items, top_n=int(env.get("ENRICH_SCORING_TOP_N", 220)))
+        # also ensure ext-ids on the scoring set (helps later guards)
+        _enrich_external_ids(items, top_n=int(env.get("ENRICH_SCORING_TOP_N", 220)))
     except Exception as ex:
         _log(f"[scoring-enrich] FAILED: {ex!r}")
         traceback.print_exc()
@@ -310,7 +338,6 @@ def main() -> None:
     # ---------- scoring ----------
     ranked: List[Dict[str, Any]] = items
     try:
-        # let scoring load the model path via env
         env["USER_MODEL_PATH"] = model_path
         if callable(score_items):
             ranked = score_items(env, items)
@@ -323,22 +350,24 @@ def main() -> None:
         _log(f"[scoring] FAILED: {ex!r}")
         traceback.print_exc()
 
-    def _score_of(it: Dict[str, Any]) -> float:
-        try:
-            return float(it.get("score", it.get("match", 0.0)) or 0.0)
-        except Exception:
-            return 0.0
+    # ---------- post-scoring targeted enrichment (final Top K) ----------
+    final_top_n = int(env.get("ENRICH_PROVIDERS_FINAL_TOP_N", 40))
+    try:
+        _enrich_providers(ranked, env.get("REGION", "US"), top_n=final_top_n)
+        _enrich_external_ids(ranked, top_n=int(env.get("ENRICH_EXTERNALIDS_TOP_N", 60)))
+    except Exception as ex:
+        _log(f"[post-enrich] FAILED: {ex!r}")
 
-    above_cut = sum(1 for it in ranked if _score_of(it) >= 58.0)
     _safe_json_dump(run_dir / "items.enriched.json", ranked)
     _safe_json_dump(run_dir / "assistant_feed.json", ranked)
 
-    # summary scaffold (email body built later by engine.summarize)
+    # summary scaffold (email body built/updated by summarize)
     try:
-        (run_dir / "summary.md").write_text(_markdown_summary(ranked, env, top_n=25), encoding="utf-8")
+        (run_dir / "summary.md").write_text(_markdown_summary(ranked, env), encoding="utf-8")
     except Exception as ex:
         _log(f"[summary] FAILED: {ex!r}")
 
+    above_cut = sum(1 for it in ranked if float(it.get("score", 0) or 0) >= 58.0)
     _log(f" | results: discovered={discovered} eligible={eligible} above_cut={above_cut}")
 
     try:
@@ -361,6 +390,9 @@ def main() -> None:
                 "EXCLUSIONS": excl_info,
                 "PROFILE_TELEMETRY": profile_t,
                 "USER_MODEL_PATH": model_path,
+                "ENRICH_EXTERNALIDS_EXCL_TOP_N": env.get("ENRICH_EXTERNALIDS_EXCL_TOP_N"),
+                "ENRICH_EXTERNALIDS_TOP_N": env.get("ENRICH_EXTERNALIDS_TOP_N"),
+                "ENRICH_PROVIDERS_FINAL_TOP_N": env.get("ENRICH_PROVIDERS_FINAL_TOP_N"),
             },
             "discover_pages": env.get("DISCOVER_PAGE_TELEMETRY", []),
             "paths": {
@@ -371,7 +403,7 @@ def main() -> None:
                 "runner_log": str((run_dir / "runner.log").resolve()),
                 "exports_dir": str((run_dir / "exports").resolve()),
                 "seen_index_json": str((exports_dir / "seen_index.json").resolve()),
-                "user_model_json": model_path,
+                "user_model_json": str((exports_dir / "user_model.json").resolve()),
                 "profile_report": str((exports_dir / "profile_report.md").resolve()),
             },
         }
