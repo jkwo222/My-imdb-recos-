@@ -113,6 +113,7 @@ def _basic_from_result(kind: str, r: Dict[str, Any]) -> Dict[str, Any]:
         "release_date": r.get("release_date"),
         "first_air_date": r.get("first_air_date"),
         "original_language": r.get("original_language"),
+        "media_type_raw": r.get("media_type") or kind,
     }
 
 # ---------- Provider mapping ----------
@@ -129,8 +130,9 @@ _PROVIDER_MAP = {
 }
 
 def _provider_slug(name: str) -> Optional[str]:
-    if not name: return None
-    return __PROVIDER_MAP.get(name.strip().lower())
+    if not name:
+        return None
+    return _PROVIDER_MAP.get(name.strip().lower())
 
 def _extract_provider_slugs(result_block: Dict[str, Any]) -> List[str]:
     slugs: List[str] = []
@@ -290,7 +292,7 @@ def get_title_watch_providers(kind: str, tmdb_id: int, region: str = "US") -> Li
             seen.add(s); out.append(s)
     return out
 
-# ---------- NEW: search_multi ----------
+# ---------- Multi-search (used by enrichment fallback) ----------
 def search_multi(query: str, *, page: int = 1, region: str = "US") -> List[Dict[str, Any]]:
     """
     Lightweight multi search across movie/tv/person. We return only movie/tv hits,
