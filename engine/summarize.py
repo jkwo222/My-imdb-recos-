@@ -19,7 +19,7 @@ EMAIL_TOP_TV            = _int("EMAIL_TOP_TV", 10)
 EMAIL_SCORE_MIN         = _int("EMAIL_SCORE_MIN", 60)
 EMAIL_INCLUDE_TELEMETRY = _bool("EMAIL_INCLUDE_TELEMETRY", True)
 EMAIL_EXCLUDE_ANIME     = _bool("EMAIL_EXCLUDE_ANIME", True)
-EMAIL_NETWORK_FALLBACK  = _bool("EMAIL_NETWORK_FALLBACK", True)  # NEW: infer provider from TV networks if providers missing
+EMAIL_NETWORK_FALLBACK  = _bool("EMAIL_NETWORK_FALLBACK", True)
 
 LAB_NEW_MOVIE           = _bool("EMAIL_INCLUDE_NEW_MOVIE_LABEL", True)
 LAB_NEW_SEASON          = _bool("EMAIL_INCLUDE_NEW_SEASON_LABEL", True)
@@ -85,7 +85,7 @@ def _providers_for_item(it: Dict[str, Any], allowed: Iterable[str]) -> List[str]
     allowed_set = {_normalize_slug(x) for x in (allowed or [])}
     provs = it.get("providers") or it.get("providers_slugs") or []
     provs = {_normalize_slug(str(p)) for p in provs}
-    # Fallback: if no providers but TV networks imply a platform, optionally map networks -> providers
+    # Fallback via TV network names -> provider slugs
     if not provs and EMAIL_NETWORK_FALLBACK and (it.get("media_type") or "").lower() == "tv":
         for net in it.get("networks") or []:
             slug = _slugify_provider_name(str(net))
@@ -132,27 +132,45 @@ def _recency_label(it: Dict[str, Any]) -> Optional[str]:
                 return "New Season"
     return None
 
+def _fmt_runtime(it: Dict[str, Any]) -> Optional[str]:
+    # movies: runtime (mins) → "2h 04m"; tv: episode_run_time list → "45m" (first bucket)
+    if (it.get("media_type") or "").lower()=="movie":
+        try:
+            m = int(float(it.get("runtime") or 0))
+            if m <= 0: return None
+            h, mm = divmod(m, 60)
+            return (f"{h}h {mm}m" if h else f"{mm}m")
+        except Exception:
+            return None
+    else:
+        ert = it.get("episode_run_time") or []
+        try:
+            m = int(float(ert[0])) if ert else 0
+            return f"{m}m" if m > 0 else None
+        except Exception:
+            return None
+
 def _fmt_title_line(it: Dict[str, Any]) -> str:
     title=it.get("title") or it.get("name") or "Untitled"
     year =it.get("year")
     lab  =_recency_label(it)
-    bits=[f"{_media_emoji(it)} *{title}*{f' ({year})' if year else ''}"]
+    bits=[f"{_media_emoji(it)} ***{title}***{f' ({year})' if year else ''}"]
     if lab: bits.append(f"— **{lab}**")
     return " ".join(bits)
 
 def _fmt_meta_line(it: Dict[str, Any], providers: List[str]) -> str:
     match=it.get("score")
     aud=_audience_pct(it)
-    why=(it.get("why") or "").strip()
     prov_md=", ".join(f"**{p}**" for p in providers) if providers else "_Not on your services_"
+    rt=_fmt_runtime(it)
+    director = (it.get("directors") or [None])[0]
     parts=[]
     if isinstance(match,(int,float)): parts.append(f"Match {int(round(match))}")
     if isinstance(aud,int): parts.append(f"Audience {aud}")
     parts.append(prov_md)
-    out=" • ".join(parts)
-    if why:
-        out+=f"\n  - why: {why}"
-    return out
+    if rt: parts.append(rt)
+    if director: parts.append(f"Dir. {director}")
+    return " • ".join(parts)
 
 def render_email(
     ranked_items: List[Dict[str, Any]],
@@ -178,13 +196,18 @@ def render_email(
     for it in sorted(ranked_items, key=lambda x: float(x.get("score", x.get("tmdb_vote", 0.0)) or 0.0), reverse=True):
         if not _eligible(it): continue
         provs=_providers_for_item(it, allowed)
-        line=f"- {_fmt_title_line(it)}\n  {_fmt_meta_line(it, provs)}"
+        title_line=f"- {_fmt_title_line(it)}"
+        meta_line =f"  • {_fmt_meta_line(it, provs)}"
+        why=(it.get("why") or "").strip()
+        why_line = f"  • why: {why}" if why else None
+        block = [title_line, meta_line] + ([why_line] if why_line else [])
+        block_text = "\n".join(block)
         if (it.get("media_type") or "").lower()=="movie":
             if m_cnt<EMAIL_TOP_MOVIES:
-                movies.append(line); m_cnt+=1
+                movies.append(block_text); m_cnt+=1
         else:
             if s_cnt<EMAIL_TOP_TV:
-                shows.append(line); s_cnt+=1
+                shows.append(block_text); s_cnt+=1
         if m_cnt>=EMAIL_TOP_MOVIES and s_cnt>=EMAIL_TOP_TV:
             break
 
@@ -230,7 +253,6 @@ def write_email_markdown(
         ranked = json.loads(ranked_items_path.read_text(encoding="utf-8", errors="replace"))
     except Exception:
         ranked = []
-    # optional artifacts (not required by renderer but passed for future use)
     diag = None
     diag_path = run_dir / "diag.json"
     if diag_path.exists():
