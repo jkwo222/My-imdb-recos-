@@ -33,6 +33,13 @@ jobs:
       ENRICH_PROVIDERS_TOP_N: "220"
       ENRICH_SCORING_TOP_N: "220"
 
+      # search_multi() fallback tuning (optional)
+      SEARCH_MULTI_ON_EMPTY_DETAILS: "true"
+      SEARCH_MULTI_ON_MISSING_ID: "true"
+      SEARCH_MULTI_TITLE_SIM_TH: "0.62"
+      SEARCH_MULTI_YEAR_WEIGHT: "0.35"
+      SEARCH_MULTI_TYPE_BONUS: "0.25"
+
       # Profile model knobs
       AFFINITY_K: "5"
       DECAY_HALF_LIFE_DAYS: "270"
@@ -106,11 +113,11 @@ jobs:
           mkdir -p data/out data/cache
           python -m engine.runner | tee data/out/latest/runner.log
 
-      # Build digest using our summarize module (no CLI flags needed)
+      # Build digest using summarize module (exports feedback targets too)
       - name: Build digest summary (Top Movies & Top Shows)
         run: |
           python - <<'PY'
-          import os, json
+          import os
           from pathlib import Path
           from engine.summarize import write_email_markdown
           run_dir = Path("data/out/latest")
@@ -237,6 +244,7 @@ jobs:
             data/out/latest/diag.json
             data/out/latest/exports/selection_breakdown.json
             data/out/latest/exports/feedback_targets.json
+            data/out/latest/exports/user_model.json
 
       # Save caches so next run restores an ever-growing pool
       - name: Save pool/tmdb caches
