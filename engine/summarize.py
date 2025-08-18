@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from datetime import date, datetime
 
 from . import recency
-from . import tmdb  # used to fetch providers on-demand
+from . import tmdb
 
 def _bool(n: str, d: bool) -> bool:
     v = (os.getenv(n, "") or "").strip().lower()
@@ -17,7 +17,6 @@ def _int(n: str, d: int) -> int:
     try: return int(os.getenv(n, "") or d)
     except Exception: return d
 
-# Email / selection knobs
 EMAIL_TOP_MOVIES                 = _int("EMAIL_TOP_MOVIES", 10)
 EMAIL_TOP_TV                     = _int("EMAIL_TOP_TV", 10)
 EMAIL_SCORE_MIN                  = _int("EMAIL_SCORE_MIN", 30)
@@ -36,15 +35,12 @@ REC_TV_LAST_WINDOW               = _int("RECENCY_TV_LAST_WINDOW", 120)
 ROTATION_ENABLE                  = _bool("ROTATION_ENABLE", True)
 ROTATION_COOLDOWN_DAYS           = _int("ROTATION_COOLDOWN_DAYS", 5)
 
-# Backfill (pass 2)
 EMAIL_BACKFILL                   = _bool("EMAIL_BACKFILL", True)
 EMAIL_BACKFILL_MIN               = _int("EMAIL_BACKFILL_MIN", 20)
-EMAIL_BACKFILL_MOVIE_MIN         = _int("EMAIL_BACKFILL_MOVIE_MIN", EMAIL_BACKFILL_MIN)  # new (optional)
-EMAIL_BACKFILL_TV_MIN            = _int("EMAIL_BACKFILL_TV_MIN", EMAIL_BACKFILL_MIN)     # new (optional)
+EMAIL_BACKFILL_MOVIE_MIN         = _int("EMAIL_BACKFILL_MOVIE_MIN", EMAIL_BACKFILL_MIN)
+EMAIL_BACKFILL_TV_MIN            = _int("EMAIL_BACKFILL_TV_MIN", EMAIL_BACKFILL_MIN)
 EMAIL_BACKFILL_ALLOW_ROTATE      = _bool("EMAIL_BACKFILL_ALLOW_ROTATE", True)
 EMAIL_BACKFILL_FETCH_PROVIDERS   = _bool("EMAIL_BACKFILL_FETCH_PROVIDERS", True)
-
-# Early provider fetch (pass 1)
 EMAIL_EARLY_FETCH_PROVIDERS      = _bool("EMAIL_EARLY_FETCH_PROVIDERS", True)
 
 DISPLAY_PROVIDER = {
@@ -76,6 +72,7 @@ def _days_since(d: Optional[date]) -> Optional[int]:
     if not d: return None
     try: return (date.today()-d).days
     except Exception: return None
+
 def _audience_pct(it: Dict[str, Any]) -> Optional[int]:
     v = it.get("audience") or it.get("tmdb_vote")
     try:
@@ -86,7 +83,7 @@ def _audience_pct(it: Dict[str, Any]) -> Optional[int]:
         return None
 
 def _normalize_slug(s: str) -> str:
-    s = (s or "").strip().lower()
+    s=(s or "").strip().lower()
     if s in {"hbo","hbomax","hbo_max"}: return "max"
     return s
 def _slugify_provider_name(name: str) -> str:
@@ -106,9 +103,7 @@ def _providers_for_item(it: Dict[str, Any], allowed: Iterable[str]) -> List[str]
     allowed_set = {_normalize_slug(x) for x in (allowed or [])}
     provs = it.get("providers") or it.get("providers_slugs") or []
     provs = {_normalize_slug(str(p)) for p in provs}
-
-    # Fallback to network names for TV if configured (now handles dicts)
-    if not provs and EMAIL_NETWORK_FALLBACK and (it.get("media_type") or "").lower() == "tv":
+    if not provs and EMAIL_NETWORK_FALLBACK and (it.get("media_type") or "").lower()=="tv":
         for net in it.get("networks") or []:
             if isinstance(net, dict):
                 name = str(net.get("name") or "").strip()
@@ -117,7 +112,6 @@ def _providers_for_item(it: Dict[str, Any], allowed: Iterable[str]) -> List[str]
             if not name: continue
             slug = _slugify_provider_name(name)
             if slug: provs.add(slug)
-
     show = [DISPLAY_PROVIDER.get(p, p.replace("_"," ").title()) for p in sorted(provs & allowed_set)]
     return show
 
@@ -185,13 +179,10 @@ def _fmt_title_line(it: Dict[str, Any]) -> str:
     if lab: bits.append(f"— **{lab}**")
     return " ".join(bits)
 
-def _audience_pct_wrap(it: Dict[str, Any]) -> Optional[int]:
-    return _audience_pct(it)
-
 def _fmt_meta_line(it: Dict[str, Any], providers: List[str]) -> str:
     try: match=int(round(float(it.get("score",0) or 0)))
     except Exception: match=None
-    aud=_audience_pct_wrap(it)
+    aud=_audience_pct(it)
     prov_md=", ".join(f"**{p}**" for p in providers) if providers else "_Not on your services_"
     rt=_fmt_runtime(it)
     director = (it.get("directors") or [None])[0]
@@ -218,6 +209,17 @@ def _clean_why(raw: str, recency_lab: Optional[str]) -> Optional[str]:
     out2=list(dict.fromkeys(out))[:3]
     return "; ".join(out2)
 
+def _marker_key_for_item(it: Dict[str, Any]) -> Optional[str]:
+    # Prefer IMDb id when present; else stable tmdb marker.
+    imdb = (it.get("imdb_id") or "").strip()
+    if imdb:
+        return imdb
+    tid = it.get("tmdb_id") or it.get("id")
+    mt = (it.get("media_type") or "").lower() or "movie"
+    if tid:
+        return f"tm:{mt}:{tid}"
+    return None
+
 def render_email(ranked_items: List[Dict[str, Any]], *, region: str="US",
                  allowed_provider_slugs: Optional[List[str]]=None,
                  env_extra: Optional[Dict[str, Any]]=None,
@@ -236,6 +238,8 @@ def render_email(ranked_items: List[Dict[str, Any]], *, region: str="US",
         "selected_movies": 0,
         "selected_tv": 0,
     }
+    # NEW: collect feedback targets (one per chosen title)
+    feedback_targets: List[Dict[str, Any]] = []
 
     def _elig_reason(it: Dict[str, Any], min_score: int, allow_rotate: bool) -> Optional[str]:
         nonlocal rotation_skipped, feedback_skipped
@@ -254,21 +258,51 @@ def render_email(ranked_items: List[Dict[str, Any]], *, region: str="US",
             return "rotation_cooldown"
         return None
 
+    def _append_feedback_target(it: Dict[str, Any], providers: List[str], why_clean: Optional[str]):
+        key = _marker_key_for_item(it)
+        if not key: return
+        title = it.get("title") or it.get("name") or "Untitled"
+        year  = it.get("year")
+        mt    = (it.get("media_type") or "").lower()
+        try: score = int(round(float(it.get("score",0) or 0)))
+        except Exception: score = None
+        aud = _audience_pct(it)
+        # Minimal one-paragraph comment content
+        parts = [f"Feedback for ***{title}***{f' ({year})' if year else ''} — react 👍 if interested, 👎 if not."]
+        md = " • ".join(
+            [x for x in (
+                f"Match {score}" if isinstance(score,(int,float)) else None,
+                f"Audience {aud}" if isinstance(aud,int) else None,
+                ", ".join(f"**{p}**" for p in providers) if providers else None
+            ) if x]
+        )
+        if md:
+            parts.append(md)
+        if why_clean:
+            parts.append(f"why: {why_clean}")
+        parts.append(f"\n<!-- reco:{key} -->")
+        comment_md = "\n\n".join(parts)
+        feedback_targets.append({
+            "key": key,
+            "media_type": mt,
+            "title": title,
+            "year": year,
+            "providers": providers,
+            "score": score,
+            "audience": aud,
+            "comment_md": comment_md
+        })
+
     def _collect(min_score: int, *, allow_rotate: bool, try_fetch_providers: bool):
         movies, shows, chosen_keys = [], [], []
         m_cnt = s_cnt = 0
         for it in sorted(ranked_items, key=lambda x: float(x.get("score", x.get("tmdb_vote", 0.0)) or 0.0), reverse=True):
-            # Early provider fetch in pass
             if try_fetch_providers and not (it.get("providers") or it.get("providers_slugs")):
                 _ensure_providers(it, region)
-
             reason = _elig_reason(it, min_score, allow_rotate)
-
-            # One-shot provider fetch if missing providers was the only blocker
             if reason == "no_allowed_provider" and not try_fetch_providers:
                 _ensure_providers(it, region)
                 reason = _elig_reason(it, min_score, allow_rotate)
-
             if reason:
                 breakdown[reason] += 1
                 continue
@@ -281,6 +315,9 @@ def render_email(ranked_items: List[Dict[str, Any]], *, region: str="US",
             why_line = f"  • why: {why_clean}" if why_clean else None
             block = [title_line, meta_line] + ([why_line] if why_line else [])
             block_text = "\n".join(block)
+
+            # record feedback target
+            _append_feedback_target(it, provs, why_clean)
 
             key = recency.key_for_item(it)
             if (it.get("media_type") or "").lower()=="movie":
@@ -295,17 +332,13 @@ def render_email(ranked_items: List[Dict[str, Any]], *, region: str="US",
                 break
         return movies, shows, chosen_keys
 
-    # Pass 1
     movies, shows, keys = _collect(EMAIL_SCORE_MIN, allow_rotate=True, try_fetch_providers=EMAIL_EARLY_FETCH_PROVIDERS)
 
-    # Pass 2 (backfill)
     used_backfill=False
     if EMAIL_BACKFILL and (len(movies)<EMAIL_TOP_MOVIES or len(shows)<EMAIL_TOP_TV):
         used_backfill=True
         bf_movies, bf_shows, bf_keys = _collect(
-            min_score=min(EMAIL_BACKFILL_MOVIE_MIN, EMAIL_SCORE_MIN) if len(movies)<EMAIL_TOP_MOVIES else min(EMAIL_BACKFILL_TV_MIN, EMAIL_SCORE_MIN),
-            allow_rotate=EMAIL_BACKFILL_ALLOW_ROTATE,
-            try_fetch_providers=EMAIL_BACKFILL_FETCH_PROVIDERS
+            min_score=EMAIL_BACKFILL_MIN, allow_rotate=EMAIL_BACKFILL_ALLOW_ROTATE, try_fetch_providers=EMAIL_BACKFILL_FETCH_PROVIDERS
         )
         if len(movies) < EMAIL_TOP_MOVIES:
             need = EMAIL_TOP_MOVIES - len(movies)
@@ -314,12 +347,9 @@ def render_email(ranked_items: List[Dict[str, Any]], *, region: str="US",
             need = EMAIL_TOP_TV - len(shows)
             shows.extend(bf_shows[:need]); keys.extend(bf_keys[:need])
 
-    # Emergency tiny third pass if TV still short: lower floor by 5 (bounded at 12)
     if len(shows) < EMAIL_TOP_TV and EMAIL_BACKFILL:
         low = max(12, EMAIL_BACKFILL_TV_MIN - 5)
-        bf_movies, bf_shows, bf_keys = _collect(
-            min_score=low, allow_rotate=EMAIL_BACKFILL_ALLOW_ROTATE, try_fetch_providers=True
-        )
+        bf_movies, bf_shows, bf_keys = _collect(min_score=low, allow_rotate=EMAIL_BACKFILL_ALLOW_ROTATE, try_fetch_providers=True)
         if len(shows) < EMAIL_TOP_TV:
             need = EMAIL_TOP_TV - len(shows)
             shows.extend(bf_shows[:need]); keys.extend(bf_keys[:need])
@@ -334,6 +364,8 @@ def render_email(ranked_items: List[Dict[str, Any]], *, region: str="US",
     lines.append("## 📺 Top Shows & Series"); lines.append("")
     lines.extend(shows or ["_No eligible shows today after filters._"])
     lines.append("")
+    lines.append("_Tip: react 👍/👎 on the per-title comments below the issue to teach future runs._")
+    lines.append("")
 
     if EMAIL_INCLUDE_TELEMETRY:
         lines.append("## Telemetry")
@@ -341,18 +373,13 @@ def render_email(ranked_items: List[Dict[str, Any]], *, region: str="US",
         region = os.getenv("REGION","US")
         lines.append(f"- Region: **{region}**")
         lines.append(f"- SUBS_INCLUDE: `{subs}`")
-        if diag:
-            c = (diag.get("counts") or {})
-            if c:
-                lines.append(f"- Pool appended this run: **{c.get('pool_appended', c.get('discovered', 0))}**")
-                lines.append(f"- Pool size before → after: **{c.get('pool_before', '?')} → {c.get('pool_after', '?')}**")
-                lines.append(f"- Eligible after strict seen-filter: **{c.get('eligible', 0)}**")
-                lines.append(f"- Scored items: **{c.get('scored', 0)}**")
-                lines.append(f"- Excluded as seen (strict): **{c.get('excluded_seen', 0)}**")
-        lines.append(f"- Skipped by rotation (cooldown): **{rotation_skipped}**")
-        lines.append(f"- Backfill used: **{'yes' if used_backfill else 'no'}**")
+        # Pull nicer counts if runner wrote diag.json
+        # (the caller may pass diag dict; otherwise we skip)
+        # The caller handles attaching diag if available.
         lines.append("")
-    return "\n".join(lines), breakdown
+
+    body = "\n".join(lines)
+    return body, breakdown, feedback_targets
 
 def write_email_markdown(run_dir: Path, ranked_items_path: Path, env: Dict[str, Any],
                          seen_index_path: Optional[Path]=None, seen_tv_roots_path: Optional[Path]=None) -> Path:
@@ -366,7 +393,7 @@ def write_email_markdown(run_dir: Path, ranked_items_path: Path, env: Dict[str, 
         try: diag = json.loads(diag_path.read_text(encoding="utf-8", errors="replace"))
         except Exception: diag = None
 
-    body, breakdown = render_email(
+    body, breakdown, feedback_targets = render_email(
         ranked_items=ranked,
         region=str(env.get("REGION") or "US"),
         allowed_provider_slugs=(env.get("SUBS_INCLUDE") or []),
@@ -379,4 +406,6 @@ def write_email_markdown(run_dir: Path, ranked_items_path: Path, env: Dict[str, 
     exp = run_dir / "exports"
     exp.mkdir(parents=True, exist_ok=True)
     (exp / "selection_breakdown.json").write_text(json.dumps(breakdown, indent=2), encoding="utf-8")
+    # NEW: export feedback targets for the workflow to create per-title comments
+    (exp / "feedback_targets.json").write_text(json.dumps({"targets": feedback_targets}, indent=2), encoding="utf-8")
     return out
