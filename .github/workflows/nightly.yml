@@ -19,7 +19,18 @@ jobs:
       ORIGINAL_LANGS: '["en"]'
       # Only list the services you actually have
       SUBS_INCLUDE: apple_tv_plus,netflix,max,paramount_plus,disney_plus,peacock,hulu
-      DISCOVER_PAGES: "12"
+      DISCOVER_PAGES: "16"                # can tune; more pages => more growth
+
+      # >>> Rotating discovery (new) <<<
+      DISCOVER_PAGING_MODE: "rolling"     # first | rolling | random
+      DISCOVER_PAGE_MAX: "200"
+
+      # >>> IMDb TSV ingest (new) <<<
+      IMDB_TSV_ENABLE: "true"
+      IMDB_TSV_RECENT_YEARS: "2000"
+      IMDB_TSV_MIN_VOTES: "5000"
+      IMDB_TSV_MAX_TITLES: "150000"
+      IMDB_TSV_MAX_MAP: "2000"
 
       # TMDB auth (runner accepts either v3 or v4)
       TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
@@ -31,14 +42,14 @@ jobs:
 
       # Enrichment knobs
       ENRICH_PROVIDERS_TOP_N: "220"
-      ENRICH_SCORING_TOP_N: "260"                # richer details/credits/keywords
-      ENRICH_EXTERNALIDS_EXCL_TOP_N: "800"       # ext-ids before exclusions
-      ENRICH_PROVIDERS_FINAL_TOP_N: "50"         # providers for final Top K
-      ENRICH_EXTERNALIDS_TOP_N: "60"             # ext-ids for final Top K
+      ENRICH_SCORING_TOP_N: "260"
+      ENRICH_EXTERNALIDS_EXCL_TOP_N: "800"
+      ENRICH_PROVIDERS_FINAL_TOP_N: "50"
+      ENRICH_EXTERNALIDS_TOP_N: "60"
 
       # Profile model knobs
-      AFFINITY_K: "5"                  # shrinkage
-      DECAY_HALF_LIFE_DAYS: "270"      # taste recency
+      AFFINITY_K: "5"
+      DECAY_HALF_LIFE_DAYS: "270"
 
       # Scoring blend knobs
       AUDIENCE_PRIOR_LAMBDA: "0.3"
@@ -48,11 +59,12 @@ jobs:
       PENALIZE_KIDS: "true"
       PENALIZE_ANIME: "true"
       KIDS_CARTOON_PENALTY: "25"
-      ANIME_PENALTY: "20"
+      ANIME_PENALTY: "35"                  # slightly stronger to keep anime out of email
 
-      # TV commitment penalty
+      # TV commitment penalty (smarter thresholds)
       COMMITMENT_ENABLED: "true"
-      COMMITMENT_SEASONS_THRESHOLD: "4"
+      COMMITMENT_UNSEEN_THRESHOLD: "1"     # start penalizing after S1 if you haven't watched it
+      COMMITMENT_SEEN_THRESHOLD: "4"       # be kinder on shows you already follow
       COMMITMENT_SEASON_PENALTY: "3"
       COMMITMENT_MAX_PENALTY: "18"
 
@@ -69,7 +81,7 @@ jobs:
       # Email layout & gating (split 10/10 + telemetry + labels; hide anime in email)
       EMAIL_TOP_MOVIES: "10"
       EMAIL_TOP_TV: "10"
-      EMAIL_SCORE_MIN: "60"
+      EMAIL_SCORE_MIN: "62"
       EMAIL_INCLUDE_TELEMETRY: "true"
       EMAIL_EXCLUDE_ANIME: "true"
       EMAIL_INCLUDE_NEW_MOVIE_LABEL: "true"
@@ -79,9 +91,9 @@ jobs:
       # Optional @mention for notifications
       NOTIFY_USER: ${{ vars.NOTIFY_USER }}
 
-      # Cache version for pool (bump to invalidate)
+      # Pool growth & caching
       POOL_CACHE_VERSION: v1
-      POOL_MAX_ITEMS: "20000"
+      POOL_MAX_ITEMS: "50000"
 
     steps:
       - name: Check out repository
