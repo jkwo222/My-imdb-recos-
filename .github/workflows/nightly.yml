@@ -2,7 +2,7 @@ name: nightly
 
 on:
   schedule:
-    - cron: '30 7 * * *'   # 07:30 UTC (3:30am ET)
+    - cron: '30 7 * * *'   # 07:30 UTC (2:30/3:30am ET seasonally)
   workflow_dispatch:
 
 permissions:
@@ -14,86 +14,107 @@ jobs:
     runs-on: ubuntu-24.04
 
     env:
-      # Core config
+      # -------- Core discovery / region --------
       REGION: US
       ORIGINAL_LANGS: '["en"]'
-      # Only list the services you actually have
       SUBS_INCLUDE: apple_tv_plus,netflix,max,paramount_plus,disney_plus,peacock,hulu
-      DISCOVER_PAGES: "16"                # can tune; more pages => more growth
-
-      # >>> Rotating discovery (new) <<<
-      DISCOVER_PAGING_MODE: "rolling"     # first | rolling | random
+      DISCOVER_PAGES: "12"
+      DISCOVER_PAGING_MODE: rolling        # rolling | random
       DISCOVER_PAGE_MAX: "200"
 
-      # >>> IMDb TSV ingest (new) <<<
-      IMDB_TSV_ENABLE: "true"
-      IMDB_TSV_RECENT_YEARS: "2000"
-      IMDB_TSV_MIN_VOTES: "5000"
-      IMDB_TSV_MAX_TITLES: "150000"
-      IMDB_TSV_MAX_MAP: "2000"
-
-      # TMDB auth (runner accepts either v3 or v4)
+      # -------- TMDB / IMDb auth --------
       TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
       TMDB_BEARER:  ${{ secrets.TMDB_ACCESS_TOKEN }}
-
-      # IMDb (CSV expected at data/user/ratings.csv)
       IMDB_USER_ID: ${{ secrets.IMDB_USER_ID }}
-      IMDB_PUBLIC_MAX_PAGES: "10"
+      IMDB_PUBLIC_URL: "https://www.imdb.com/user/${{ secrets.IMDB_USER_ID }}/ratings?sort=date_added%2Cdesc&mode=detail"
+      IMDB_PUBLIC_MAX_PAGES: "8"
+      IMDB_PUBLIC_CACHE_TTL_SECONDS: "604800"      # 7 days
+      IMDB_PUBLIC_FORCE_REFRESH: "false"
 
-      # Enrichment knobs
+      # -------- Caches (ensure true pool growth) --------
+      POOL_CACHE_VERSION: v1
+      POOL_MAX_ITEMS: "20000"
+      POOL_PRUNE_AT: "0"
+      POOL_PRUNE_KEEP: "0"
+
+      # -------- Enrichment knobs --------
       ENRICH_PROVIDERS_TOP_N: "220"
       ENRICH_SCORING_TOP_N: "260"
       ENRICH_EXTERNALIDS_EXCL_TOP_N: "800"
-      ENRICH_PROVIDERS_FINAL_TOP_N: "50"
       ENRICH_EXTERNALIDS_TOP_N: "60"
+      ENRICH_PROVIDERS_FINAL_TOP_N: "400"
 
-      # Profile model knobs
+      # -------- IMDb scraping (with cache) --------
+      IMDB_SCRAPE_ENABLE: "true"
+      IMDB_SCRAPE_TOP_N: "120"
+      IMDB_SCRAPE_KEYWORDS_TOP_N: "80"
+      IMDB_SCRAPE_KEYWORDS_MAX: "30"
+      IMDB_SCRAPE_CACHE_DIR: data/cache/imdb
+      IMDB_SCRAPE_CACHE_TTL_SECONDS: "1209600"     # 14 days
+
+      # -------- Profile model & scoring --------
       AFFINITY_K: "5"
       DECAY_HALF_LIFE_DAYS: "270"
-
-      # Scoring blend knobs
       AUDIENCE_PRIOR_LAMBDA: "0.3"
       PROVIDER_PREF_LAMBDA: "0.5"
+
+      # People weights (director boost reduced)
+      ACTOR_WEIGHT: "2.2"
+      DIRECTOR_WEIGHT: "1.0"
+      WRITER_WEIGHT: "0.8"
+      GENRE_WEIGHT: "0.9"
+      KEYWORD_WEIGHT: "0.25"
 
       # Anime / Kids penalties
       PENALIZE_KIDS: "true"
       PENALIZE_ANIME: "true"
       KIDS_CARTOON_PENALTY: "25"
-      ANIME_PENALTY: "35"                  # slightly stronger to keep anime out of email
+      ANIME_PENALTY: "20"
+      KIDS_MOVIE_MIN_RUNTIME: "70"
 
-      # TV commitment penalty (smarter thresholds)
+      # Romance & old/B&W penalties
+      ROMANCE_PENALTY: "12"
+      ROMCOM_PENALTY: "16"
+      OLD_CONTENT_YEAR_CUTOFF: "1984"
+      OLD_CONTENT_PENALTY: "18"
+      BLACK_WHITE_PENALTY: "22"
+
+      # TV commitment penalties
       COMMITMENT_ENABLED: "true"
-      COMMITMENT_UNSEEN_THRESHOLD: "1"     # start penalizing after S1 if you haven't watched it
-      COMMITMENT_SEEN_THRESHOLD: "4"       # be kinder on shows you already follow
-      COMMITMENT_SEASON_PENALTY: "3"
-      COMMITMENT_MAX_PENALTY: "18"
+      COMMITMENT_UNSEEN_THRESHOLD: "1"   # start penalizing after S1 if you haven't seen it
+      COMMITMENT_SEEN_THRESHOLD: "4"     # gentler if you already follow it
+      COMMITMENT_SEASON_PENALTY: "3.0"
+      COMMITMENT_MAX_PENALTY: "18.0"
 
-      # Recency boosts
+      # Recency windows (used for labels & bonus)
       RECENCY_MOVIE_WINDOW_DAYS: "270"
-      RECENCY_MOVIE_BONUS_MAX: "10"
       RECENCY_TV_FIRST_WINDOW: "180"
-      RECENCY_TV_FIRST_BONUS_MAX: "8"
       RECENCY_TV_LAST_WINDOW: "120"
-      RECENCY_TV_LAST_BONUS_MAX: "10"
-      RECENCY_TV_FOLLOWUP_BONUS_MAX: "6"
-      RECENCY_PROVIDER_MULTIPLIER: "1.15"
+      RECENCY_MOVIE_BONUS_MAX: "10.0"
+      RECENCY_TV_FIRST_BONUS_MAX: "8.0"
+      RECENCY_TV_LAST_BONUS_MAX: "7.0"
 
-      # Email layout & gating (split 10/10 + telemetry + labels; hide anime in email)
+      # Email layout & gating
       EMAIL_TOP_MOVIES: "10"
       EMAIL_TOP_TV: "10"
-      EMAIL_SCORE_MIN: "62"
+      EMAIL_SCORE_MIN: "60"
       EMAIL_INCLUDE_TELEMETRY: "true"
       EMAIL_EXCLUDE_ANIME: "true"
+      EMAIL_NETWORK_FALLBACK: "true"
       EMAIL_INCLUDE_NEW_MOVIE_LABEL: "true"
-      EMAIL_INCLUDE_NEW_SEASON_LABEL: "true"
       EMAIL_INCLUDE_NEW_SERIES_LABEL: "true"
+      EMAIL_INCLUDE_NEW_SEASON_LABEL: "true"
 
-      # Optional @mention for notifications
+      # Rotation (cooldown) in email selection
+      ROTATION_ENABLE: "true"
+      ROTATION_COOLDOWN_DAYS: "5"
+      ROTATION_EXEMPT_SCORE: "90"
+
+      # Optional @mention on the daily issue comment
       NOTIFY_USER: ${{ vars.NOTIFY_USER }}
 
-      # Pool growth & caching
-      POOL_CACHE_VERSION: v1
-      POOL_MAX_ITEMS: "50000"
+      # Per-title feedback comments (toggle)
+      POST_PER_TITLE_FEEDBACK: "true"
 
     steps:
       - name: Check out repository
@@ -109,40 +130,198 @@ jobs:
           python -m pip install -U pip
           pip install -r requirements.txt
 
-      # Restore persistent caches so the pool truly grows
-      - name: Restore pool/tmdb caches
+      # Restore persistent caches so the pool truly grows + reuse IMDb/TMDB caches
+      - name: Restore caches
         id: cache-restore
         uses: actions/cache/restore@v4
         with:
           path: |
             data/cache/pool
             data/cache/tmdb
+            data/cache/imdb
+            data/cache/imdb_user
+            data/cache/rotation
           key: pool-${{ runner.os }}-${{ env.REGION }}-${{ env.POOL_CACHE_VERSION }}-${{ github.run_id }}
           restore-keys: |
             pool-${{ runner.os }}-${{ env.REGION }}-${{ env.POOL_CACHE_VERSION }}-
-
-      - name: Ensure debug scripts executable
-        run: |
-          chmod +x ./.github/scripts/make_debug_bundle.sh || true
-          chmod +x ./.github/scripts/collect_diag.py || true
 
       - name: Run engine
         run: |
           mkdir -p data/out data/cache
           python -m engine.runner
 
-      - name: Make debug bundle (full + compact snapshot)
-        run: bash ./.github/scripts/make_debug_bundle.sh
+      # (runner already writes summary.md) — no extra summarize step needed
 
-      - name: Upload compact debug snapshot
+      - name: Make debug bundle
+        run: |
+          chmod +x ./.github/scripts/make_debug_bundle.sh || true
+          bash ./.github/scripts/make_debug_bundle.sh
+
+      # Export the exact picks we’ll ask feedback for (10 movies + 10 shows)
+      - name: Export picks for feedback (picks.json)
+        run: |
+          python - <<'PY'
+          import os, json, re, math, pathlib
+          from datetime import date
+          p = pathlib.Path("data/out/latest/items.enriched.json")
+          if not p.exists():
+              raise SystemExit(0)
+          items = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+          def normslug(s): 
+              s=(s or "").strip().lower()
+              return "max" if s in {"hbomax","hbo max","hbo","hbo_max","max"} else s
+          allowed = {normslug(x) for x in (os.getenv("SUBS_INCLUDE","").split(",") if os.getenv("SUBS_INCLUDE") else [])}
+          score_min = float(os.getenv("EMAIL_SCORE_MIN","60") or 60)
+          def is_anime(it):
+              lang=(it.get("original_language") or "").lower()
+              genres=[]
+              for g in (it.get("genres") or it.get("tmdb_genres") or []):
+                  if isinstance(g, dict) and g.get("name"): genres.append(g["name"].lower())
+                  elif isinstance(g, str): genres.append(g.lower())
+              title=(it.get("title") or it.get("name") or "").lower()
+              if "anime" in genres: return True
+              if "animation" in genres and lang=="ja": return True
+              if any(k in title for k in ("one piece","dandadan","dragon ball","naruto","jujutsu kaisen","attack on titan","my hero academia","chainsaw man","spy x family")):
+                  return True
+              return False
+          def providers_ok(it):
+              provs = [normslug(str(p)) for p in (it.get("providers") or it.get("providers_slugs") or [])]
+              return bool(set(provs) & allowed)
+          ranked = sorted(items, key=lambda x: float(x.get("score", x.get("tmdb_vote", x.get("popularity", 0.0))) or 0.0), reverse=True)
+          sel_movies=[]; sel_tv=[]
+          for it in ranked:
+              try: sc = float(it.get("score",0) or 0)
+              except: sc = 0.0
+              if sc < score_min: continue
+              if is_anime(it): continue
+              if not providers_ok(it): continue
+              pick = {
+                  "title": it.get("title") or it.get("name"),
+                  "year": it.get("year"),
+                  "media_type": (it.get("media_type") or "").lower(),
+                  "score": sc,
+                  "providers": list(set([normslug(str(p)) for p in (it.get("providers") or it.get("providers_slugs") or [])])),
+                  "imdb_id": it.get("imdb_id"),
+                  "tmdb_id": it.get("tmdb_id"),
+              }
+              if pick["media_type"]=="movie" and len(sel_movies)<int(os.getenv("EMAIL_TOP_MOVIES","10")):
+                  sel_movies.append(pick)
+              elif pick["media_type"]=="tv" and len(sel_tv)<int(os.getenv("EMAIL_TOP_TV","10")):
+                  sel_tv.append(pick)
+              if len(sel_movies)>=int(os.getenv("EMAIL_TOP_MOVIES","10")) and len(sel_tv)>=int(os.getenv("EMAIL_TOP_TV","10")):
+                  break
+          out = {"movies": sel_movies, "tv": sel_tv}
+          outp = pathlib.Path("data/out/latest/picks.json")
+          outp.parent.mkdir(parents=True, exist_ok=True)
+          outp.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+          PY
+
+      - name: Post/update Daily Recommendations issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const title = 'Daily Recommendations';
+            let body = '';
+            try { body = fs.readFileSync('data/out/latest/summary.md', 'utf8'); }
+            catch { body = 'No summary.md found. Check debug bundle.'; }
+
+            // Find or create issue
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: 'daily-recos', per_page: 100
+            });
+            let issue = issues.find(i => i.title === title);
+            if (!issue) {
+              issue = (await github.rest.issues.create({ owner, repo, title, body, labels: ['daily-recos'] })).data;
+            } else {
+              await github.rest.issues.update({ owner, repo, issue_number: issue.number, body });
+            }
+
+            // Add a daily comment with the digest too (optional; keeps email-like thread)
+            const mention = process.env.NOTIFY_USER ? ` cc @${process.env.NOTIFY_USER}` : '';
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: issue.number,
+              body: `Daily digest posted.${mention}\n\n` + body
+            });
+
+            core.setOutput('issue_number', issue.number);
+
+      - name: Post per-title feedback comments (👍/👎)
+        if: env.POST_PER_TITLE_FEEDBACK == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const title = 'Daily Recommendations';
+            // read picks
+            let picks;
+            try { picks = JSON.parse(fs.readFileSync('data/out/latest/picks.json', 'utf8')); }
+            catch { return core.info('No picks.json; skipping per-title feedback comments'); }
+
+            // find issue
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: 'daily-recos', per_page: 100
+            });
+            const issue = issues.find(i => i.title === title);
+            if (!issue) { return core.warning('Daily Recommendations issue not found'); }
+
+            // fetch existing comments to upsert by marker
+            const all = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: issue.number, per_page: 100
+            });
+
+            const indexByMarker = new Map();
+            for (const c of all) {
+              const m = /<!--\s*reco:([^\s>]+)\s*-->/.exec(c.body || '');
+              if (m) indexByMarker.set(m[1], c);
+            }
+
+            function markerFor(p) {
+              return p.imdb_id && p.imdb_id.startsWith('tt') ? p.imdb_id : (p.tmdb_id ? `tm:${p.tmdb_id}` : null);
+            }
+            function providerName(slug) {
+              const map = { max: 'HBO Max', netflix: 'Netflix', paramount_plus: 'Paramount+', disney_plus: 'Disney+', apple_tv_plus: 'Apple TV+', peacock: 'Peacock', hulu: 'Hulu', prime_video: 'Prime Video' };
+              return map[slug] || (slug ? slug.replace(/_/g,' ').replace(/\b\w/g, c=>c.toUpperCase()) : '');
+            }
+
+            const sections = [['movies', 'Movie'], ['tv', 'Series']];
+            for (const [key, label] of sections) {
+              for (const p of (picks[key] || [])) {
+                const marker = markerFor(p);
+                if (!marker) continue;
+                const provs = (p.providers || []).map(providerName).filter(Boolean);
+                const body = [
+                  `**${p.title}**${p.year ? ` (${p.year})` : ''} — _${label}_`,
+                  provs.length ? `**On:** ${provs.join(', ')}` : '',
+                  `**Score:** ${Math.round(p.score)}`,
+                  '',
+                  `React to this comment to record feedback: 👍 interested • 👎 not for me`,
+                  '',
+                  `<!-- reco:${marker} -->`
+                ].filter(Boolean).join('\n');
+
+                const existing = indexByMarker.get(marker);
+                if (!existing) {
+                  await github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body });
+                } else {
+                  // update if content changed
+                  if ((existing.body || '').trim() !== body.trim()) {
+                    await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+                  }
+                }
+              }
+            }
+
+      - name: Upload debug bundle
         uses: actions/upload-artifact@v4
         with:
-          name: debug-snapshot
-          path: debug-snapshot.zip
+          name: debug-data
+          path: debug-data.zip
           if-no-files-found: warn
-
-      - name: Create repo snapshot (current code)
-        run: git archive -o repo-snapshot.zip HEAD
 
       - name: Upload repo snapshot
         uses: actions/upload-artifact@v4
@@ -151,14 +330,7 @@ jobs:
           path: repo-snapshot.zip
           if-no-files-found: warn
 
-      - name: Upload full debug bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-data
-          path: debug-data.zip
-          if-no-files-found: warn
-
-      - name: Upload latest outputs (convenience)
+      - name: Upload latest outputs
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -171,41 +343,17 @@ jobs:
             data/out/latest/items.enriched.json
             data/out/latest/summary.md
             data/out/latest/diag.json
-
-      - name: Post/update Daily Recommendations issue + comment
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const title = 'Daily Recommendations';
-            let body = '';
-            try { body = fs.readFileSync('data/out/latest/summary.md', 'utf8'); }
-            catch { body = 'No summary.md found. Check debug snapshot/bundle.'; }
-
-            const { data: issues } = await github.rest.issues.listForRepo({
-              owner, repo, state: 'open', labels: 'daily-recos', per_page: 100
-            });
-            let issue = issues.find(i => i.title === title);
-            if (!issue) {
-              issue = (await github.rest.issues.create({ owner, repo, title, body, labels: ['daily-recos'] })).data;
-            } else {
-              await github.rest.issues.update({ owner, repo, issue_number: issue.number, body });
-            }
-
-            const mention = process.env.NOTIFY_USER ? ` cc @${process.env.NOTIFY_USER}` : '';
-            await github.rest.issues.createComment({
-              owner, repo, issue_number: issue.number,
-              body: `Daily digest posted.${mention}\n\n` + body
-            });
+            data/out/latest/picks.json
 
       # Save caches so next run restores an ever-growing pool
-      - name: Save pool/tmdb caches
+      - name: Save caches
         if: always()
         uses: actions/cache/save@v4
         with:
           path: |
             data/cache/pool
             data/cache/tmdb
+            data/cache/imdb
+            data/cache/imdb_user
+            data/cache/rotation
           key: pool-${{ runner.os }}-${{ env.REGION }}-${{ env.POOL_CACHE_VERSION }}-${{ github.run_id }}
