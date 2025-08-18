@@ -1,314 +1,243 @@
 # engine/summarize.py
 from __future__ import annotations
-import argparse
-import csv
-import json
+import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
+from datetime import date, datetime
+import json
+import re
 
-ALLOWED_SUBS = {
-    "apple_tv_plus", "netflix", "max", "paramount_plus",
-    "disney_plus", "peacock", "hulu",
-}
+# ============= Env toggles (with sane defaults) =============
+def _bool(name: str, default: bool) -> bool:
+    v = (os.getenv(name, "") or "").strip().lower()
+    if v in {"1", "true", "yes", "on"}: return True
+    if v in {"0", "false", "no", "off"}: return False
+    return default
 
-FRIENDLY = {
-    "apple_tv_plus": "Apple TV+",
+def _int(name: str, default: int) -> int:
+    try:
+        val = os.getenv(name, "")
+        return int(val) if val else default
+    except Exception:
+        return default
+
+EMAIL_TOPK                 = _int("EMAIL_TOPK", 10)
+EMAIL_SCORE_MIN            = _int("EMAIL_SCORE_MIN", 60)
+
+# recency labeling (labels shown inline in title line)
+EMAIL_LABEL_NEW_MOVIE      = _bool("EMAIL_INCLUDE_NEW_MOVIE_LABEL", True)
+EMAIL_LABEL_NEW_SEASON     = _bool("EMAIL_INCLUDE_NEW_SEASON_LABEL", True)
+EMAIL_LABEL_NEW_SERIES     = _bool("EMAIL_INCLUDE_NEW_SERIES_LABEL", False)  # optional
+
+# windows are shared with scoring but we keep local defaults too
+REC_MOVIE_WINDOW_DAYS      = _int("RECENCY_MOVIE_WINDOW_DAYS", 270)   # ~9 months
+REC_TV_FIRST_WINDOW        = _int("RECENCY_TV_FIRST_WINDOW", 180)     # new series window
+REC_TV_LAST_WINDOW         = _int("RECENCY_TV_LAST_WINDOW", 120)      # new season window
+
+# ============= Provider name formatting =============
+DISPLAY_PROVIDER = {
     "netflix": "Netflix",
     "max": "Max",
     "paramount_plus": "Paramount+",
     "disney_plus": "Disney+",
+    "apple_tv_plus": "Apple TV+",
     "peacock": "Peacock",
     "hulu": "Hulu",
-    # extra slugs
     "prime_video": "Prime Video",
 }
 
-def _load_json(p: Optional[Path]) -> Any:
-    if not p:
-        return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8", errors="replace"))
-    except Exception:
-        return None
-
-def _as_list(x) -> List[str]:
-    if x is None:
-        return []
-    if isinstance(x, list):
-        return [str(v) for v in x]
-    if isinstance(x, str):
-        return [s.strip() for s in x.split(",") if s.strip()]
-    return [str(x)]
-
 def _normalize_slug(s: str) -> str:
     s = (s or "").strip().lower()
-    if s in {"hbo_max", "hbomax", "hbo"}:
-        return "max"
+    if s in {"hbo", "hbo_max", "hbomax"}: return "max"
     return s
 
-def _score(it: Dict[str, Any]) -> float:
-    try:
-        return float(it.get("match", it.get("score", 0.0)) or 0.0)
-    except Exception:
-        return 0.0
+# ============= Helpers =============
+_NON = re.compile(r"[^a-z0-9]+")
 
-def _aud_0_100(it: Dict[str, Any]) -> float:
-    for k in ("audience", "tmdb_vote"):
-        v = it.get(k)
+def _norm_title(s: str) -> str:
+    return _NON.sub(" ", (s or "").strip().lower()).strip()
+
+def _parse_ymd(s: Optional[str]) -> Optional[date]:
+    if not s: return None
+    s = s.strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
         try:
-            f = float(v)
+            return datetime.strptime(s, fmt).date()
         except Exception:
-            continue
-        if f <= 10.0:
-            f *= 10.0
-        return max(0.0, min(100.0, f))
-    return 50.0
-
-def _providers_slugs(it: Dict[str, Any]) -> List[str]:
-    p = it.get("providers") or it.get("providers_slugs") or []
-    return [s for s in p if isinstance(s, str)]
-
-def _allowed_from_env(diag_env: Dict[str, Any]) -> List[str]:
-    subs = [_normalize_slug(s) for s in _as_list(diag_env.get("SUBS_INCLUDE"))]
-    if not subs:
-        subs = list(ALLOWED_SUBS)
-    allowed = [s for s in subs if s in ALLOWED_SUBS]
-    return allowed or list(ALLOWED_SUBS)
-
-def _eligible_item(it: Dict[str, Any], allowed: List[str]) -> bool:
-    provs = [_normalize_slug(p) for p in _providers_slugs(it)]
-    if not provs:
-        return False
-    allowed_set = set(allowed)
-    return any(p in allowed_set for p in provs)
-
-def _fmt_providers_bold(it: Dict[str, Any], allowed: List[str], maxn: int = 3) -> Optional[str]:
-    provs = [_normalize_slug(p) for p in _providers_slugs(it)]
-    if not provs:
-        return None
-    kept = [p for p in provs if p in set(allowed)]
-    if not kept:
-        return None
-    names = [FRIENDLY.get(p, " ".join(w.capitalize() for w in p.split("_"))) for p in kept]
-    names = [f"**{n}**" for n in names]
-    short = names[:maxn]
-    return ", ".join(short) + ("…" if len(names) > maxn else "")
-
-def _imdb_link(it: Dict[str, Any]) -> Optional[str]:
-    imdb = it.get("imdb_id")
-    return f"https://www.imdb.com/title/{imdb}/" if isinstance(imdb, str) and imdb else None
-
-def _tmdb_link(it: Dict[str, Any]) -> Optional[str]:
-    tid = it.get("tmdb_id")
-    kind = (it.get("media_type") or "").lower()
-    if not tid or not kind:
-        return None
-    try:
-        tid = int(tid)
-    except Exception:
-        return None
-    return f"https://www.themoviedb.org/{'movie' if kind=='movie' else 'tv'}/{tid}"
-
-def _emoji_for_kind(kind: str) -> str:
-    return "🍿" if (kind or "").lower() == "movie" else "📺"
-
-def _pick_top(items: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
-    return sorted(items, key=_score, reverse=True)[:n]
-
-# ---- FINAL GUARD: consult exported seen_index.json ---------------------------
-
-def _load_seen_guard(diag: Dict[str, Any]) -> Dict[str, set]:
-    paths = (diag or {}).get("paths", {}) if isinstance(diag, dict) else {}
-    exp = paths.get("seen_index_json")
-    if not exp:
-        return {"ids": set(), "tkeys": set()}
-    p = Path(exp)
-    data = _load_json(p) or {}
-    ids = set(data.get("imdb_ids") or [])
-    tkeys = set(data.get("title_year_keys") or [])
-    return {"ids": ids, "tkeys": tkeys}
-
-def _title_year_key_norm(it: Dict[str, Any]) -> str:
-    t = (it.get("title") or it.get("name") or "").strip().lower()
-    t = "".join(ch if ch.isalnum() else " " for ch in t)
-    t = " ".join(w for w in t.split() if w not in {"the","a","an","and","of","part"})
-    y = str(it.get("year") or "").strip()
-    return f"{t}::{y}"
-
-def _guard_seen(it: Dict[str, Any], guard: Dict[str, set]) -> bool:
-    imdb = it.get("imdb_id")
-    if imdb and imdb in guard["ids"]:
-        return True
-    key = _title_year_key_norm(it)
-    if key in guard["tkeys"]:
-        return True
-    # year ±1 tolerance
-    if "::" in key and key.endswith("::"):
-        # no usable year, skip tol
-        return False
-    base, y = key.rsplit("::", 1)
-    try:
-        yi = int(y)
-    except Exception:
-        return False
-    for dy in (-1, 1):
-        if f"{base}::{yi+dy}" in guard["tkeys"]:
-            return True
-    return False
-
-def _bullet(it: Dict[str, Any], allowed: List[str]) -> Optional[str]:
-    title = it.get("title") or it.get("name") or "—"
-    year = it.get("year") or ""
-    sc = _score(it)
-    aud = _aud_0_100(it)
-    kind = it.get("media_type") or ""
-    emoji = _emoji_for_kind(kind)
-
-    prov_bold = _fmt_providers_bold(it, allowed, maxn=3)
-    if not prov_bold:
-        return None
-
-    why = (it.get("why") or "").strip()
-    links = []
-    imdb = _imdb_link(it)
-    tmdb = _tmdb_link(it)
-    if imdb: links.append(f"[IMDb]({imdb})")
-    if tmdb: links.append(f"[TMDB]({tmdb})")
-    link_s = " • ".join(links)
-
-    main = f"{emoji} **{title}** ({year}) — **Match {sc:.0f}** | Audience {aud:.0f} | {prov_bold}"
-    if why:
-        main += f" — _{why}_"
-    if link_s:
-        main += f" — {link_s}"
-    return f"- {main}"
-
-def build_digest(items: List[Dict[str, Any]], diag: Dict[str, Any], ratings_csv: Optional[Path], top_n: int = 12) -> str:
-    env = (diag or {}).get("env", {}) if isinstance(diag, dict) else {}
-    allowed = _allowed_from_env(env)
-
-    region = env.get("REGION", "US")
-    langs = _as_list(env.get("ORIGINAL_LANGS"))
-    pages = env.get("DISCOVER_PAGES", 0)
-    prov_map = env.get("PROVIDER_MAP", {})
-    prov_unmatched = env.get("PROVIDER_UNMATCHED", [])
-    pool_t = env.get("POOL_TELEMETRY", {}) or {}
-    ran_at = (diag or {}).get("ran_at_utc")
-    run_sec = (diag or {}).get("run_seconds")
-    discovered = env.get("DISCOVERED_COUNT", None)
-    eligible_pre = env.get("ELIGIBLE_COUNT", None)
-
-    # 1) service filter
-    filtered = [it for it in items if _eligible_item(it, allowed)]
-
-    # 2) take top N
-    picks = _pick_top(filtered, top_n)
-
-    # 3) final guard: drop anything in seen_index.json (ids or title/year ±1)
-    guard = _load_seen_guard(diag)
-    guard_removed = 0
-    guarded_picks: List[Dict[str, Any]] = []
-    for it in picks:
-        if _guard_seen(it, guard):
-            guard_removed += 1
-            continue
-        guarded_picks.append(it)
-
-    # 4) taste profile (optional)
-    ratings_rows, genre_counter = (0, {})
-    if ratings_csv and ratings_csv.exists():
+            pass
+    if len(s) >= 4 and s[:4].isdigit():
         try:
-            import re
-            sep = re.compile(r"[|,/;+]")
-            with ratings_csv.open("r", encoding="utf-8", errors="replace") as fh:
-                reader = csv.DictReader(fh)
-                for row in reader:
-                    ratings_rows += 1
-                    gs = row.get("genres") or row.get("Genres") or ""
-                    for tok in (t.strip() for t in sep.split(gs)):
-                        if tok:
-                            genre_counter[tok] = genre_counter.get(tok, 0) + 1
+            return date(int(s[:4]), 1, 1)
+        except Exception:
+            return None
+    return None
+
+def _days_since(d: Optional[date]) -> Optional[int]:
+    if not d: return None
+    try:
+        return (date.today() - d).days
+    except Exception:
+        return None
+
+def _audience_pct(it: Dict[str, Any]) -> Optional[int]:
+    v = it.get("audience") or it.get("tmdb_vote")
+    try:
+        f = float(v)
+        if f <= 10.0: f *= 10.0
+        return int(round(max(0.0, min(100.0, f))))
+    except Exception:
+        return None
+
+def _providers_for_item(it: Dict[str, Any], allowed: Iterable[str]) -> List[str]:
+    allowed_set = {_normalize_slug(x) for x in (allowed or [])}
+    provs = it.get("providers") or it.get("providers_slugs") or []
+    provs = {_normalize_slug(str(p)) for p in provs}
+    show = [DISPLAY_PROVIDER.get(p, p.replace("_", " ").title()) for p in sorted(provs & allowed_set)]
+    return show
+
+def _recency_label(it: Dict[str, Any]) -> Optional[str]:
+    mt = (it.get("media_type") or "").lower()
+    if mt == "movie" and EMAIL_LABEL_NEW_MOVIE:
+        d = _parse_ymd(it.get("release_date"))
+        days = _days_since(d)
+        if days is not None and days <= REC_MOVIE_WINDOW_DAYS:
+            return "New Movie"
+    if mt == "tv":
+        if EMAIL_LABEL_NEW_SEASON:
+            lad = _parse_ymd(it.get("last_air_date"))
+            ds = _days_since(lad)
+            if ds is not None and ds <= REC_TV_LAST_WINDOW:
+                return "New Season"
+        if EMAIL_LABEL_NEW_SERIES:
+            fad = _parse_ymd(it.get("first_air_date"))
+            df = _days_since(fad)
+            if df is not None and df <= REC_TV_FIRST_WINDOW:
+                return "New Series"
+    return None
+
+def _media_emoji(it: Dict[str, Any]) -> str:
+    mt = (it.get("media_type") or "").lower()
+    return "🍿" if mt == "movie" else "📺"
+
+def _fmt_title_line(it: Dict[str, Any], providers: List[str]) -> str:
+    title = it.get("title") or it.get("name") or "Untitled"
+    year = it.get("year")
+    label = _recency_label(it)
+    parts = [f"{_media_emoji(it)} *{title}*{f' ({year})' if year else ''}"]
+    if label:
+        parts.append(f"— **{label}**")
+    return " ".join(parts)
+
+def _fmt_meta_line(it: Dict[str, Any], providers: List[str]) -> str:
+    match = it.get("score")
+    aud = _audience_pct(it)
+    why = (it.get("why") or "").strip()
+    prov_md = ", ".join(f"**{p}**" for p in providers) if providers else "_Not on your services_"
+    bits = []
+    if isinstance(match, (int, float)):
+        bits.append(f"Match {int(round(match))}")
+    if isinstance(aud, int):
+        bits.append(f"Audience {aud}")
+    bits.append(prov_md)
+    out = " • ".join(bits)
+    if why:
+        out += f"\n  - why: {why}"
+    return out
+
+# ============= Public API =============
+def render_email(
+    ranked_items: List[Dict[str, Any]],
+    *,
+    region: str = "US",
+    allowed_provider_slugs: Optional[List[str]] = None,
+    seen_index_path: Optional[Path] = None
+) -> str:
+    """
+    Build the full markdown email body with Top Picks and telemetry.
+    """
+    allowed_provider_slugs = allowed_provider_slugs or []
+
+    # Optional: double-check “never show seen” with a final pass
+    seen_ids, seen_keys = set(), set()
+    if seen_index_path and seen_index_path.exists():
+        try:
+            seen = json.loads(seen_index_path.read_text(encoding="utf-8", errors="replace"))
+            for x in seen.get("imdb_ids", []):
+                if isinstance(x, str) and x.startswith("tt"):
+                    seen_ids.add(x)
+            for x in seen.get("title_year_keys", []):
+                if isinstance(x, str) and "::" in x:
+                    seen_keys.add(x)
         except Exception:
             pass
 
-    lines: List[str] = []
-    lines.append(f"### 🎬 Top Picks ({region})\n")
-    if ratings_rows:
-        top_gen = ", ".join([f"{g}×{c}" for g, c in sorted(genre_counter.items(), key=lambda kv: kv[1], reverse=True)[:6]])
-        lines.append(f"_Taste profile (from your ratings.csv, {ratings_rows} rows):_ {top_gen}\n")
+    def _is_seen(it: Dict[str, Any]) -> bool:
+        imdb = it.get("imdb_id")
+        title = it.get("title") or it.get("name")
+        year = it.get("year")
+        key = f"{_norm_title(title)}::{year}" if title and year else None
+        return (isinstance(imdb, str) and imdb in seen_ids) or (key and key in seen_keys)
 
-    if guarded_picks:
-        for it in guarded_picks:
-            b = _bullet(it, allowed)
-            if b:
-                lines.append(b)
+    # Filter & select Top Picks
+    picks: List[str] = []
+    shown = 0
+    for it in sorted(ranked_items, key=lambda x: float(x.get("score", x.get("tmdb_vote", 0.0)) or 0.0), reverse=True):
+        if shown >= EMAIL_TOPK:
+            break
+        if float(it.get("score", 0) or 0) < EMAIL_SCORE_MIN:
+            continue
+        if _is_seen(it):
+            continue
+        provs = _providers_for_item(it, allowed_provider_slugs)
+        if not provs:
+            continue
+        # title line + meta line
+        picks.append(f"{_fmt_title_line(it, provs)}\n  { _fmt_meta_line(it, provs) }")
+        shown += 1
+
+    lines: List[str] = []
+    lines.append("# Daily Recommendations\n")
+    if picks:
+        lines.append("## Top Picks\n")
+        for p in picks:
+            lines.append(f"- {p}")
         lines.append("")
     else:
-        lines.append("_No items to show on your services right now._\n")
+        lines.append("_No eligible Top Picks today (after filters)._\n")
 
-    # Telemetry
-    lines.append("### 📊 Telemetry")
-    if ran_at is not None:
-        lines.append(f"- Ran at (UTC): **{ran_at}**" + (f" — {run_sec:.1f}s" if isinstance(run_sec, (int, float)) else ""))
+    # Minimal telemetry (runner also writes detailed diag)
+    lines.append("## Telemetry")
+    subs = os.getenv("SUBS_INCLUDE", "")
     lines.append(f"- Region: **{region}**")
-    if langs:
-        lines.append(f"- Original languages: `{', '.join(langs)}`")
-    lines.append(f"- SUBS_INCLUDE (effective): `{', '.join(allowed)}`")
-    lines.append(f"- Discover pages: **{pages}**")
-    if discovered is not None:
-        lines.append(f"- Discovered (raw): **{discovered}**")
-    if eligible_pre is not None:
-        lines.append(f"- Eligible before service filter: **{eligible_pre}**")
-    lines.append(f"- Eligible after service filter: **{len(filtered)}**")
-    lines.append(f"- Provider map: `{json.dumps(prov_map, ensure_ascii=False)}`")
-    if prov_unmatched:
-        lines.append(f"- Provider slugs not matched: `{prov_unmatched}`")
+    lines.append(f"- SUBS_INCLUDE: `{subs}`")
+    lines.append(f"- Labels: movie={EMAIL_LABEL_NEW_MOVIE}, new_season={EMAIL_LABEL_NEW_SEASON}, new_series={EMAIL_LABEL_NEW_SERIES}")
+    lines.append("")
+    return "\n".join(lines)
 
-    # exclusions summary from runner
-    excl = (diag or {}).get("env", {}).get("EXCLUSIONS", {})
-    if excl:
-        lines.append(f"- Excluded as seen (runner): **{excl.get('excluded_count', 0)}** "
-                     f"(ratings_ids~{excl.get('ratings_rows', 0)}, public_ids={excl.get('public_ids', 0)})")
-    # guard summary
-    lines.append(f"- Guard removed in summary: **{guard_removed}**")
 
-    if pool_t:
-        before = pool_t.get("file_lines_before")
-        after = pool_t.get("file_lines_after")
-        appended = pool_t.get("appended_this_run")
-        delta = (after - before) if isinstance(before, int) and isinstance(after, int) else appended
-        lines.append(f"- Pool growth: **{('+'+str(delta)) if isinstance(delta, int) else '—'} this run**")
-        lines.append(f"- Pool size (lines): **{before} → {after}**")
-        lines.append(f"- Appended records this run: **{appended}**")
-        lines.append(f"- Loaded unique from pool: **{pool_t.get('loaded_unique')}** / cap **{pool_t.get('pool_max_items')}**")
-        if pool_t.get("unique_keys_est") is not None:
-            lines.append(f"- Unique keys (est): **{pool_t.get('unique_keys_est')}**")
-        if pool_t.get("prune_at"):
-            lines.append(f"- Prune policy: prune_at={pool_t.get('prune_at')}, keep={pool_t.get('prune_keep')}")
+def write_email_markdown(
+    run_dir: Path,
+    ranked_items_path: Path,
+    env: Dict[str, Any],
+    seen_index_path: Optional[Path] = None,
+) -> Path:
+    """
+    Convenience wrapper: read items, render, and write summary.md into run_dir.
+    """
+    try:
+        ranked = json.loads(ranked_items_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        ranked = []
 
-    return "\n".join(lines).strip() + "\n"
+    region = str(env.get("REGION") or "US")
+    allowed = env.get("SUBS_INCLUDE", []) or []
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Produce a compact Top Picks digest into summary.md")
-    ap.add_argument("--in", dest="inp", required=True, help="items.enriched.json (or assistant_feed.json)")
-    ap.add_argument("--diag", dest="diag", required=False, help="diag.json (runner telemetry)")
-    ap.add_argument("--ratings", dest="ratings", required=False, help="data/user/ratings.csv (optional)")
-    ap.add_argument("--out", dest="out", required=True, help="output markdown (summary.md)")
-    ap.add_argument("--top", dest="top", type=int, default=12, help="Top-N picks to list")
-    args = ap.parse_args()
-
-    inp = Path(args.inp)
-    outp = Path(args.out)
-    diagp = Path(args.diag) if args.diag else None
-    ratingsp = Path(args.ratings) if args.ratings else None
-
-    items = _load_json(inp) or []
-    if not isinstance(items, list):
-        items = []
-    diag = _load_json(diagp) if (diagp and diagp.exists()) else {}
-    body = build_digest(items, diag, ratingsp if (ratingsp and ratingsp.exists()) else None, top_n=args.top)
-    outp.parent.mkdir(parents=True, exist_ok=True)
-    outp.write_text(body, encoding="utf-8")
-
-if __name__ == "__main__":
-    main()
+    body = render_email(
+        ranked,
+        region=region,
+        allowed_provider_slugs=allowed,
+        seen_index_path=seen_index_path,
+    )
+    out = run_dir / "summary.md"
+    out.write_text(body, encoding="utf-8")
+    return out
