@@ -1,10 +1,6 @@
 # engine/runner.py
 from __future__ import annotations
-import json
-import os
-import sys
-import time
-import traceback
+import json, os, sys, time, traceback
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -32,7 +28,7 @@ from .exclusions import (
 )
 from .profile import build_user_model
 from . import tmdb
-from . import summarize  # writes summary.md with inline labels
+from . import summarize  # renders email body with inline labels
 
 OUT_ROOT = Path("data/out")
 CACHE_ROOT = Path("data/cache")
@@ -87,18 +83,15 @@ def _env_from_os() -> Env:
 
     langs = _json_or_list(os.getenv("ORIGINAL_LANGS", '["en"]'))
     subs = _json_or_list(os.getenv("SUBS_INCLUDE", ""))
-
     return Env.from_mapping(
         {
             "REGION": os.getenv("REGION", "US").strip() or "US",
             "ORIGINAL_LANGS": langs,
             "SUBS_INCLUDE": subs,
             "DISCOVER_PAGES": max(1, min(50, _i("DISCOVER_PAGES", 12))),
-            # pool
             "POOL_MAX_ITEMS": _i("POOL_MAX_ITEMS", 20000),
             "POOL_PRUNE_AT": _i("POOL_PRUNE_AT", 0),
             "POOL_PRUNE_KEEP": _i("POOL_PRUNE_KEEP", 0),
-            # enrichment sizes
             "ENRICH_PROVIDERS_TOP_N": _i("ENRICH_PROVIDERS_TOP_N", 220),
             "ENRICH_SCORING_TOP_N": _i("ENRICH_SCORING_TOP_N", 260),
             "ENRICH_EXTERNALIDS_EXCL_TOP_N": _i("ENRICH_EXTERNALIDS_EXCL_TOP_N", 800),
@@ -199,33 +192,31 @@ def _enrich_external_ids(items: List[Dict[str, Any]], top_n: int) -> None:
 
 
 def _collect_seen_tv_roots(ratings_csv: Path) -> List[str]:
-    """Normalize TV titles from ratings.csv so we can boost follow-up seasons."""
+    """
+    Build normalized TV title roots from ratings CSV to power the
+    'follow-up new season' boost for shows you've watched.
+    """
+    import csv, re
+
     roots: List[str] = []
     if not ratings_csv.exists():
         return roots
 
-    import csv
-    import re
-
     _non = re.compile(r"[^a-z0-9]+")
-
     def norm(s: str) -> str:
         return _non.sub(" ", (s or "").strip().lower()).strip()
 
     with ratings_csv.open("r", encoding="utf-8", errors="replace") as fh:
         rd = csv.DictReader(fh)
         for r in rd:
-            t = (
-                r.get("Title")
-                or r.get("Primary Title")
-                or r.get("Original Title")
-                or ""
-            ).strip()
+            t = (r.get("Title") or r.get("Primary Title") or r.get("Original Title") or "").strip()
             tt = (r.get("Title Type") or "").lower()
-            if t and ("tv" in tt or "series" in tt or "episode" in tt):
+            if not t:
+                continue
+            if "tv" in tt or "series" in tt or "episode" in tt:
                 roots.append(norm(t))
 
-    # unique, stable order
+    # unique preserve order
     out: List[str] = []
     seen: set[str] = set()
     for x in roots:
@@ -245,6 +236,7 @@ def main() -> None:
     diag_path = run_dir / "diag.json"
     exports_dir = run_dir / "exports"
     exports_dir.mkdir(parents=True, exist_ok=True)
+
     log_lines: List[str] = []
 
     def _log(s: str) -> None:
@@ -257,9 +249,7 @@ def main() -> None:
         or os.getenv("TMDB_ACCESS_TOKEN")
         or os.getenv("TMDB_V4_TOKEN")
     ):
-        msg = (
-            "[env] Missing required environment: TMDB_API_KEY or TMDB_BEARER/ACCESS_TOKEN."
-        )
+        msg = "[env] Missing required environment: TMDB_API_KEY or TMDB_BEARER/ACCESS_TOKEN."
         _log(msg)
         _safe_json(diag_path, {"error": msg})
         sys.exit(2)
@@ -275,40 +265,36 @@ def main() -> None:
         items = []
     pool_t = env.get("POOL_TELEMETRY", {}) or {}
     _log(
-        f" | catalog:end discovered={env.get('DISCOVERED_COUNT',0)} pooled={len(items)} "
-        f"pool_file_lines={pool_t.get('file_lines_after')} loaded_unique={pool_t.get('loaded_unique')}"
+        f" | catalog:end discovered={env.get('DISCOVERED_COUNT',0)} "
+        f"pooled={len(items)} pool_file_lines={pool_t.get('file_lines_after')} "
+        f"loaded_unique={pool_t.get('loaded_unique')}"
     )
     _safe_json(run_dir / "items.discovered.json", items)
 
-    # Pre-exclusion: external IDs harden "never seen"
+    # Pre-exclusion: external IDs to harden 'never seen'
     try:
-        _enrich_external_ids(
-            items, top_n=int(env.get("ENRICH_EXTERNALIDS_EXCL_TOP_N", 800))
-        )
+        _enrich_external_ids(items, top_n=int(env.get("ENRICH_EXTERNALIDS_EXCL_TOP_N", 800)))
     except Exception as ex:
         _log(f"[extids-pre] FAILED: {ex!r}")
 
-    # Exclusions & exports (strict "never show seen")
+    # Exclusions + seen exports + TV roots (for follow-up season boosts)
     excl_info = {"ratings_rows": 0, "public_ids": 0, "excluded_count": 0}
     seen_export = {"imdb_ids": [], "title_year_keys": []}
     seen_tv_roots: List[str] = []
-
     try:
         seen_idx: Dict[str, Any] = {}
         ratings_csv = Path("data/user/ratings.csv")
         if ratings_csv.exists():
             seen_idx = _load_seen_index(ratings_csv)
             excl_info["ratings_rows"] = sum(
-                1
-                for k in seen_idx.keys()
-                if isinstance(k, str) and k.startswith("tt")
+                1 for k in seen_idx.keys() if isinstance(k, str) and k.startswith("tt")
             )
-            # Build TV title roots for follow-up season boosts
+            # collect normalized TV title roots for follow-up recognition
             seen_tv_roots = _collect_seen_tv_roots(ratings_csv)
             _safe_json(exports_dir / "seen_tv_roots.json", seen_tv_roots)
 
         before_pub = len(seen_idx)
-        seen_idx = _merge_seen_public(seen_idx)  # uses env for public list (if set)
+        seen_idx = _merge_seen_public(seen_idx)
         excl_info["public_ids"] = max(0, len(seen_idx) - before_pub)
 
         pre = len(items)
@@ -318,4 +304,142 @@ def main() -> None:
         seen_export["imdb_ids"] = [
             k for k in seen_idx.keys() if isinstance(k, str) and k.startswith("tt")
         ]
-       
+        seen_export["title_year_keys"] = [k for k in seen_idx.keys() if "::" in k]
+        _safe_json(exports_dir / "seen_index.json", seen_export)
+
+        _log(
+            f"[exclusions] strict filter: removed={excl_info['excluded_count']} "
+            f"(ratings_ids~{excl_info['ratings_rows']}, public_ids_add={excl_info['public_ids']})"
+        )
+    except Exception as ex:
+        _log(f"[exclusions] FAILED: {ex!r}")
+        traceback.print_exc()
+
+    # Make TV roots available to the scorer (enables follow-up bonus)
+    env["SEEN_TV_TITLE_ROOTS"] = seen_tv_roots
+
+    eligible = len(items)
+
+    # Pre-scoring enrichment (providers, details/credits/keywords)
+    try:
+        _enrich_providers(items, env.get("REGION", "US"), top_n=int(env.get("ENRICH_PROVIDERS_TOP_N", 220)))
+    except Exception as ex:
+        _log(f"[providers-pre] FAILED: {ex!r}")
+    try:
+        _enrich_scoring_signals(items, top_n=int(env.get("ENRICH_SCORING_TOP_N", 260)))
+        _enrich_external_ids(items, top_n=int(env.get("ENRICH_SCORING_TOP_N", 260)))
+    except Exception as ex:
+        _log(f"[scoring-enrich] FAILED: {ex!r}")
+        traceback.print_exc()
+
+    # Profile
+    profile_t: Dict[str, Any] = {}
+    model_path = str((exports_dir / "user_model.json"))
+    try:
+        model = build_user_model(Path("data/user/ratings.csv"), exports_dir)
+        profile_t = {
+            "rows": int(model.get("meta", {}).get("count", 0)),
+            "global_avg": model.get("meta", {}).get("global_avg"),
+            "path": model_path,
+        }
+    except Exception as ex:
+        _log(f"[profile] FAILED: {ex!r}")
+        traceback.print_exc()
+    env["USER_MODEL_PATH"] = model_path
+
+    # Scoring
+    try:
+        ranked = score_items(env, items)
+        ranked = sorted(
+            ranked,
+            key=lambda it: it.get("score", it.get("match", it.get("tmdb_vote", 0.0))),
+            reverse=True,
+        )
+    except Exception as ex:
+        _log(f"[scoring] FAILED: {ex!r}")
+        traceback.print_exc()
+        ranked = items
+
+    # Post-scoring: ensure providers + IMDb ids for the actual Top K we’ll show
+    final_top_n = int(env.get("ENRICH_PROVIDERS_FINAL_TOP_N", 50))
+    try:
+        _enrich_providers(ranked, env.get("REGION", "US"), top_n=final_top_n)
+        _enrich_external_ids(ranked, top_n=int(env.get("ENRICH_EXTERNALIDS_TOP_N", 60)))
+    except Exception as ex:
+        _log(f"[post-enrich] FAILED: {ex!r}")
+
+    _safe_json(run_dir / "items.enriched.json", ranked)
+    _safe_json(run_dir / "assistant_feed.json", ranked)
+
+    # Build email body with labels (New Movie/New Season)
+    try:
+        summarize.write_email_markdown(
+            run_dir=run_dir,
+            ranked_items_path=run_dir / "items.enriched.json",
+            env={"REGION": env.get("REGION", "US"), "SUBS_INCLUDE": env.get("SUBS_INCLUDE", [])},
+            seen_index_path=exports_dir / "seen_index.json",
+        )
+    except Exception as ex:
+        _log(f"[summarize] FAILED: {ex!r}")
+        (run_dir / "summary.md").write_text(
+            "# Daily Recommendations\n\n_Summary generation failed._\n", encoding="utf-8"
+        )
+
+    above_cut = sum(1 for it in ranked if float(it.get("score", 0) or 0) >= 58.0)
+    _log(
+        f" | results: discovered={env.get('DISCOVERED_COUNT',0)} "
+        f"eligible={eligible} above_cut={above_cut}"
+    )
+
+    # diag.json for debugging
+    try:
+        _safe_json(
+            diag_path,
+            {
+                "ran_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "run_seconds": round(time.time() - t0, 3),
+                "env": {
+                    "REGION": env.get("REGION", "US"),
+                    "ORIGINAL_LANGS": env.get("ORIGINAL_LANGS", []),
+                    "SUBS_INCLUDE": env.get("SUBS_INCLUDE", []),
+                    "DISCOVER_PAGES": env.get("DISCOVER_PAGES", 0),
+                    "PROVIDER_MAP": env.get("PROVIDER_MAP", {}),
+                    "PROVIDER_UNMATCHED": env.get("PROVIDER_UNMATCHED", []),
+                    "POOL_TELEMETRY": env.get("POOL_TELEMETRY", {}),
+                    "PROFILE_TELEMETRY": {
+                        "rows": profile_t.get("rows"),
+                        "global_avg": profile_t.get("global_avg"),
+                    },
+                    "USER_MODEL_PATH": model_path,
+                    "SEEN_TV_TITLE_ROOTS_COUNT": len(seen_tv_roots),
+                    "ENRICH_EXTERNALIDS_EXCL_TOP_N": env.get("ENRICH_EXTERNALIDS_EXCL_TOP_N"),
+                    "ENRICH_EXTERNALIDS_TOP_N": env.get("ENRICH_EXTERNALIDS_TOP_N"),
+                    "ENRICH_PROVIDERS_FINAL_TOP_N": env.get("ENRICH_PROVIDERS_FINAL_TOP_N"),
+                },
+                "paths": {
+                    "assistant_feed": str((run_dir / "assistant_feed.json").resolve()),
+                    "items_discovered": str((run_dir / "items.discovered.json").resolve()),
+                    "items_enriched": str((run_dir / "items.enriched.json").resolve()),
+                    "summary": str((run_dir / "summary.md").resolve()),
+                    "runner_log": str((run_dir / "runner.log").resolve()),
+                    "exports_dir": str((exports_dir).resolve()),
+                    "seen_index_json": str((exports_dir / "seen_index.json").resolve()),
+                    "user_model_json": str((exports_dir / "user_model.json").resolve()),
+                    "profile_report": str((exports_dir / "profile_report.md").resolve()),
+                    "seen_tv_roots": str((exports_dir / "seen_tv_roots.json").resolve()),
+                },
+            },
+        )
+    except Exception:
+        pass
+
+    try:
+        log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+    _stamp_last_run(run_dir)
+
+
+if __name__ == "__main__":
+    main()
