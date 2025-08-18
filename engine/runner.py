@@ -24,6 +24,7 @@ from .scoring import score_items
 from .exclusions import load_seen_index as _load_seen_index, filter_unseen as _filter_unseen, merge_with_public as _merge_seen_public
 from .profile import build_user_model
 from . import tmdb
+from . import summarize  # <-- NEW: render email body with labels
 
 OUT_ROOT = Path("data/out"); CACHE_ROOT = Path("data/cache")
 
@@ -82,32 +83,6 @@ def _build_run_dir() -> Path:
     ts=time.strftime("%Y%m%d_%H%M%S"); rd=OUT_ROOT/f"run_{ts}"; rd.mkdir(parents=True, exist_ok=True)
     return rd
 
-def _markdown_summary(items: List[Dict[str, Any]], env: Env) -> str:
-    discovered=int(env.get("DISCOVERED_COUNT",0)); eligible=int(env.get("ELIGIBLE_COUNT",0))
-    subs=env.get("SUBS_INCLUDE",[]); region=env.get("REGION","US"); pages=env.get("DISCOVER_PAGES",1)
-    prov_map=env.get("PROVIDER_MAP",{}); unmatched=env.get("PROVIDER_UNMATCHED",[])
-    pool_t=env.get("POOL_TELEMETRY",{}) or {}; prof_t=env.get("PROFILE_TELEMETRY",{}) or {}
-    lines=[]
-    lines.append("# Daily recommendations\n")
-    lines.append("## Telemetry")
-    lines.append(f"- Region: **{region}**")
-    lines.append(f"- SUBS_INCLUDE: `{','.join(subs)}`" if subs else "- SUBS_INCLUDE: _none_")
-    lines.append(f"- Provider map: `{json.dumps(prov_map, ensure_ascii=False)}`")
-    if unmatched: lines.append(f"- Provider slugs not matched this region: `{unmatched}`")
-    lines.append(f"- Discover pages: **{pages}**")
-    lines.append(f"- Discovered (raw): **{discovered}**")
-    lines.append(f"- Eligible after exclusions: **{eligible}**")
-    if pool_t:
-        lines.append(f"- Pool: before={pool_t.get('file_lines_before')} → after={pool_t.get('file_lines_after')}, "
-                     f"unique_keys_est={pool_t.get('unique_keys_est')}, loaded_unique={pool_t.get('loaded_unique')}, "
-                     f"appended_this_run={pool_t.get('appended_this_run')}, cap={pool_t.get('pool_max_items')}")
-        if pool_t.get("prune_at",0):
-            lines.append(f"- Pool prune policy: prune_at={pool_t.get('prune_at')}, keep={pool_t.get('prune_keep')}")
-    if prof_t:
-        lines.append(f"- Profile: rows={prof_t.get('rows')} global_avg={prof_t.get('global_avg')} model={prof_t.get('path')}")
-    lines.append("")
-    return "\n".join(lines)
-
 def _base_for_select(it: Dict[str, Any]) -> float:
     try: v=float(it.get("tmdb_vote") or 0.0)
     except Exception: v=0.0
@@ -159,26 +134,6 @@ def _enrich_external_ids(items: List[Dict[str, Any]], top_n: int) -> None:
             if ex.get("imdb_id"): it["imdb_id"]=ex["imdb_id"]
         except Exception: pass
 
-def _collect_seen_tv_roots(ratings_csv: Path) -> List[str]:
-    roots=[]
-    if not ratings_csv.exists(): return roots
-    import csv, re
-    _non = re.compile(r"[^a-z0-9]+")
-    def norm(s:str)->str: return _non.sub(" ", (s or "").strip().lower()).strip()
-    with ratings_csv.open("r",encoding="utf-8", errors="replace") as fh:
-        rd=csv.DictReader(fh)
-        for r in rd:
-            t=(r.get("Title") or r.get("Primary Title") or r.get("Original Title") or "").strip()
-            tt=(r.get("Title Type") or "").lower()
-            if t and ("tv" in tt or "series" in tt or "episode" in tt):
-                roots.append(norm(t))
-    # uniq
-    out=[]; seen=set()
-    for x in roots:
-        if x not in seen:
-            out.append(x); seen.add(x)
-    return out
-
 def main() -> None:
     t0=time.time()
     run_self_check()
@@ -204,26 +159,24 @@ def main() -> None:
     _log(f" | catalog:end discovered={env.get('DISCOVERED_COUNT',0)} pooled={len(items)} pool_file_lines={pool_t.get('file_lines_after')} loaded_unique={pool_t.get('loaded_unique')}")
     _safe_json(run_dir/"items.discovered.json", items)
 
-    # Pre-exclusion: external IDs to harden 'never seen'
+    # Pre-exclusion: external IDs (hardens never-seen)
     try: _enrich_external_ids(items, top_n=int(env.get("ENRICH_EXTERNALIDS_EXCL_TOP_N",800)))
     except Exception as ex: _log(f"[extids-pre] FAILED: {ex!r}")
 
-    # Exclusions + seen exports + TV roots (for follow-up season boosts)
+    # Exclusions & exports
     excl_info={"ratings_rows":0,"public_ids":0,"excluded_count":0}
     seen_export={"imdb_ids": [], "title_year_keys": []}
-    seen_tv_roots: List[str] = []
     try:
         seen_idx={}
         ratings_csv=Path("data/user/ratings.csv")
         if ratings_csv.exists():
             seen_idx=_load_seen_index(ratings_csv)
             excl_info["ratings_rows"]=sum(1 for k in seen_idx.keys() if isinstance(k,str) and k.startswith("tt"))
-            seen_tv_roots=_collect_seen_tv_roots(ratings_csv)
-            _safe_json(exports_dir/"seen_tv_roots.json", seen_tv_roots)
         before_pub=len(seen_idx)
         seen_idx=_merge_seen_public(seen_idx)
         excl_info["public_ids"]=max(0, len(seen_idx)-before_pub)
-        pre=len(items); items=_filter_unseen(items, seen_idx)
+        pre=len(items); from .exclusions import filter_unseen as _filter_unseen  # type: ignore
+        items=_filter_unseen(items, seen_idx)
         excl_info["excluded_count"]=pre-len(items)
         seen_export["imdb_ids"]=[k for k in seen_idx.keys() if isinstance(k,str) and k.startswith("tt")]
         seen_export["title_year_keys"]=[k for k in seen_idx.keys() if "::" in k]
@@ -232,10 +185,9 @@ def main() -> None:
     except Exception as ex:
         _log(f"[exclusions] FAILED: {ex!r}"); traceback.print_exc()
 
-    env["SEEN_TV_TITLE_ROOTS"]=seen_tv_roots
     eligible=len(items)
 
-    # Pre-scoring enrichment (providers, details/credits/keywords)
+    # Pre-scoring enrichment (providers + scoring signals)
     try: _enrich_providers(items, env.get("REGION","US"), top_n=int(env.get("ENRICH_PROVIDERS_TOP_N",220)))
     except Exception as ex: _log(f"[providers-pre] FAILED: {ex!r}")
     try:
@@ -244,7 +196,7 @@ def main() -> None:
     except Exception as ex:
         _log(f"[scoring-enrich] FAILED: {ex!r}"); traceback.print_exc()
 
-    # Profile
+    # Profile model
     profile_t={}
     model_path=str((exports_dir/"user_model.json"))
     try:
@@ -261,7 +213,7 @@ def main() -> None:
     except Exception as ex:
         _log(f"[scoring] FAILED: {ex!r}"); traceback.print_exc(); ranked=items
 
-    # Post-scoring: ensure providers + IMDb ids for the actual Top K we’ll show
+    # Post-scoring enrichment for the final picks
     final_top_n=int(env.get("ENRICH_PROVIDERS_FINAL_TOP_N",50))
     try:
         _enrich_providers(ranked, env.get("REGION","US"), top_n=final_top_n)
@@ -272,13 +224,23 @@ def main() -> None:
     _safe_json(run_dir/"items.enriched.json", ranked)
     _safe_json(run_dir/"assistant_feed.json", ranked)
 
-    # Summary scaffold (email body refined by summarize)
-    try: (run_dir/"summary.md").write_text(_markdown_summary(ranked, env), encoding="utf-8")
-    except Exception as ex: _log(f"[summary] FAILED: {ex!r}")
+    # === Build the full email body (with inline labels) ===
+    try:
+        summarize.write_email_markdown(
+            run_dir=run_dir,
+            ranked_items_path=run_dir/"items.enriched.json",
+            env={"REGION": env.get("REGION","US"), "SUBS_INCLUDE": env.get("SUBS_INCLUDE",[])},
+            seen_index_path=exports_dir/"seen_index.json",
+        )
+    except Exception as ex:
+        _log(f"[summarize] FAILED: {ex!r}")
+        # fallback to a tiny scaffold if summarize failed
+        (run_dir/"summary.md").write_text("# Daily Recommendations\n\n_Summary generation failed._\n", encoding="utf-8")
 
     above_cut=sum(1 for it in ranked if float(it.get("score",0) or 0)>=58.0)
     _log(f" | results: discovered={env.get('DISCOVERED_COUNT',0)} eligible={eligible} above_cut={above_cut}")
 
+    # diag.json for debugging
     try:
         _safe_json(diag_path, {
             "ran_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -291,10 +253,8 @@ def main() -> None:
                 "PROVIDER_MAP": env.get("PROVIDER_MAP",{}),
                 "PROVIDER_UNMATCHED": env.get("PROVIDER_UNMATCHED",[]),
                 "POOL_TELEMETRY": env.get("POOL_TELEMETRY",{}),
-                "EXCLUSIONS": excl_info,
-                "PROFILE_TELEMETRY": profile_t,
+                "PROFILE_TELEMETRY": {"rows": profile_t.get("rows"), "global_avg": profile_t.get("global_avg")},
                 "USER_MODEL_PATH": model_path,
-                "SEEN_TV_TITLE_ROOTS_COUNT": len(seen_tv_roots),
                 "ENRICH_EXTERNALIDS_EXCL_TOP_N": env.get("ENRICH_EXTERNALIDS_EXCL_TOP_N"),
                 "ENRICH_EXTERNALIDS_TOP_N": env.get("ENRICH_EXTERNALIDS_TOP_N"),
                 "ENRICH_PROVIDERS_FINAL_TOP_N": env.get("ENRICH_PROVIDERS_FINAL_TOP_N"),
@@ -309,10 +269,10 @@ def main() -> None:
                 "seen_index_json": str((exports_dir/"seen_index.json").resolve()),
                 "user_model_json": str((exports_dir/"user_model.json").resolve()),
                 "profile_report": str((exports_dir/"profile_report.md").resolve()),
-                "seen_tv_roots": str((exports_dir/"seen_tv_roots.json").resolve()),
             },
         })
-    except Exception: pass
+    except Exception:
+        pass
 
     try: log_path.write_text("\n".join(log_lines)+"\n", encoding="utf-8")
     except Exception: pass
