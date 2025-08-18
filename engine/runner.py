@@ -98,7 +98,7 @@ def _env_from_os() -> Env:
     pool_max = _int_env("POOL_MAX_ITEMS", 20000)
     prune_at = _int_env("POOL_PRUNE_AT", 0)
     prune_keep = _int_env("POOL_PRUNE_KEEP", max(0, prune_at - 5000) if prune_at > 0 else 0)
-    enrich_top_n = _int_env("ENRICH_PROVIDERS_TOP_N", 220)  # bump default for better coverage
+    enrich_top_n = _int_env("ENRICH_PROVIDERS_TOP_N", 220)  # default bump
 
     return Env.from_mapping({
         "REGION": os.getenv("REGION", "US").strip() or "US",
@@ -194,8 +194,14 @@ def main() -> None:
 
     env = _env_from_os()
 
-    if not os.getenv("TMDB_API_KEY") and not os.getenv("TMDB_BEARER"):
-        msg = "[env] Missing required environment: TMDB_API_KEY or TMDB_BEARER. Set one of them and re-run."
+    # Accept either API key OR any bearer token env name
+    if not (
+        os.getenv("TMDB_API_KEY")
+        or os.getenv("TMDB_BEARER")
+        or os.getenv("TMDB_ACCESS_TOKEN")
+        or os.getenv("TMDB_V4_TOKEN")
+    ):
+        msg = "[env] Missing required environment: TMDB_API_KEY or TMDB_BEARER/ACCESS_TOKEN. Set one and re-run."
         _log(msg)
         _safe_json_dump(diag_path, {"error": msg})
         sys.exit(2)
@@ -216,7 +222,7 @@ def main() -> None:
 
     _safe_json_dump(run_dir / "items.discovered.json", items)
 
-    # --- STRICT EXCLUSIONS: ratings.csv + public IMDb + fuzzy/title-year ---
+    # --- STRICT EXCLUSIONS: ratings.csv + public IMDb (via exclusions.py) ---
     excl_info = {"ratings_rows": 0, "public_ids": 0, "excluded_count": 0}
     seen_export = {"imdb_ids": [], "title_year_keys": []}
     try:
@@ -224,7 +230,6 @@ def main() -> None:
         ratings_csv = Path("data/user/ratings.csv")
         if ratings_csv.exists():
             seen_idx = _load_seen_index(ratings_csv)
-            # Count explicit ids from CSV
             excl_info["ratings_rows"] = sum(1 for k in seen_idx.keys() if isinstance(k, str) and k.startswith("tt"))
         before_pub = len(seen_idx)
         seen_idx = _merge_seen_public(seen_idx)
@@ -234,7 +239,7 @@ def main() -> None:
         items = _filter_unseen(items, seen_idx)
         excl_info["excluded_count"] = pre_ct - len(items)
 
-        # Export a compact seen snapshot for summarizer double-check
+        # Export seen snapshot for summarizer final guard
         seen_export["imdb_ids"] = [k for k in seen_idx.keys() if isinstance(k, str) and k.startswith("tt")]
         seen_export["title_year_keys"] = [k for k in seen_idx.keys() if "::" in k]
         _safe_json_dump(exports_dir / "seen_index.json", seen_export)
@@ -276,7 +281,7 @@ def main() -> None:
     _safe_json_dump(run_dir / "items.enriched.json", ranked)
     _safe_json_dump(run_dir / "assistant_feed.json", ranked)
 
-    # Quick markdown telemetry
+    # Quick markdown telemetry (the digest email is built later by engine.summarize)
     try:
         (run_dir / "summary.md").write_text(_markdown_summary(ranked, env, top_n=25), encoding="utf-8")
     except Exception as ex:
